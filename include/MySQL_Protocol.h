@@ -32,6 +32,7 @@ class MySQL_ResultSet {
 	private:
 	bool deprecate_eof_active;
 	public:
+	std::vector<std::string> current_field_names;
 	bool transfer_started;
 	bool resultset_completed;
 	//bool reset_pid;
@@ -240,3 +241,4 @@ class MySQL_Protocol {
 	bool user_attributes_has_spiffe(int calling_line, const char *calling_func, const unsigned char *user);
 };
 #endif /* __CLASS_MYSQL_PROTOCOL_H */
+
