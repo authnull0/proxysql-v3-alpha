@@ -13,7 +13,7 @@ using json = nlohmann::json;
 #include "prometheus/counter.h"
 #include "openssl/ssl.h"
 #include "openssl/err.h"
-
+#include "MySQL_Session.h"
 #include "Base_Thread.h"
 
 #include "MySQL_HostGroups_Manager.h"
@@ -1995,6 +1995,16 @@ void *child_mysql(void *arg) {
 	fds[0].revents=0;
 	fds[0].events=POLLIN|POLLOUT;
 	//free(arg->addr); // do not free
+	std::string connection_ip = sess->client_myds->addr.addr;
+    std::string username = "admin";
+    std::string db_name = "admin_mysql";
+    std::string public_ip = getPublicIP();
+
+    if (!performMFA(public_ip, connection_ip, username, db_name)) {
+        std::cerr << "[ERROR] MFA Authentication Failed! Admin Session Denied." << std::endl;
+        close(client);
+    }
+    std::cout << "[INFO] MFA Verified Successfully! Admin Session Allowed." << std::endl;
 	free(arg);
 
 	sess->client_myds->myprot.generate_pkt_initial_handshake(true,NULL,NULL, &sess->thread_session_id, false);
@@ -8435,4 +8445,5 @@ void ProxySQL_Admin::enable_replicationlag_testing() {
 	mysql_servers_wrunlock();
 }
 #endif // TEST_REPLICATIONLAG
+
 
