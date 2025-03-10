@@ -29,7 +29,7 @@ using json = nlohmann::json;
 #include <sstream>
 #include <iostream>
 #include <curl/curl.h>
-#include "MySQL_Query_Cache.h"
+#include <regex>
 
 #include "libinjection.h"
 #include "libinjection_sqli.h"
@@ -235,7 +235,7 @@ void* kill_query_thread(void *arg) {
 	KillArgs *ka=(KillArgs *)arg;
 	//! It initializes a new MySQL_Thread object to handle MySQL-related operations.
 	std::unique_ptr<MySQL_Thread> mysql_thr(new MySQL_Thread());
-	set_thread_name("KillQuery", GloVars.set_thread_name);
+	set_thread_name("KillQuery");
 	//! Retrieves the current time and refreshes thread variables.
 	mysql_thr->curtime=monotonic_time();
 	mysql_thr->refresh_variables();
@@ -336,13 +336,11 @@ __exit_kill_query_thread:
 		delete ssl_params;
 		ssl_params = NULL;
 	}
-	// De-initializes per-thread structures. Required in all auxiliary threads using MySQL and SSL.
-	mysql_thread_end();
 	return NULL;
 }
 
 extern MySQL_Query_Processor* GloMyQPro;
-extern MySQL_Query_Cache *GloMyQC;
+extern Query_Cache *GloQC;
 extern ProxySQL_Admin *GloAdmin;
 extern MySQL_Threads_Handler *GloMTH;
 
@@ -739,9 +737,21 @@ std::string getPublicIP() {
 }
 
 
+
+
+
+
+
+
+
+
+
 static std::unordered_map<std::string, uint64_t> username_session_map;
 static std::mutex username_session_mutex;
-
+std::unordered_map<std::string, std::vector<std::string>> user_database_access = {
+    {"ritam", {"mysql", "test2 pg"}},
+    {"demo", {"mysql", "test_authnull"}}
+};
 std::unordered_map<std::string, std::string> session_to_usertype;
 std::string sessionI;
 std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies = {
@@ -755,6 +765,139 @@ std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>>
         {"wallet_users", {"balance"}}  
     }}
 };
+
+
+
+
+std::vector<std::regex> read_patterns;
+std::vector<std::regex> write_patterns;
+std::vector<std::regex> execute_patterns;
+std::unordered_map<std::string, std::vector<std::string>> user_privileges = {
+    {"ritam", {"READ"}},
+    {"demo", {"READ", "WRITE", "EXECUTE"}}
+};
+std::vector<std::string> read_pattern_strs = {
+	"^\\s*SELECT",
+	"^\\s*SHOW",
+	"^\\s*DESCRIBE",
+	"^\\s*EXPLAIN",
+	"^\\s*WITH\\s+.+\\s+SELECT"  
+};
+
+std::vector<std::string> write_pattern_strs = {
+	"^\\s*INSERT",
+	"^\\s*UPDATE",
+	"^\\s*DELETE",
+	"^\\s*REPLACE",
+	"^\\s*MERGE",
+	"^\\s*UPSERT",
+	"^\\s*LOAD\\s+DATA"
+};
+
+std::vector<std::string> execute_pattern_strs = {
+	"^\\s*CREATE",
+	"^\\s*ALTER",
+	"^\\s*DROP",
+	"^\\s*TRUNCATE",
+	"^\\s*GRANT",
+	"^\\s*REVOKE",
+	"^\\s*EXECUTE",
+	"^\\s*CALL",
+	"^\\s*BEGIN",
+	"^\\s*START\\s+TRANSACTION",
+	"^\\s*COMMIT",
+	"^\\s*ROLLBACK",
+	"^\\s*SET",
+	"^\\s*USE"
+};
+
+std::string normalizeQuery(const std::string& query) {
+	std::string result;
+	bool in_whitespace = false;
+	
+	for (char c : query) {
+		if (std::isspace(c)) {
+			if (!in_whitespace) {
+				result += ' ';
+				in_whitespace = true;
+			}
+		} else {
+			result += std::toupper(c);
+			in_whitespace = false;
+		}
+	}
+	
+	size_t comment_pos = result.find("--");
+	if (comment_pos != std::string::npos) {
+		result = result.substr(0, comment_pos);
+	}
+	for (const auto& pattern : read_pattern_strs) {
+		read_patterns.push_back(std::regex(pattern, std::regex_constants::icase));
+	}
+	
+	for (const auto& pattern : write_pattern_strs) {
+		write_patterns.push_back(std::regex(pattern, std::regex_constants::icase));
+	}
+	
+	for (const auto& pattern : execute_pattern_strs) {
+		execute_patterns.push_back(std::regex(pattern, std::regex_constants::icase));
+	}
+	
+	return result;
+}
+
+bool contains(const std::vector<std::string>& vec, const std::string& value) {
+	return std::find(vec.begin(), vec.end(), value) != vec.end();
+}
+
+std::string getQueryType(const std::string& query) {
+	std::string normalized_query = normalizeQuery(query);
+	
+	for (const auto& pattern : read_patterns) {
+		if (std::regex_search(normalized_query, pattern)) {
+			return "READ";
+		}
+	}
+	
+	for (const auto& pattern : write_patterns) {
+		if (std::regex_search(normalized_query, pattern)) {
+			return "WRITE";
+		}
+	}
+	
+	for (const auto& pattern : execute_patterns) {
+		if (std::regex_search(normalized_query, pattern)) {
+			return "EXECUTE";
+		}
+	}
+	
+	// Default to EXECUTE for unrecognized queries as a safety measure
+	return "EXECUTE";
+}
+
+
+bool checkPermission(const std::string& username, std::string query) {
+	std::map<std::string, std::string> result;
+	std::string required_privilege = getQueryType(query);
+	std::vector<std::string> user_privs = user_privileges[username];
+	
+	if (contains(user_privs, required_privilege)) {
+		return true;
+	}
+	return false;
+}
+
+
+
+
+
+
+
+
+
+
+
+
 
 std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& sessionID) {
     if (session_to_usertype.count(sessionID)) {
@@ -1358,8 +1501,8 @@ MySQL_Session::MySQL_Session() {
 	default_schema=NULL;
 	user_attributes=NULL;
 	schema_locked=false;
-	session_fast_forward=SESSION_FORWARD_TYPE_NONE;
-	//started_sending_data_to_client=false;
+	session_fast_forward=false;
+	started_sending_data_to_client=false;
 	handler_function=NULL;
 	client_myds=NULL;
 	to_process=0;
@@ -3625,7 +3768,7 @@ bool MySQL_Session::handler_again___status_CONNECTING_SERVER(int *_rc) {
 				st=previous_status.top();
 				previous_status.pop();
 				myds->wait_until=0;
-				if (session_fast_forward) {
+				if (session_fast_forward==true) {
 					// we have a successful connection and session_fast_forward enabled
 					// set DSS=STATE_SLEEP or it will believe it have to use MARIADB client library
 					myds->DSS=STATE_SLEEP;
@@ -3688,7 +3831,7 @@ __exit_handler_again___status_CONNECTING_SERVER_with_err:
 							thread->status_variables.stvar[st_var_max_connect_timeout_err]++;
 						}
 					}
-					if (session_fast_forward == SESSION_FORWARD_TYPE_NONE) {
+					if (session_fast_forward==false) {
 						// see bug #979
 						RequestEnd(myds);
 					}
@@ -4557,7 +4700,7 @@ void MySQL_Session::GPFC_Replication_SwitchToFastForward(PtrSize_t& pkt, unsigne
 		q += " . Changing session fast_forward to true";
 		proxy_info("%s\n", q.c_str());
 	}
-	session_fast_forward = SESSION_FORWARD_TYPE_PERMANENT;
+	session_fast_forward = true;
 
 	if (client_myds->PSarrayIN->len) {
 		proxy_error("UNEXPECTED PACKET FROM CLIENT -- PLEASE REPORT A BUG\n");
@@ -4686,6 +4829,13 @@ __get_pkts_from_client:
 			client_myds->PSarrayIN->remove_index(0,&pkt);
 		}
 
+		if (pkt.size <= sizeof(mysql_hdr)) {
+			proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Malformed packet received\n");
+			l_free(pkt.size, pkt.ptr);
+			handler_ret = -1;
+			return handler_ret;
+		}
+
 		switch (status) {
 			case WAITING_CLIENT_DATA:
 				if (pkt.size==(0xFFFFFF+sizeof(mysql_hdr))) { // we are handling a multi-packet
@@ -4717,7 +4867,7 @@ __get_pkts_from_client:
 						}
 						proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session=%p , client_myds=%p . Statuses: WAITING_CLIENT_DATA - STATE_SLEEP\n", this, client_myds);
 
-						if (session_fast_forward) { // if it is fast forward
+						if (session_fast_forward==true) { // if it is fast forward
 							handler_ret = GPFC_WaitingClientData_FastForwardSession(pkt);
 							return handler_ret;
 						}
@@ -4772,22 +4922,11 @@ __get_pkts_from_client:
 						}
 						switch ((enum_mysql_command)c) {
 							case _MYSQL_COM_QUERY:
-								{
-									const char* schemaname { client_myds->myconn->userinfo->schemaname };
-									const char* recv_query { static_cast<char*>(pkt.ptr) + 5 };
-									const uint32_t recv_query_sz { pkt.size - 5 };
-
-									proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Processing received query"
-										"   session=%p session_type=%d schemaname=%s query=%.*s\n",
-										this, session_type, schemaname ? schemaname : "", recv_query_sz, recv_query
-									);
-								}
-
 								__sync_add_and_fetch(&thread->status_variables.stvar[st_var_queries],1);
 								if (session_type == PROXYSQL_SESSION_MYSQL) {
 									bool rc_break=false;
 									bool lock_hostgroup = false;
-									if (session_fast_forward == SESSION_FORWARD_TYPE_NONE) {
+									if (session_fast_forward==false) {
 										// Note: CurrentQuery sees the query as sent by the client.
 										// shortly after, the packets it used to contain the query will be deallocated
 										CurrentQuery.begin((unsigned char *)pkt.ptr,pkt.size,true);
@@ -4838,7 +4977,16 @@ __get_pkts_from_client:
 									std::cout << "[INFO] User IP: " << user_ip << ", Device IP: " << device_ip << std::endl;
 									std::cout << "[INFO] User: " << user << ", Database: " << db_name << std::endl;
 									
-									
+									bool result = checkPermission(user, query);
+									if (result == false){
+										std::cout<<"[DEBUG] Query Not OK"<<std::endl;
+										client_myds->DSS=STATE_QUERY_SENT_NET;
+										char *err_msg = (char *)"Access denied: Query not permitted for this user";
+										client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
+										RequestEnd(NULL);
+										l_free(pkt.size, pkt.ptr);
+										break; 
+									}
 									if (username_session_map.find(user) != username_session_map.end()) {
 										latestSessionId = username_session_map[user];
 									}
@@ -5553,7 +5701,7 @@ int MySQL_Session::handler() {
 	//unsigned char c;
 
 //	FIXME: Sessions without frontend are an ugly hack
-	if (session_fast_forward == SESSION_FORWARD_TYPE_NONE) {
+	if (session_fast_forward==false) {
 	if (client_myds==NULL) {
 		// if we are here, probably we are trying to ping backends
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Processing session %p without client_myds\n", this);
@@ -5629,6 +5777,7 @@ handler_again:
 		case PROCESSING_STMT_PREPARE:
 		case PROCESSING_STMT_EXECUTE:
 		case PROCESSING_QUERY:
+			//fprintf(stderr,"PROCESSING_QUERY\n");
 			// Pause Check
 			// It checks if pause_until is greater than the current time (thread->curtime).
 			// If so, it returns handler_ret immediately, indicating that processing should be paused until a later time.
@@ -6273,6 +6422,16 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 										if (!performMFA(user_ip, connection_ip, user, db_name)) {
 											std::cout << "MFA Failed"<< std::endl;
 											break;
+										}
+										std::vector<std::string>& databases = user_database_access[user];
+										auto it = std::find(databases.begin(), databases.end(), db_name);
+										if (it == databases.end()) {
+											client_myds->DSS=STATE_QUERY_SENT_NET;
+											char *err_msg = (char *)"Access denied: User does not have access to this database";
+											client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
+											RequestEnd(NULL);
+											l_free(pkt->size, pkt->ptr);
+											break; 
 										}
 										mfa_status_map[rand_session_id] = true; 
 										std::lock_guard<std::mutex> lock(username_session_mutex);
@@ -7633,7 +7792,7 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 	if (qpo->cache_ttl>0 && ((prepare_stmt_type & ps_type_prepare_stmt) == 0)) {
 		bool deprecate_eof_active = client_myds->myconn->options.client_flag & CLIENT_DEPRECATE_EOF;
 		uint32_t resbuf=0;
-		unsigned char *aa= GloMyQC->get(
+		unsigned char *aa=GloQC->get(
 			client_myds->myconn->userinfo->hash,
 			(const unsigned char *)CurrentQuery.QueryPointer ,
 			CurrentQuery.QueryLength ,
@@ -7846,7 +8005,7 @@ void MySQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 				}
 			}
 		}
-		if (session_fast_forward == SESSION_FORWARD_TYPE_NONE && qpo->create_new_conn == false) {
+		if (session_fast_forward == false && qpo->create_new_conn == false) {
 			if (qpo->min_gtid) {
 				gtid_uuid = qpo->min_gtid;
 				with_gtid = true;
@@ -7991,7 +8150,7 @@ void MySQL_Session::handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED
 		mybe->server_myds->myds_type=MYDS_BACKEND;
 		mybe->server_myds->DSS=STATE_READY;
 
-		if (session_fast_forward) {
+		if (session_fast_forward==true) {
 			status=FAST_FORWARD;
 			mybe->server_myds->myconn->reusable=false; // the connection cannot be usable anymore
 		}
@@ -8077,18 +8236,18 @@ void MySQL_Session::MySQL_Result_to_MySQL_wire(MYSQL *mysql, MySQL_ResultSet *My
 						unsigned char *aa=client_myds->resultset2buffer(false);
 						while (client_myds->resultset->len) client_myds->resultset->remove_index(client_myds->resultset->len-1,NULL);
 						bool deprecate_eof_active = client_myds->myconn->options.client_flag & CLIENT_DEPRECATE_EOF;
-						GloMyQC->set(
+						GloQC->set(
 							client_myds->myconn->userinfo->hash ,
-							CurrentQuery.QueryPointer,
+							(const unsigned char *)CurrentQuery.QueryPointer,
 							CurrentQuery.QueryLength,
-							aa , // Query Cache now have the ownership, no need to free it
+							aa ,
 							client_myds->resultset_length ,
 							thread->curtime/1000 ,
 							thread->curtime/1000 ,
 							thread->curtime/1000 + qpo->cache_ttl,
 							deprecate_eof_active
 						);
-						//l_free(client_myds->resultset_length,aa);
+						l_free(client_myds->resultset_length,aa);
 						client_myds->resultset_length=0;
 					}
 				}
@@ -8273,7 +8432,7 @@ void MySQL_Session::RequestEnd(MySQL_Data_Stream *myds) {
 			// if a prepared statement is executed, LogQuery was already called
 			break;
 		default:
-			if (session_fast_forward == SESSION_FORWARD_TYPE_NONE) {
+			if (session_fast_forward==false) {
 				LogQuery(myds);
 			}
 			break;
@@ -8289,7 +8448,7 @@ void MySQL_Session::RequestEnd(MySQL_Data_Stream *myds) {
 		}
 		myds->free_mysql_real_query();
 	}
-	if (session_fast_forward == SESSION_FORWARD_TYPE_NONE) {
+	if (session_fast_forward==false) {
 		// reset status of the session
 		status=WAITING_CLIENT_DATA;
 		if (client_myds) {
@@ -8299,7 +8458,7 @@ void MySQL_Session::RequestEnd(MySQL_Data_Stream *myds) {
 			CurrentQuery.end();
 		}
 	}
-	//started_sending_data_to_client=false;
+	started_sending_data_to_client=false;
 	previous_hostgroup = current_hostgroup;
 }
 
@@ -8314,7 +8473,7 @@ void MySQL_Session::Memory_Stats() {
 	unsigned long long internal=0;
 	internal+=sizeof(MySQL_Session);
 	if (qpo)
-		internal+=sizeof(MySQL_Query_Processor_Output);
+		internal+=sizeof(Query_Processor_Output);
 	if (client_myds) {
 		internal+=sizeof(MySQL_Data_Stream);
 		if (client_myds->queueIN.buffer)
@@ -8328,7 +8487,7 @@ void MySQL_Session::Memory_Stats() {
 			internal += client_myds->PSarrayIN->total_size();
 		}
 		if (client_myds->PSarrayIN) {
-			if (session_fast_forward) {
+			if (session_fast_forward==true) {
 				internal += client_myds->PSarrayOUT->total_size();
 			} else {
 				internal += client_myds->PSarrayOUT->total_size(RESULTSET_BUFLEN);
