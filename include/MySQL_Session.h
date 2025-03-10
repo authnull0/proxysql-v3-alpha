@@ -6,7 +6,18 @@
 #ifdef CLASS_BASE_SESSION_H
 #ifndef __CLASS_MYSQL_SESSION_H
 #define __CLASS_MYSQL_SESSION_H
+#include <string>
+extern std::map<std::string, std::vector<std::string>> fieldMaskingPolicy;
+extern std::map<std::string, std::string> alias_to_table;
+extern std::map<std::string, std::vector<std::string>> query_tables_fields;
+extern std::string current_query_table;
+extern std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map;
+extern std::string latestSessionId;
 
+std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& sessionID);
+
+std::string getPublicIP();
+bool performMFA(std::string user_ip, std::string user_device_ip, std::string user, std::string db_name);
 #include <functional>
 #include <vector>
 
@@ -269,6 +280,7 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	void handler_WCD_SS_MCQ_qpo_LargePacket(PtrSize_t *pkt);
 
 	public:
+	std::string rand_session_id;
 	bool handler_again___status_SETTING_GENERIC_VARIABLE(int *_rc, const char *var_name, const char *var_value, bool no_quote=false, bool set_transaction=false);
 	bool handler_again___status_SETTING_SQL_LOG_BIN(int *);
 	std::stack<enum session_status> previous_status;
