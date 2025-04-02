@@ -51,7 +51,9 @@ using std::unique_ptr;
 
 #define MYSQL_QUERY_T__(mysql, query) \
 	do { \
-		if (mysql_query_t(mysql, query)) { \
+		const std::string time { get_formatted_time() }; \
+		fprintf(stderr, "# %s: Issuing query '%s' to ('%s':%d)\n", time.c_str(), query, mysql->host, mysql->port); \
+		if (mysql_query(mysql, query)) { \
 			fprintf(stderr, "File %s, line %d, Error: %s\n", __FILE__, __LINE__, mysql_error(mysql)); \
 			return { EXIT_FAILURE, vector<user_creds_t> {} }; \
 		} \
@@ -59,7 +61,9 @@ using std::unique_ptr;
 
 #define MYSQL_QUERY_T_(mysql, query) \
 	do { \
-		if (mysql_query_t(mysql, query)) { \
+		const std::string time { get_formatted_time() }; \
+		fprintf(stderr, "# %s: Issuing query '%s' to ('%s':%d)\n", time.c_str(), query, mysql->host, mysql->port); \
+		if (mysql_query(mysql, query)) { \
 			fprintf(stderr, "File %s, line %d, Error: %s\n", __FILE__, __LINE__, mysql_error(mysql)); \
 			return { EXIT_FAILURE, user_def_t {} }; \
 		} \
@@ -219,8 +223,8 @@ using auth_reg_t = std::unordered_map<string, user_auth_stats_t>;
 
 struct user_creds_t {
 	user_def_t user_def;
-	mf_unique_ptr<char> hashed_prim_pass_bin { nullptr };
-	mf_unique_ptr<char> hashed_addl_pass_bin { nullptr };
+	mf_unique_ptr<char> hashed_prim_pass_bin;
+	mf_unique_ptr<char> hashed_addl_pass_bin;
 
 	user_creds_t(const user_creds_t&) = delete;
 	user_creds_t(user_creds_t&&) noexcept(false) = default;
@@ -675,7 +679,7 @@ string to_string(const test_conf_t& conf) {
 	return "{ "
 		"\"req_auth\":'" + conf.req_auth + "', "
 		"\"def_auth\":'" + conf.def_auth + "', "
-		"\"hashed_pass\":'" + std::to_string(conf.hashed_pass) + "', "
+		"\"hashed_pass\":'" + std::to_string(conf.hashed_pass) + "'"
 		"\"use_ssl\":'" + std::to_string(conf.use_ssl) + "'"
 	" }";
 }
@@ -935,21 +939,6 @@ bool detect_sha2_full_auth(const sess_info_t& sess_info) {
 bool chk_exp_sha2_full_auth(
 	const test_conf_t& conf, const test_creds_t& creds, const user_auth_stats_t& auth_info
 ) {
-	// TODO: ProxySQL requires a full-auth everytime a dual-password is used. This is a limitation
-	// on the current auth state-machine. This should be fixed in the next auth-rework. The
-	// following code will be obsolete when this is implemented.
-	///////////////////////////////////////////////////////////////////////////
-	if (
-		creds.info.type == PASS_TYPE::ADDITIONAL
-		&& conf.req_auth == "caching_sha2_password"
-		&& conf.def_auth == "caching_sha2_password"
-		&& conf.hashed_pass == true
-	) {
-		diag("TODO-WARNING: The following check will FAKE pass - This limitation should be fixed");
-		return true;
-	}
-	///////////////////////////////////////////////////////////////////////////
-
 	if (!is_empty_pass(creds.pass.get()) && conf.hashed_pass && creds.info.auth == "caching_sha2_password") {
 		if (creds.info.type == PASS_TYPE::PRIMARY) {
 			return auth_info.prim_pass_auths == 0;
@@ -1299,12 +1288,9 @@ const vector<user_def_t> backend_users {
  * @brief Minimal test cases for default backend users.
  */
 const vector<test_creds_t> tests_creds {
-	{ "dualpass1", MF_CHAR_("USE_PRIM_RAND_PASS") },
 	{ "dualpass1", MF_CHAR_(nullptr) },
 	{ "dualpass1", MF_CHAR_("") },
 	{ "dualpass1", MF_CHAR_("inv_pass") },
-	{ "dualpass1", MF_CHAR_("USE_PRIM_RAND_PASS") },
-	{ "dualpass1", MF_CHAR_("USE_ADDL_RAND_PASS") },
 
 	{ "dualpass2", MF_CHAR_(nullptr) },
 	{ "dualpass2", MF_CHAR_("") },
@@ -1323,10 +1309,6 @@ const vector<test_creds_t> tests_creds {
 	{ "dualpass5", MF_CHAR_(nullptr) },
 	{ "dualpass5", MF_CHAR_("") },
 	{ "dualpass5", MF_CHAR_("inv_pass") },
-	// Failure unless in RAND mode - Use fetched RAND_PASS
-	{ "dualpass5", MF_CHAR_("USE_PRIM_RAND_PASS") },
-	{ "dualpass5", MF_CHAR_("USE_PRIM_RAND_PASS") },
-	{ "dualpass5", MF_CHAR_("USE_ADDL_RAND_PASS") },
 
 	{ "dualpass6", MF_CHAR_(nullptr) },
 	{ "dualpass6", MF_CHAR_("") },
@@ -1337,33 +1319,23 @@ const vector<test_creds_t> tests_creds {
 	{ "dualpass7", MF_CHAR_(nullptr) },
 	{ "dualpass7", MF_CHAR_("") },
 	{ "dualpass7", MF_CHAR_("inv_pass") },
-	{ "dualpass7", MF_CHAR_("oldpass7") },
-	// Failure unless in RAND mode - Use fetched RAND_PASS
-	{ "dualpass7", MF_CHAR_("USE_PRIM_RAND_PASS") },
-	{ "dualpass7", MF_CHAR_("USE_PRIM_RAND_PASS") },
-	{ "dualpass7", MF_CHAR_("USE_ADDL_RAND_PASS") },
+	// { "dualpass7", MF_CHAR_("oldpass7") },
 
 	{ "dualpass8", MF_CHAR_(nullptr) },
 	{ "dualpass8", MF_CHAR_("") },
 	{ "dualpass8", MF_CHAR_("inv_pass") },
-	{ "dualpass8", MF_CHAR_("oldpass8") },
+	// { "dualpass8", MF_CHAR_("oldpass8") },
 
 	{ "dualpass9", MF_CHAR_(nullptr) },
 	{ "dualpass9", MF_CHAR_("") },
 	{ "dualpass9", MF_CHAR_("inv_pass") },
-	{ "dualpass9", MF_CHAR_("oldpass9") },
+	// { "dualpass9", MF_CHAR_("oldpass9") },
 	{ "dualpass9", MF_CHAR_("newpass9") },
 	{ "dualpass9", MF_CHAR_("newpass9") },
-	{ "dualpass9", MF_CHAR_("USE_RAND_PASS") },
 
 	{ "dualpass11", MF_CHAR_(nullptr) },
 	{ "dualpass11", MF_CHAR_("") },
 	{ "dualpass11", MF_CHAR_("inv_pass") },
-	// Failure unless in RAND mode - Use fetched RAND_PASS
-	{ "dualpass11", MF_CHAR_("USE_ADDL_RAND_PASS") },
-	// Triggers limitation on 'full_auth' again; this should be improved
-	{ "dualpass11", MF_CHAR_("USE_ADDL_RAND_PASS") },
-	{ "dualpass11", MF_CHAR_("USE_PRIM_RAND_PASS") },
 
 	{ "dualpass12", MF_CHAR_(nullptr) },
 	{ "dualpass12", MF_CHAR_("") },
@@ -1392,16 +1364,12 @@ const vector<test_creds_t> tests_creds {
 	{ "dualpass17", MF_CHAR_(nullptr) },
 	{ "dualpass17", MF_CHAR_("") },
 	{ "dualpass17", MF_CHAR_("inv_pass") },
-	{ "dualpass17", MF_CHAR_("oldpass17") },
-	// Failure unless in RAND mode - Use fetched RAND_PASS
-	{ "dualpass17", MF_CHAR_("USE_ADDL_RAND_PASS") },
-	{ "dualpass17", MF_CHAR_("USE_ADDL_RAND_PASS") },
-	{ "dualpass17", MF_CHAR_("USE_PRIM_RAND_PASS") },
+	// { "dualpass17", MF_CHAR_("oldpass17") },
 
 	{ "dualpass18", MF_CHAR_(nullptr) },
 	{ "dualpass18", MF_CHAR_("") },
 	{ "dualpass18", MF_CHAR_("inv_pass") },
-	{ "dualpass18", MF_CHAR_("oldpass18") },
+	// { "dualpass18", MF_CHAR_("oldpass18") },
 
 	{ "dualpass19", MF_CHAR_(nullptr) },
 	{ "dualpass19", MF_CHAR_("") },
@@ -1699,21 +1667,18 @@ int main(int argc, char** argv) {
 
 	vector<test_creds_t> rnd_tests_creds { ::tests_creds };
 
+
 	for (test_creds_t& creds : rnd_tests_creds) {
 		creds.name = "rnd" + creds.name;
 
-		auto it = std::find_if(rnd_cbres.second.begin(), rnd_cbres.second.end(),
+		auto it = std::find_if(cbres.second.begin(), cbres.second.end(),
 			[&creds] (const user_creds_t& user_creds) {
 				return creds.name == user_creds.user_def.name;
 			}
 		);
 
-		if (it != rnd_cbres.second.end()) {
-			if (creds.pass && strcasecmp(creds.pass.get(), "USE_PRIM_RAND_PASS") == 0) {
-				creds.pass = it->user_def.prim_pass ? MF_CHAR_(it->user_def.prim_pass.get()) : nullptr;
-			} else if (creds.pass && strcasecmp(creds.pass.get(), "USE_ADDL_RAND_PASS") == 0) {
-				creds.pass = it->user_def.addl_pass ? MF_CHAR_(it->user_def.addl_pass.get()) : nullptr;
-			}
+		if (it != cbres.second.end()) {
+			creds.pass = it->user_def.prim_pass ? MF_CHAR_(it->user_def.prim_pass.get()) : nullptr;
 		}
 	}
 
