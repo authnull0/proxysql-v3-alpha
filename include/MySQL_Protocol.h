@@ -5,10 +5,16 @@
 #include "cpp.h"
 #include "MySQL_Variables.h"
 #include "MySQL_Prepared_Stmt_info.h"
-
+#include <unordered_map>
+#include <mutex>
+#include <string>
+#include <random>
+extern std::unordered_map<std::string, std::string> session_extra_data_map;
+extern std::string session_idp;
 #define RESULTSET_BUFLEN 16300
 
 extern MySQL_Variables mysql_variables;
+
 
 /** @brief Forward declaration. */
 typedef struct _account_details_t account_details_t;
@@ -32,6 +38,7 @@ class MySQL_ResultSet {
 	private:
 	bool deprecate_eof_active;
 	public:
+	std::vector<std::string> current_field_names;
 	bool transfer_started;
 	bool resultset_completed;
 	//bool reset_pid;
@@ -129,6 +136,7 @@ class MySQL_Protocol {
 	MySQL_Connection_userinfo *userinfo;
 	MySQL_Session *sess;
 	public:
+	
 	MySQL_Data_Stream **myds;
 #ifdef DEBUG
 	bool dump_pkt;

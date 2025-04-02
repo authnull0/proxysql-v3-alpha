@@ -10,7 +10,7 @@ using json = nlohmann::json;
 #include "re2/re2.h"
 #include "re2/regexp.h"
 #include "mysqld_error.h"
-
+#include <random>
 #include "MySQL_Data_Stream.h"
 #include "MySQL_Query_Processor.h"
 #include "MySQL_PreparedStatement.h"
@@ -22,7 +22,14 @@ using json = nlohmann::json;
 #include "SQLite3_Server.h"
 #include "MySQL_Variables.h"
 #include "ProxySQL_Cluster.hpp"
-
+#include <string>
+#include <nlohmann/json.hpp>
+#include <unordered_map>
+#include <mutex>
+#include <sstream>
+#include <iostream>
+#include <curl/curl.h>
+#include <regex>
 
 #include "libinjection.h"
 #include "libinjection_sqli.h"
@@ -590,7 +597,17 @@ bool Query_Info::is_select_NOT_for_update() {
 	return true;
 }
 
-
+long unsigned int stringToUnsignedLong(const std::string& str) {
+    try {
+        return std::stoul(str); // Convert string to unsigned long
+    } catch (const std::invalid_argument& e) {
+        // Handle the case where conversion fails
+        return 0; // or some other default value
+    } catch (const std::out_of_range& e) {
+        // Handle the case where the number is too large
+        return ULONG_MAX; // or some other default value
+    }
+}
 void MySQL_Session::set_status(enum session_status e) {
 	if (e==session_status___NONE) {
 		if (mybe) {
@@ -608,7 +625,1513 @@ void MySQL_Session::set_status(enum session_status e) {
 /**
  * @brief Constructs a new MySQL session object.
  */
+
+
+
+static std::unordered_map<std::string, uint64_t> username_session_map;
+static std::mutex username_session_mutex;
+std::unordered_map<std::string, std::vector<std::string>> user_database_access;
+std::unordered_map<std::string, std::string> session_to_usertype;
+std::string sessionI;
+std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies;
+std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges;
+
+
+std::string current_table;
+std::map<std::string, std::vector<std::string>> fieldMaskingPolicy;
+std::map<std::string, std::string> alias_to_table;
+std::map<std::string, std::vector<std::string>> query_tables_fields;
+std::string current_query_table;
+std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map;
+std::string latestSessionId;
+std::string latestDB;
+std::string latestUser;
+std::vector<std::regex> read_patterns;
+std::vector<std::regex> write_patterns;
+std::vector<std::regex> execute_patterns;
+std::string authtoken;
+int authnull_org_id;
+int authnull_tenant_id;
+std::string authnull_api_url;
+void loadAuthNullConfig() {
+    authnull_org_id = GloVars.confFile->get_int("authnull", "org_id", 0);
+    authnull_tenant_id = GloVars.confFile->get_int("authnull", "tenant_id", 0);
+    authnull_api_url = GloVars.confFile->get_string("authnull", "api_url", "");
+}
+size_t WriteCallback(void *contents, size_t size, size_t nmemb, std::string *output) {
+    size_t totalSize = size * nmemb;
+    output->append((char *)contents, totalSize);
+    return totalSize;
+}
+
+#include <ctime>
+#include <random>
+#include <sstream>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+std::string generateRandomSessionID() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(100000, 999999);
+    
+    std::ostringstream ss;
+    ss << "session_" << dis(gen);
+    return ss.str();
+}
+bool performMFA(std::string user_ip, std::string user_device_ip, std::string user, std::string db_name, std::string authtoken) {
+    CURL *curl;
+    CURLcode res;
+    long http_code = 0;
+    curl = curl_easy_init();
+    std::time_t epoch_time = std::time(nullptr);
+
+    if (!curl) {
+        std::cerr << "CURL Initialization Failed!" << std::endl;
+        return false;
+    }
+
+    nlohmann::json requestData = {
+        {"username", user}, 
+        {"credentialType", "DATABASE"},
+        {"orgId", authnull_org_id},
+        {"tenantId", authnull_tenant_id},
+        {"requestId", generateRandomSessionID()},
+        {"dbUser", user},
+        {"userIp", user_device_ip},
+        {"database_host", user_ip},
+        {"hostname", db_name},
+        {"databaseType", "mysql"},
+        {"databaseName", db_name},
+		{"token", authtoken},
+        {"timestamp", epoch_time}
+    };
+
+    std::string json_payload = requestData.dump();
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_URL, authnull_api_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    
+    // Handle redirects
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    
+    // Set timeout to prevent hanging
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L); // 30 seconds timeout
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L); // 10 seconds connect timeout
+
+    res = curl_easy_perform(curl);
+    
+    // Get HTTP status code
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    std::cout << "HTTP Status Code: " << http_code << std::endl;
+
+    curl_easy_cleanup(curl);
+    curl_slist_free_all(headers);
+
+    if (res == CURLE_OK) {
+        std::cout << "MFA API Response: " << response << std::endl;
+        std::cout << "Request Sent: " << requestData.dump(4) << std::endl;
+
+        if (http_code >= 200 && http_code < 300) {
+            try {
+                json jsonResponse = json::parse(response);
+                if (jsonResponse.contains("isValid") && jsonResponse["isValid"].get<bool>() == true) {
+                    std::cout << "MFA Verified Successfully!" << std::endl;
+                    
+                    // Parse and map response data
+                    if (jsonResponse.contains("credential") && 
+                        jsonResponse["credential"].contains("credentialSubject")) {
+                        
+                        auto& credential = jsonResponse["credential"]["credentialSubject"];
+                        
+                        // Extract username and database name
+                        std::string username = user; // Using the passed user parameter
+                        std::string mfa_db = credential["databaseName"].get<std::string>();
+                        
+                        // Extract privileges
+                        std::vector<std::string> mfa_privileges;
+                        if (credential.contains("privilege") && credential["privilege"].is_array()) {
+                            mfa_privileges = credential["privilege"].get<std::vector<std::string>>();
+                        }
+                        
+                        // Extract tables
+                        std::vector<std::string> mfa_tables;
+                        if (credential.contains("tables") && credential["tables"].is_array()) {
+                            mfa_tables = credential["tables"].get<std::vector<std::string>>();
+                        }
+                        
+                        // Update data structures
+                        user_database_access[username] = {mfa_db};
+                        user_database_privileges[username][mfa_db] = mfa_privileges;
+                        
+                        // Update masking policies
+                        std::string key = username + "+" + mfa_db;
+                        std::map<std::string, std::vector<std::string>> masking_policy;
+                        
+                        if (credential.contains("fieldMasking") && credential["fieldMasking"].is_object()) {
+                            auto& fieldMasking = credential["fieldMasking"];
+                            
+                            for (auto& table : mfa_tables) {
+                                if (fieldMasking.contains(table)) {
+                                    masking_policy[table] = fieldMasking[table].get<std::vector<std::string>>();
+                                } else {
+                                    masking_policy[table] = {};
+                                }
+                            }
+                            
+                            usertype_masking_policies[key] = masking_policy;
+                        }
+                        
+                        std::cout << "Mapped MFA data for " << username << ": DB=" << mfa_db 
+                                  << ", Privileges=" << json(mfa_privileges).dump() << std::endl;
+                    }
+                    
+                    return true;
+                } else {
+                    std::cerr << "MFA Failed! Response: " << jsonResponse.dump(4) << std::endl;
+                }
+            } catch (json::exception &e) {
+                std::cerr << "JSON Parsing Error: " << e.what() << " | Response: " << response << std::endl;
+            }
+        } else {
+            std::cerr << "HTTP Error: Status Code " << http_code << ", Response: " << response << std::endl;
+        }
+    } else {
+        std::cerr << "CURL Error: " << curl_easy_strerror(res) << std::endl;
+    }
+
+    return false;
+}
+std::unordered_map<std::string, bool> mfa_status_map; 
+std::mutex mfa_mutex;
+
+std::string getPublicIP() {
+    CURL *curl;
+    CURLcode res;
+    std::string readBuffer;
+
+    curl = curl_easy_init();
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.ipify.org");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, 
+            +[](void *ptr, size_t size, size_t nmemb, std::string *data) -> size_t {
+                data->append((char *)ptr, size * nmemb);
+                return size * nmemb;
+            });
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+        res = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+    }
+    return readBuffer;
+}
+
+
+std::vector<std::string> read_pattern_strs = {
+	"^\\s*SELECT",
+	"^\\s*SHOW",
+	"^\\s*DESCRIBE",
+	"^\\s*EXPLAIN",
+	"^\\s*WITH\\s+.+\\s+SELECT"  
+};
+
+std::vector<std::string> write_pattern_strs = {
+	"^\\s*INSERT",
+	"^\\s*UPDATE",
+	"^\\s*DELETE",
+	"^\\s*REPLACE",
+	"^\\s*MERGE",
+	"^\\s*UPSERT",
+	"^\\s*LOAD\\s+DATA"
+};
+
+std::vector<std::string> execute_pattern_strs = {
+	"^\\s*CREATE",
+	"^\\s*ALTER",
+	"^\\s*DROP",
+	"^\\s*TRUNCATE",
+	"^\\s*GRANT",
+	"^\\s*REVOKE",
+	"^\\s*EXECUTE",
+	"^\\s*CALL",
+	"^\\s*BEGIN",
+	"^\\s*START\\s+TRANSACTION",
+	"^\\s*COMMIT",
+	"^\\s*ROLLBACK",
+	"^\\s*SET",
+	"^\\s*USE"
+};
+
+std::string normalizeQuery(const std::string& query) {
+	std::string result;
+	bool in_whitespace = false;
+	
+	for (char c : query) {
+		if (std::isspace(c)) {
+			if (!in_whitespace) {
+				result += ' ';
+				in_whitespace = true;
+			}
+		} else {
+			result += std::toupper(c);
+			in_whitespace = false;
+		}
+	}
+	
+	size_t comment_pos = result.find("--");
+	if (comment_pos != std::string::npos) {
+		result = result.substr(0, comment_pos);
+	}
+	for (const auto& pattern : read_pattern_strs) {
+		read_patterns.push_back(std::regex(pattern, std::regex_constants::icase));
+	}
+	
+	for (const auto& pattern : write_pattern_strs) {
+		write_patterns.push_back(std::regex(pattern, std::regex_constants::icase));
+	}
+	
+	for (const auto& pattern : execute_pattern_strs) {
+		execute_patterns.push_back(std::regex(pattern, std::regex_constants::icase));
+	}
+	
+	return result;
+}
+
+bool contains(const std::vector<std::string>& vec, const std::string& value) {
+	return std::find(vec.begin(), vec.end(), value) != vec.end();
+}
+
+std::string getQueryType(const std::string& query) {
+	std::string normalized_query = normalizeQuery(query);
+	
+	for (const auto& pattern : read_patterns) {
+		if (std::regex_search(normalized_query, pattern)) {
+			return "READ";
+		}
+	}
+	
+	for (const auto& pattern : write_patterns) {
+		if (std::regex_search(normalized_query, pattern)) {
+			return "WRITE";
+		}
+	}
+	
+	for (const auto& pattern : execute_patterns) {
+		if (std::regex_search(normalized_query, pattern)) {
+			return "EXECUTE";
+		}
+	}
+	
+	// Default to EXECUTE for unrecognized queries as a safety measure
+	return "EXECUTE";
+}
+
+
+bool checkPermission(const std::string& username, const std::string& query, const std::string& databaseName) {
+    // Step 1: Determine the required privilege for the query
+    std::string required_privilege = getQueryType(query); // e.g., "READ", "WRITE", "EXECUTE"
+    
+    // Step 2: Check if the username has access to the specified database
+    auto dbAccessIt = user_database_access.find(username);
+    if (dbAccessIt == user_database_access.end() || 
+        std::find(dbAccessIt->second.begin(), dbAccessIt->second.end(), databaseName) == dbAccessIt->second.end()) {
+        std::cout << "[ERROR] User " << username << " has no access to database " << databaseName << std::endl;
+        return false;
+    }
+
+    // Step 3: Fetch the user's privileges for the specific database
+    auto userPrivsIt = user_database_privileges.find(username);
+    if (userPrivsIt != user_database_privileges.end()) {
+        auto dbPrivsIt = userPrivsIt->second.find(databaseName);
+        if (dbPrivsIt != userPrivsIt->second.end()) {
+            std::vector<std::string> user_privs = dbPrivsIt->second;
+            
+            // Step 4: Check if the required privilege is present
+            if (contains(user_privs, required_privilege)) {
+                std::cout << "[DEBUG] Permission granted for " << username << " on " << databaseName 
+                          << " for " << required_privilege << std::endl;
+                return true;
+            } else {
+                std::cout << "[DEBUG] Permission denied for " << username << " on " << databaseName 
+                          << ": lacks " << required_privilege << std::endl;
+                return false;
+            }
+        } else {
+            std::cout << "[DEBUG] No privileges defined for " << username << " on " << databaseName << std::endl;
+        }
+    } else {
+        std::cout << "[DEBUG] No privilege data found for user: " << username << std::endl;
+    }
+
+    // Step 5: Default to deny if no privileges are found
+    return false;
+}
+
+
+
+std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(
+    const std::string& sessionID, const std::string& databaseName, const std::string& user) {
+    
+    std::lock_guard<std::mutex> lock(username_session_mutex);
+    
+    // Create the composite key
+    std::string composite_key = user + "+" + databaseName;
+    
+    std::cout << "[DEBUG] Looking up policy for " << composite_key << std::endl;
+    
+    // Look up the policy using the composite key
+    auto policy_it = usertype_masking_policies.find(composite_key);
+    if (policy_it != usertype_masking_policies.end()) {
+        std::cout << "[DEBUG] Retrieved policy for " << composite_key << std::endl;
+        return policy_it->second;
+    }
+    
+    std::cout << "[DEBUG] No specific policy found for " << composite_key << std::endl;
+    return {}; // Return empty policy if not found
+}
+
+std::vector<std::string> tokenizeSQL(const std::string& sql) {
+    std::vector<std::string> tokens;
+    std::string currentToken;
+    bool inQuotes = false;
+    char quoteChar = '\0';
+    
+    for (size_t i = 0; i < sql.length(); i++) {
+        char c = sql[i];
+        
+        if (c == '\'' || c == '"' || c == '`') {
+            if (!inQuotes) {
+                if (!currentToken.empty()) {
+                    tokens.push_back(currentToken);
+                    currentToken.clear();
+                }
+                inQuotes = true;
+                quoteChar = c;
+                currentToken += c;
+            } else if (c == quoteChar) {
+                currentToken += c;
+                tokens.push_back(currentToken);
+                currentToken.clear();
+                inQuotes = false;
+            } else {
+                currentToken += c;
+            }
+            continue;
+        }
+        
+        if (inQuotes) {
+            currentToken += c;
+            continue;
+        }
+        
+        if (std::isspace(c)) {
+            if (!currentToken.empty()) {
+                tokens.push_back(currentToken);
+                currentToken.clear();
+            }
+            continue;
+        }
+
+        if (c == ',' || c == '(' || c == ')' || c == '=' || c == ';') {
+            if (!currentToken.empty()) {
+                tokens.push_back(currentToken);
+                currentToken.clear();
+            }
+            tokens.push_back(std::string(1, c));
+            continue;
+        }
+
+        currentToken += c;
+    }
+    
+    if (!currentToken.empty()) {
+        tokens.push_back(currentToken);
+    }
+    
+    return tokens;
+}
+
+
+
+
+std::string normalizeFunctionCall(const std::string& functionName, const std::vector<std::string>& args) {
+    std::string normalized = functionName + "(";
+    for (size_t i = 0; i < args.size(); i++) {
+        if (i > 0) normalized += ",";
+        
+        // Extract only the core tokens, ignoring whitespace
+        std::string normalizedArg;
+        std::istringstream argStream(args[i]);
+        std::string token;
+        while (argStream >> token) {
+            normalizedArg += token;
+        }
+        normalized += normalizedArg;
+    }
+    normalized += ")";
+    return normalized;
+}
+
+void processFunctionCall(size_t& i, const std::vector<std::string>& tokens, 
+                         std::map<std::string, std::vector<std::string>>& query_tables_fields,
+                         const std::map<std::string, std::string>& alias_to_table,
+                         const std::map<std::string, std::vector<std::string>>& fieldMaskingPolicy,
+                         std::unordered_map<std::string, std::pair<std::string, std::string>>& field_alias_map) {
+    
+    std::string functionName = tokens[i];
+    std::transform(functionName.begin(), functionName.end(), functionName.begin(), ::tolower);
+    
+    // Verify it's actually a function call with parentheses
+    if (i + 1 >= tokens.size() || tokens[i + 1] != "(") {
+        return;
+    }
+    
+    // Track all arguments in the function call
+    std::vector<std::string> args;
+    int depth = 0;
+    std::string currentArg;
+    
+    // Parse all arguments inside the function call
+    for (size_t j = i + 2; j < tokens.size(); j++) {
+        if (tokens[j] == "(") {
+            depth++;
+            currentArg += tokens[j] + " ";
+        }
+        else if (tokens[j] == ")") {
+            if (depth == 0) {
+                // End of function call
+                if (!currentArg.empty()) {
+                    args.push_back(currentArg);
+                }
+                i = j; // Update the main loop counter
+                break;
+            }
+            depth--;
+            currentArg += tokens[j] + " ";
+        }
+        else if (tokens[j] == "," && depth == 0) {
+            // Argument separator at the main level
+            args.push_back(currentArg);
+            currentArg = "";
+        }
+        else {
+            currentArg += tokens[j] + " ";
+        }
+    }
+    
+    // Process each argument to find field references
+    for (const auto& arg : args) {
+        // Skip literals, constants, and function keywords
+        if (arg.empty() || 
+            (arg.front() == '\'' && arg.back() == '\'') || 
+            (arg.front() == '"' && arg.back() == '"') ||
+            std::all_of(arg.begin(), arg.end(), [](char c) { return std::isdigit(c) || c == '.'; })) {
+            continue;
+        }
+        
+        // Process argument tokens to extract potential field names
+        std::istringstream argStream(arg);
+        std::string token;
+        while (argStream >> token) {
+            // Skip SQL keywords and type casts
+            std::string lowerToken = token;
+            std::transform(lowerToken.begin(), lowerToken.end(), lowerToken.begin(), ::tolower);
+            
+            const std::unordered_set<std::string> skipTokens = {
+                "as", "from", "where", "char", "signed", "unsigned", "decimal", 
+                "interval", "day", "year", "month", "hour", "minute", "second"
+            };
+            
+            if (skipTokens.count(lowerToken)) {
+                continue;
+            }
+            
+            // Check if token is a qualified field reference (table.field)
+            size_t dotPos = token.find(".");
+            if (dotPos != std::string::npos) {
+                std::string tableAlias = token.substr(0, dotPos);
+                std::string fieldName = token.substr(dotPos + 1);
+                
+                // Remove quotes if present
+                if (fieldName.length() >= 2 && 
+                    ((fieldName.front() == '"' && fieldName.back() == '"') ||
+                     (fieldName.front() == '`' && fieldName.back() == '`'))) {
+                    fieldName = fieldName.substr(1, fieldName.length() - 2);
+                }
+                
+                if (alias_to_table.count(tableAlias)) {
+                    std::string tableName = alias_to_table.at(tableAlias);
+                    
+                    // Check if this field should be masked according to policy
+                    if (fieldMaskingPolicy.count(tableName) && 
+                        std::find(fieldMaskingPolicy.at(tableName).begin(), 
+                                 fieldMaskingPolicy.at(tableName).end(), 
+                                 fieldName) != fieldMaskingPolicy.at(tableName).end()) {
+                        
+                        // Add to query_tables_fields if not already there
+                        if (std::find(query_tables_fields[tableName].begin(), 
+                                     query_tables_fields[tableName].end(), 
+                                     fieldName) == query_tables_fields[tableName].end()) {
+                            query_tables_fields[tableName].push_back(fieldName);
+                            std::cout << "[DEBUG] Added field from function arg: " 
+                                     << tableName << "." << fieldName << std::endl;
+                        }
+                    }
+                }
+            } 
+            else {
+                // Unqualified field name - check against all tables in masking policy
+                for (const auto& [tableName, fields] : fieldMaskingPolicy) {
+                    if (std::find(fields.begin(), fields.end(), token) != fields.end()) {
+                        // This is a sensitive field that needs masking
+                        if (std::find(query_tables_fields[tableName].begin(), 
+                                     query_tables_fields[tableName].end(), 
+                                     token) == query_tables_fields[tableName].end()) {
+                            query_tables_fields[tableName].push_back(token);
+                            std::cout << "[DEBUG] Added unqualified field from function: " 
+                                     << tableName << "." << token << std::endl;
+                        }
+                        break;
+                    }
+                }
+                
+                // For tables already in the query, check if field exists in any table
+                for (const auto& [tableName, _] : query_tables_fields) {
+                    if (fieldMaskingPolicy.count(tableName) && 
+                        std::find(fieldMaskingPolicy.at(tableName).begin(), 
+                                 fieldMaskingPolicy.at(tableName).end(), 
+                                 token) != fieldMaskingPolicy.at(tableName).end()) {
+                        
+                        if (std::find(query_tables_fields[tableName].begin(), 
+                                     query_tables_fields[tableName].end(), 
+                                     token) == query_tables_fields[tableName].end()) {
+                            query_tables_fields[tableName].push_back(token);
+                            std::cout << "[DEBUG] Added field to existing table: " 
+                                     << tableName << "." << token << std::endl;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Handle function result alias
+    std::string functionAlias = "";
+    if (i + 2 < tokens.size() && tokens[i + 1] == "as") {
+        functionAlias = tokens[i + 2];
+        i += 2;
+    } else if (i + 1 < tokens.size() && tokens[i + 1] != "," && 
+              tokens[i + 1] != "from" && tokens[i + 1] != "where") {
+        functionAlias = tokens[i + 1];
+        i += 1;
+    }
+    
+    // Map the function alias to the fields used inside it
+    if (!functionAlias.empty()) {
+        // For simplicity, map to the first field found in args
+        for (const auto& arg : args) {
+            std::istringstream argStream(arg);
+            std::string token;
+            while (argStream >> token) {
+                // Try to find a matching field in any table
+                for (const auto& [tableName, fields] : query_tables_fields) {
+                    if (std::find(fields.begin(), fields.end(), token) != fields.end()) {
+                        field_alias_map[functionAlias] = std::make_pair(tableName, token);
+                        std::cout << "[DEBUG] Mapped function alias to field: " 
+                                 << functionAlias << " -> " << tableName << "." << token << std::endl;
+                        return; // Stop after finding first match
+                    }
+                }
+                
+                // Check qualified references
+                size_t dotPos = token.find(".");
+                if (dotPos != std::string::npos) {
+                    std::string tableAlias = token.substr(0, dotPos);
+                    std::string fieldName = token.substr(dotPos + 1);
+                    
+                    if (alias_to_table.count(tableAlias)) {
+                        std::string tableName = alias_to_table.at(tableAlias);
+                        field_alias_map[functionAlias] = std::make_pair(tableName, fieldName);
+                        std::cout << "[DEBUG] Mapped function alias to qualified field: " 
+                                 << functionAlias << " -> " << tableName << "." << fieldName << std::endl;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+	else { 
+		// NEW CODE: Handle case with no explicit alias 
+		// Create a default alias based on the function name and arguments 
+		std::string exactAlias = functionName + "("; 
+		for (size_t argIdx = 0; argIdx < args.size(); argIdx++) { 
+			if (argIdx > 0) exactAlias += ","; 
+			exactAlias += args[argIdx]; 
+		} 
+		exactAlias += ")"; 
+		
+		// Create normalized version without spaces 
+		std::string normalizedAlias = functionName + "("; 
+		for (size_t argIdx = 0; argIdx < args.size(); argIdx++) { 
+			if (argIdx > 0) normalizedAlias += ","; 
+			// Remove all spaces from argument 
+			std::string normalizedArg; 
+			for (char c : args[argIdx]) { 
+				if (!std::isspace(c)) { 
+					normalizedArg += c; 
+				} 
+			} 
+			normalizedAlias += normalizedArg; 
+		} 
+		normalizedAlias += ")"; 
+			
+		// Use these aliases to map to the fields 
+		for (const auto& arg : args) { 
+			// Process the same way as you do for explicit aliases 
+			std::istringstream argStream(arg); 
+			std::string token; 
+			while (argStream >> token) { 
+				// Try to find a matching field in any table 
+				for (const auto& [tableName, fields] : query_tables_fields) { 
+					if (std::find(fields.begin(), fields.end(), token) != fields.end()) { 
+						field_alias_map[exactAlias] = std::make_pair(tableName, token); 
+						field_alias_map[normalizedAlias] = std::make_pair(tableName, token); 
+						std::cout << "[DEBUG] Mapped function aliases to field: "  
+								<< exactAlias << " and " << normalizedAlias 
+								<< " -> " << tableName << "." << token << std::endl; 
+						return; 
+					} 
+				} 
+				
+				// Check qualified references 
+				size_t dotPos = token.find("."); 
+				if (dotPos != std::string::npos) { 
+					std::string tableAlias = token.substr(0, dotPos); 
+					std::string fieldName = token.substr(dotPos + 1); 
+					
+					if (alias_to_table.count(tableAlias)) { 
+						std::string tableName = alias_to_table.at(tableAlias); 
+						field_alias_map[exactAlias] = std::make_pair(tableName, fieldName); 
+						field_alias_map[normalizedAlias] = std::make_pair(tableName, fieldName); 
+						std::cout << "[DEBUG] Mapped function aliases to qualified field: "  
+								<< exactAlias << " and " << normalizedAlias 
+								<< " -> " << tableName << "." << fieldName << std::endl; 
+						return; 
+					} 
+				} 
+			} 
+		} 
+	}
+}
+
+
+void extractTableAndFieldsFromQuery(const std::string& query, const std::string& sessionI,const std::string& username,const std::string& db_name) {
+    alias_to_table.clear();
+    std::string nm = sessionI;
+	std::string db = db_name;
+	std::string user = username;
+    fieldMaskingPolicy = getMaskingPolicyForSession(nm, db, user);
+    query_tables_fields.clear();
+    field_alias_map.clear(); 
+    current_query_table.clear();
+    
+    std::cout << "[DEBUG] Parsing query: " << query << std::endl;
+
+    std::string normalizedQuery = query;
+    std::transform(normalizedQuery.begin(), normalizedQuery.end(), normalizedQuery.begin(), ::tolower);
+
+    std::vector<std::string> tokens = tokenizeSQL(normalizedQuery);
+    
+    // Parser state
+    bool foundSelect = false;
+    bool foundFrom = false;
+    bool inSelectClause = false;
+    bool inFromClause = false;
+    bool expectingTableName = false;
+    bool expectingAlias = false;
+    bool isStarQuery = false;
+    int parenLevel = 0;
+    bool inSubquery = false;
+    bool hasAggregates = false;
+    
+    std::string lastTable = "";
+    std::string lastKeyword = "";
+    std::string lastField = "";
+    std::vector<std::pair<std::string, std::string>> selectFields;
+    std::unordered_map<std::string, std::vector<std::string>> subqueryTables;
+    std::string currentSubqueryAlias = "";
+
+    const std::unordered_set<std::string> sqlKeywords = {
+        "select", "from", "where", "join", "inner", "left", "right", "full", "cross", "outer", "on", 
+        "order", "by", "group", "having", "limit", "offset", "union", "as", "and", "or", "not",
+        "case", "when", "then", "else", "end", "distinct", "all", "any", "between", "in", "like", 
+    };
+    
+    const std::unordered_set<std::string> aggregateFunctions = {
+        "sum", "count", "avg", "min", "max", "abs", "upper",
+		"lower", "length", "trim", "ceil", "floor", "date",
+		"year", "month", "day", "stddev", "variance", "cast",
+		"convert"
+    };
+    
+    for (size_t i = 0; i < tokens.size(); i++) {
+        std::string token = tokens[i];
+        std::string lowerToken = token;
+        std::transform(lowerToken.begin(), lowerToken.end(), lowerToken.begin(), ::tolower);
+		if (i + 1 < tokens.size() && tokens[i + 1] == "(") {
+			// Process functions properly
+			processFunctionCall(i, tokens, query_tables_fields, alias_to_table, fieldMaskingPolicy, field_alias_map);
+			continue;
+		}
+        if (token == "(") {
+            parenLevel++;
+
+            // Enhanced subquery detection and handling
+            if (i + 1 < tokens.size() && tokens[i + 1] == "select") {
+                inSubquery = true;
+                
+                std::string subqueryAlias = "";
+                std::vector<std::pair<std::string, std::string>> subqueryFields;
+                std::vector<std::string> subqueryTablesList;
+                
+                int subqueryStart = i;
+                int subqueryParenLevel = 1;
+                int subquerySelectIndex = i + 1;
+                int subqueryFromIndex = -1;
+                int subqueryEndIndex = -1;
+
+                // First scan to find the boundaries of the subquery
+                for (size_t j = i + 1; j < tokens.size(); j++) {
+                    if (tokens[j] == "(") {
+                        subqueryParenLevel++;
+                    } else if (tokens[j] == ")") {
+                        subqueryParenLevel--;
+                        if (subqueryParenLevel == 0) {
+                            subqueryEndIndex = j;
+                            break;
+                        }
+                    } else if (tokens[j] == "from" && subqueryFromIndex == -1) {
+                        subqueryFromIndex = j;
+                    }
+                }
+
+                if (subqueryEndIndex > 0 && subqueryFromIndex > 0) {
+                    // Process the subquery's SELECT clause
+                    std::string subquerySelectedField = "";
+                    for (size_t j = subquerySelectIndex + 1; j < subqueryFromIndex; j++) {
+                        if (tokens[j] != "," && !sqlKeywords.count(tokens[j])) {
+                            size_t dotPos = tokens[j].find(".");
+                            if (dotPos != std::string::npos) {
+                                std::string tableAlias = tokens[j].substr(0, dotPos);
+                                std::string fieldName = tokens[j].substr(dotPos + 1);
+                                
+                                if (fieldName.length() >= 2 && 
+                                    ((fieldName.front() == '"' && fieldName.back() == '"') ||
+                                     (fieldName.front() == '`' && fieldName.back() == '`'))) {
+                                    fieldName = fieldName.substr(1, fieldName.length() - 2);
+                                }
+                                
+                                subquerySelectedField = fieldName;
+                                subqueryFields.push_back(std::make_pair(tableAlias, fieldName));
+                            } else {
+                                subquerySelectedField = tokens[j];
+                                subqueryFields.push_back(std::make_pair("", tokens[j]));
+                            }
+                        }
+                    }
+
+                    // Process the subquery's FROM clause
+                    std::string subqueryTable = "";
+                    for (size_t j = subqueryFromIndex + 1; j < subqueryEndIndex; j++) {
+                        if (tokens[j] != "where" && tokens[j] != "and" && tokens[j] != "or" && 
+                            tokens[j] != "," && !sqlKeywords.count(tokens[j]) && 
+                            tokens[j] != "(" && tokens[j] != ")") {
+                            
+                            if (subqueryTable.empty()) {
+                                subqueryTable = tokens[j];
+                                
+                                if (subqueryTable.length() >= 2 && 
+                                    ((subqueryTable.front() == '"' && subqueryTable.back() == '"') ||
+                                     (subqueryTable.front() == '`' && subqueryTable.back() == '`'))) {
+                                    subqueryTable = subqueryTable.substr(1, subqueryTable.length() - 2);
+                                }
+                                
+                                subqueryTablesList.push_back(subqueryTable);
+                                
+                                // Initialize tables in query_tables_fields if they don't exist
+                                if (query_tables_fields.find(subqueryTable) == query_tables_fields.end()) {
+                                    query_tables_fields[subqueryTable] = {};
+                                }
+                                
+                                std::cout << "[DEBUG] Added subquery table: " << subqueryTable << std::endl;
+                            }
+                            
+                            // Check for table alias
+                            if (j + 1 < subqueryEndIndex) {
+                                if (tokens[j + 1] == "as" && j + 2 < subqueryEndIndex) {
+                                    alias_to_table[tokens[j + 2]] = subqueryTable;
+                                    std::cout << "[DEBUG] Added subquery table alias: " << tokens[j + 2] 
+                                              << " -> " << subqueryTable << std::endl;
+                                    j += 2;
+                                } else if (!sqlKeywords.count(tokens[j + 1]) && 
+                                           tokens[j + 1] != "where" && tokens[j + 1] != "," && 
+                                           tokens[j + 1] != ")" && tokens[j + 1] != "(") {
+                                    alias_to_table[tokens[j + 1]] = subqueryTable;
+                                    std::cout << "[DEBUG] Added subquery table alias: " << tokens[j + 1] 
+                                              << " -> " << subqueryTable << std::endl;
+                                    j += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    // Check for AS clause after the closing parenthesis
+                    if (subqueryEndIndex + 2 < tokens.size() && tokens[subqueryEndIndex + 1] == "as") {
+                        subqueryAlias = tokens[subqueryEndIndex + 2];
+                        i = subqueryEndIndex + 2; // Skip to after the alias
+                    } else if (subqueryEndIndex + 1 < tokens.size() && 
+                               !sqlKeywords.count(tokens[subqueryEndIndex + 1]) && 
+                               tokens[subqueryEndIndex + 1] != "," && 
+                               tokens[subqueryEndIndex + 1] != ")") {
+                        subqueryAlias = tokens[subqueryEndIndex + 1];
+                        i = subqueryEndIndex + 1; // Skip to after the alias
+                    } else {
+                        i = subqueryEndIndex; // Skip to the closing parenthesis
+                    }
+
+                    // Map subquery alias to its source field
+                    if (!subqueryAlias.empty() && !subqueryTablesList.empty() && !subqueryFields.empty()) {
+                        for (const auto& fieldPair : subqueryFields) {
+                            std::string tableAlias = fieldPair.first;
+                            std::string fieldName = fieldPair.second;
+                            
+                            if (!tableAlias.empty() && alias_to_table.count(tableAlias)) {
+                                std::string actualTable = alias_to_table[tableAlias];
+                                
+                                // Add the field to the table's fields list
+                                if (std::find(query_tables_fields[actualTable].begin(), 
+                                             query_tables_fields[actualTable].end(), 
+                                             fieldName) == query_tables_fields[actualTable].end()) {
+                                    query_tables_fields[actualTable].push_back(fieldName);
+                                    std::cout << "[DEBUG] Added field from subquery: " << actualTable 
+                                              << "." << fieldName << std::endl;
+                                }
+                                
+                                // Map the subquery alias to this table and field
+                                field_alias_map[subqueryAlias] = std::make_pair(actualTable, fieldName);
+                                std::cout << "[DEBUG] Added subquery alias mapping: " << subqueryAlias 
+                                          << " -> " << actualTable << "." << fieldName << std::endl;
+                            } else {
+                                // If we don't have a table alias, try to find the right table
+                                for (const auto& sqTable : subqueryTablesList) {
+                                    if (fieldMaskingPolicy.count(sqTable)) {
+                                        for (const auto& maskField : fieldMaskingPolicy[sqTable]) {
+                                            if (maskField == fieldName) {
+                                                // Add field to table's fields list
+                                                if (std::find(query_tables_fields[sqTable].begin(), 
+                                                            query_tables_fields[sqTable].end(), 
+                                                            fieldName) == query_tables_fields[sqTable].end()) {
+                                                    query_tables_fields[sqTable].push_back(fieldName);
+                                                    std::cout << "[DEBUG] Added field from subquery by mask policy match: " 
+                                                              << sqTable << "." << fieldName << std::endl;
+                                                }
+                                                
+                                                // Map the subquery alias
+                                                field_alias_map[subqueryAlias] = std::make_pair(sqTable, fieldName);
+                                                std::cout << "[DEBUG] Added subquery alias mapping by mask policy: " 
+                                                          << subqueryAlias << " -> " << sqTable << "." << fieldName << std::endl;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // If we still don't have a mapping, use the first table
+                                if (field_alias_map.find(subqueryAlias) == field_alias_map.end() && 
+                                    !subqueryTablesList.empty()) {
+                                    std::string firstTable = subqueryTablesList[0];
+                                    if (std::find(query_tables_fields[firstTable].begin(), 
+                                                query_tables_fields[firstTable].end(), 
+                                                fieldName) == query_tables_fields[firstTable].end()) {
+                                        query_tables_fields[firstTable].push_back(fieldName);
+                                    }
+                                    
+                                    field_alias_map[subqueryAlias] = std::make_pair(firstTable, fieldName);
+                                    std::cout << "[DEBUG] Added default subquery alias mapping: " << subqueryAlias 
+                                              << " -> " << firstTable << "." << fieldName << std::endl;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Store subquery tables for later reference
+                    if (!subqueryAlias.empty()) {
+                        subqueryTables[subqueryAlias] = subqueryTablesList;
+                    }
+                }
+            }
+            continue;
+        }
+        
+        if (token == ")") {
+            parenLevel--;
+            if (parenLevel < 0) parenLevel = 0; 
+            continue;
+        }
+
+        if (token == "," || token == ";" || token == "=") {
+            continue;
+        }
+        
+        // Process SQL keywords
+        if (sqlKeywords.count(lowerToken)) {
+            if (lowerToken == "select") {
+                foundSelect = true;
+                inSelectClause = true;
+                inFromClause = false;
+            }
+            else if (lowerToken == "from") {
+                foundFrom = true;
+                inSelectClause = false;
+                inFromClause = true;
+                expectingTableName = true;
+            }
+            else if (lowerToken == "join" || lowerToken == "inner" || lowerToken == "left" || 
+                     lowerToken == "right" || lowerToken == "full" || lowerToken == "cross") {
+                if (i + 1 < tokens.size() && tokens[i + 1] == "join") {
+                    continue;
+                }
+                expectingTableName = true;
+            }
+            else if (lowerToken == "as") {
+                expectingAlias = true;
+            }
+            
+            lastKeyword = lowerToken;
+            continue;
+        }
+        
+        // Process SELECT clause elements
+        if (inSelectClause) {
+            if (token == "*") {
+                isStarQuery = true;
+                continue;
+            }
+
+            bool isAggregate = false;
+            std::string aggregateField = "";
+			// In the SELECT clause processing section, where aggregate functions are handled
+			if (i + 1 < tokens.size() && tokens[i + 1] == "(") {
+				std::string funcName = lowerToken;
+				if (aggregateFunctions.count(funcName)) {
+					hasAggregates = true;
+					isAggregate = true;
+
+					// Keep track of the function name for later reference
+					std::string aggregateFunc = funcName;
+					
+					int nestedParens = 0;
+					std::string aggregateField = "";
+					std::string aggregateTable = "";
+					
+					// Process the content inside the aggregate function
+					for (size_t j = i + 2; j < tokens.size(); j++) {
+						if (tokens[j] == "(") nestedParens++;
+						else if (tokens[j] == ")") {
+							if (nestedParens == 0) {
+								i = j; 
+								break;
+							}
+							nestedParens--;
+						}
+						else if (nestedParens == 0 && tokens[j] != ",") {
+							aggregateField = tokens[j];
+							
+							size_t dotPos = aggregateField.find(".");
+							if (dotPos != std::string::npos) {
+								std::string tableAlias = aggregateField.substr(0, dotPos);
+								std::string fieldName = aggregateField.substr(dotPos + 1);
+								
+								if (fieldName.length() >= 2 && 
+									((fieldName.front() == '"' && fieldName.back() == '"') ||
+									(fieldName.front() == '`' && fieldName.back() == '`'))) {
+									fieldName = fieldName.substr(1, fieldName.length() - 2);
+								}
+								
+								if (alias_to_table.count(tableAlias)) {
+									aggregateTable = alias_to_table[tableAlias];
+									
+									// Check if this is a sensitive field that needs masking
+									if (fieldMaskingPolicy.count(aggregateTable) &&
+										std::find(fieldMaskingPolicy[aggregateTable].begin(),
+												fieldMaskingPolicy[aggregateTable].end(),
+												fieldName) != fieldMaskingPolicy[aggregateTable].end()) {
+										query_tables_fields[aggregateTable].push_back(fieldName);
+										std::cout << "[DEBUG] Added sensitive aggregate field: " << aggregateTable 
+												<< "." << fieldName << std::endl;
+									} else {
+										// Add it regardless to ensure proper tracking
+										query_tables_fields[aggregateTable].push_back(fieldName);
+										std::cout << "[DEBUG] Added aggregate field: " << aggregateTable 
+												<< "." << fieldName << std::endl;
+									}
+								}
+							} else {
+								// This is an unqualified field name, need to determine which table it belongs to
+								for (const auto& [tableName, fields] : fieldMaskingPolicy) {
+									if (std::find(fields.begin(), fields.end(), aggregateField) != fields.end()) {
+										// This is a sensitive field in this table
+										aggregateTable = tableName;
+										query_tables_fields[tableName].push_back(aggregateField);
+										std::cout << "[DEBUG] Added unqualified sensitive aggregate field: " 
+												<< tableName << "." << aggregateField << std::endl;
+										break;
+									}
+								}
+								
+								// If we still don't know the table but have tables in the query
+								if (aggregateTable.empty() && !query_tables_fields.empty()) {
+									// Assign to the first table in the query as a best guess
+									auto it = query_tables_fields.begin();
+									aggregateTable = it->first;
+									query_tables_fields[aggregateTable].push_back(aggregateField);
+									std::cout << "[DEBUG] Assigned unqualified aggregate field to first table: " 
+											<< aggregateTable << "." << aggregateField << std::endl;
+								}
+							}
+						}
+					}
+					
+					// Handle the alias for the aggregate expression
+					std::string alias = "";
+					if (i + 2 < tokens.size() && tokens[i + 1] == "as" && i + 2 < tokens.size()) {
+						alias = tokens[i + 2];
+						i += 2;
+					} else if (i + 1 < tokens.size() && tokens[i + 1] != "," && 
+							!sqlKeywords.count(tokens[i + 1]) && tokens[i + 1] != "from") {
+						alias = tokens[i + 1];
+						i += 1;
+					} else {
+						// No explicit alias - create an implicit one based on the function and field
+						alias = aggregateFunc + "_" + (!aggregateField.empty() ? aggregateField : "expr");
+						std::cout << "[DEBUG] Created implicit aggregate alias: " << alias << std::endl;
+					}
+					
+					// Map the alias to the table and field
+					if (!aggregateField.empty()) {
+						field_alias_map[alias] = std::make_pair(aggregateTable, aggregateField);
+						std::cout << "[DEBUG] Added aggregate field alias mapping: " << alias << " -> " 
+								<< aggregateTable << "." << aggregateField << std::endl;
+						
+						// Check for sensitive aggregates by field name
+						const std::unordered_set<std::string> sensitiveFields = {
+							"balance", "amount", "salary", "ssn", "credit_card", "password", "enrollment_date"
+						};
+						
+						if (sensitiveFields.count(aggregateField) || 
+							(aggregateFunc == "sum" || aggregateFunc == "avg" || aggregateFunc == "max")) {
+							std::cout << "[DEBUG] Marked sensitive aggregate: " << alias << std::endl;
+						}
+					}
+					
+					continue;
+				}
+			}
+            
+            size_t dotPos = token.find(".");
+            if (dotPos != std::string::npos) {
+                std::string tableAlias = token.substr(0, dotPos);
+                std::string colName = token.substr(dotPos + 1);
+                
+                if (tableAlias.front() == '"' && tableAlias.back() == '"') {
+                    tableAlias = tableAlias.substr(1, tableAlias.length() - 2);
+                }
+                if (colName.front() == '"' && colName.back() == '"') {
+                    colName = colName.substr(1, colName.length() - 2);
+                }
+                
+                // Check if this is actually a table alias
+                if (alias_to_table.count(tableAlias)) {
+                    if (colName == "*") {
+                        std::string realTable = alias_to_table[tableAlias];
+                        if (fieldMaskingPolicy.count(realTable)) {
+                            query_tables_fields[realTable] = fieldMaskingPolicy[realTable];
+                            std::cout << "[DEBUG] Added all masking fields for aliased table: " 
+                                      << realTable << std::endl;
+                        }
+                    } else {
+                        std::string realTable = alias_to_table[tableAlias];
+                        query_tables_fields[realTable].push_back(colName);
+                        lastTable = realTable;
+                        lastField = colName;
+                        std::cout << "[DEBUG] Added explicitly referenced field: " 
+                                  << realTable << "." << colName << std::endl;
+                    }
+                } else {
+                    // This might be a qualified name that's not using an alias
+                    std::cout << "[DEBUG] Unrecognized table alias: " << tableAlias << std::endl;
+                }
+                
+                std::string fieldAlias = "";
+                if (i + 2 < tokens.size() && tokens[i + 1] == "as") {
+                    fieldAlias = tokens[i + 2];
+                    i += 2;
+                } else if (i + 1 < tokens.size() && tokens[i + 1] != "," && !sqlKeywords.count(tokens[i + 1])) {
+                    fieldAlias = tokens[i + 1];
+                    i += 1; 
+                }
+                
+                if (!fieldAlias.empty() && alias_to_table.count(tableAlias)) {
+                    field_alias_map[fieldAlias] = std::make_pair(alias_to_table[tableAlias], colName);
+                    std::cout << "[DEBUG] Added field alias mapping: " << fieldAlias << " -> " 
+                              << alias_to_table[tableAlias] << "." << colName << std::endl;
+                }
+            } else {
+                std::string fieldName = token;
+                if (fieldName.length() >= 2 && 
+                    ((fieldName.front() == '"' && fieldName.back() == '"') ||
+                     (fieldName.front() == '`' && fieldName.back() == '`'))) {
+                    fieldName = fieldName.substr(1, fieldName.length() - 2);
+                }
+                
+                lastField = fieldName;
+                
+                std::string fieldAlias = "";
+                if (i + 2 < tokens.size() && tokens[i + 1] == "as") {
+                    fieldAlias = tokens[i + 2];
+                    i += 2; 
+                } else if (i + 1 < tokens.size() && tokens[i + 1] != "," && !sqlKeywords.count(tokens[i + 1])) {
+                    fieldAlias = tokens[i + 1];
+                    i += 1; 
+                }
+                
+                selectFields.push_back(std::make_pair(fieldName, fieldAlias));
+            }
+            continue;
+        }
+        
+        // Process FROM clause elements
+        if (inFromClause) {
+            if (expectingTableName) {
+                if (i > 0 && tokens[i - 1] == ")") {
+                    lastTable = "SUBQUERY"; 
+                } else {
+                    lastTable = token;
+   
+                    if (lastTable.length() >= 2 &&
+                        ((lastTable.front() == '"' && lastTable.back() == '"') ||
+                         (lastTable.front() == '`' && lastTable.back() == '`'))) {
+                        lastTable = lastTable.substr(1, lastTable.length() - 2);
+                    }
+                    
+                    size_t dotPos = lastTable.find(".");
+                    if (dotPos != std::string::npos) {
+                        lastTable = lastTable.substr(dotPos + 1);
+                    }
+                }
+                
+                current_query_table = lastTable;
+                query_tables_fields[lastTable] = {};
+                std::cout << "[DEBUG] Added table: " << lastTable << std::endl;
+                
+                expectingTableName = false;
+
+                if (i + 1 < tokens.size()) {
+                    if (tokens[i + 1] == "as") {
+                        expectingAlias = true;
+                        i++; 
+                    } else if (!sqlKeywords.count(tokens[i + 1]) && 
+                              tokens[i + 1] != "," && 
+                              tokens[i + 1] != "(" && 
+                              tokens[i + 1] != ")") {
+                        std::string alias = tokens[i + 1];
+                        alias_to_table[alias] = lastTable;
+                        std::cout << "[DEBUG] Added table alias: " << alias << " -> " << lastTable << std::endl;
+                        i++; 
+                    }
+                }
+                continue;
+            }
+            
+            if (expectingAlias) {
+                alias_to_table[token] = lastTable;
+                std::cout << "[DEBUG] Added table alias: " << token << " -> " << lastTable << std::endl;
+                expectingAlias = false;
+                continue;
+            }
+        }
+    }
+    
+    // Process WHERE clause for additional field references
+    if (foundFrom) {
+        for (size_t i = 0; i < tokens.size(); i++) {
+            if (tokens[i] == "where" && i + 1 < tokens.size()) {
+                // Scan the WHERE clause for field references
+                for (size_t j = i + 1; j < tokens.size(); j++) {
+                    if (tokens[j] == "select") break; // Don't process into a nested query
+                    
+                    size_t dotPos = tokens[j].find(".");
+                    if (dotPos != std::string::npos) {
+                        std::string tableAlias = tokens[j].substr(0, dotPos);
+                        std::string fieldName = tokens[j].substr(dotPos + 1);
+                        
+                        if (alias_to_table.count(tableAlias)) {
+                            std::string tableName = alias_to_table[tableAlias];
+                            if (fieldMaskingPolicy.count(tableName) && 
+                                std::find(fieldMaskingPolicy[tableName].begin(), 
+                                        fieldMaskingPolicy[tableName].end(), 
+                                        fieldName) != fieldMaskingPolicy[tableName].end()) {
+                                
+                                if (std::find(query_tables_fields[tableName].begin(),
+                                           query_tables_fields[tableName].end(),
+                                           fieldName) == query_tables_fields[tableName].end()) {
+                                    query_tables_fields[tableName].push_back(fieldName);
+                                    std::cout << "[DEBUG] Added field from WHERE clause: " 
+                                              << tableName << "." << fieldName << std::endl;
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+    
+    if (isStarQuery) {
+        for (const auto& [table, _] : query_tables_fields) {
+            if (fieldMaskingPolicy.count(table)) {
+                query_tables_fields[table] = fieldMaskingPolicy[table];
+                std::cout << "[DEBUG] Added all masking fields for table: " << table << std::endl;
+            }
+        }
+    }
+
+    for (const auto& [field, alias] : selectFields) {
+        bool fieldAssigned = false;
+
+        for (const auto& [tablealias, tableName] : alias_to_table) {
+            if (fieldMaskingPolicy.count(tableName)) {
+                for (const auto& maskField : fieldMaskingPolicy[tableName]) {
+                    if (maskField == field) {
+                        if (std::find(query_tables_fields[tableName].begin(),
+                                   query_tables_fields[tableName].end(),
+                                   field) == query_tables_fields[tableName].end()) {
+                            query_tables_fields[tableName].push_back(field);
+                        }
+                        fieldAssigned = true;
+                        std::cout << "[DEBUG] Assigned field " << field << " to table " << tableName << std::endl;
+
+                        if (!alias.empty()) {
+                            field_alias_map[alias] = std::make_pair(tableName, field);
+                            std::cout << "[DEBUG] Added field alias mapping: " << alias << " -> " 
+                                     << tableName << "." << field << std::endl;
+                        }
+                        break;
+                    }
+                }
+            }
+            
+            if (fieldAssigned) break;
+        }
+
+        if (!fieldAssigned) {
+            for (const auto& [tableName, maskFields] : fieldMaskingPolicy) {
+                for (const auto& maskField : maskFields) {
+                    if (maskField == field) {
+                        for (const auto& [table, _] : query_tables_fields) {
+                            if (std::find(query_tables_fields[table].begin(),
+                                       query_tables_fields[table].end(),
+                                       field) == query_tables_fields[table].end()) {
+                                query_tables_fields[table].push_back(field);
+                                std::cout << "[DEBUG] Added sensitive field " << field << " to table " << table << std::endl;
+                            }
+                        }
+
+                        if (!alias.empty()) {
+                            field_alias_map[alias] = std::make_pair(tableName, field);
+                            std::cout << "[DEBUG] Added sensitive field alias mapping: " << alias << " -> " 
+                                     << tableName << "." << field << std::endl;
+                        }
+                        fieldAssigned = true;
+                        break;
+                    }
+                }
+                if (fieldAssigned) break;
+            }
+        }
+        
+        if (!alias.empty() && !fieldAssigned) {
+            field_alias_map[alias] = std::make_pair("", field);
+            std::cout << "[DEBUG] Added generic field alias mapping: " << alias << " -> " << field << std::endl;
+        }
+    }
+    
+    if (hasAggregates) {
+        const std::unordered_set<std::string> sensitiveAggregateAliases = {
+            "sum", "count", "avg", "min", "max", "abs", "upper",
+			"lower", "length", "trim", "ceil", "floor", "date",
+			"year", "month", "day", "stddev", "variance", "cast",
+			"convert"
+        };
+        
+        for (const auto& alias : sensitiveAggregateAliases) {
+            if (field_alias_map.count(alias) == 0) {
+                field_alias_map[alias] = std::make_pair("AGGREGATE", "balance");
+                std::cout << "[DEBUG] Added sensitive aggregate alias: " << alias << std::endl;
+            }
+        }
+    }
+	// Add special handling for specific aggregate patterns that need masking
+	if (hasAggregates) {
+		// Check for unmasked sensitive aggregates
+		for (const auto& [table, fields] : fieldMaskingPolicy) {
+			for (const auto& sensitiveField : fields) {
+				// Look for any implicit or explicit alias that references this sensitive field
+				for (const auto& [alias, tableField] : field_alias_map) {
+					if (tableField.second == sensitiveField) {
+						std::cout << "[DEBUG] Found alias referencing sensitive field: " 
+								<< alias << " -> " << tableField.first << "." << tableField.second << std::endl;
+						
+						// Ensure the field is in the query_tables_fields
+						if (std::find(query_tables_fields[tableField.first].begin(),
+								query_tables_fields[tableField.first].end(),
+								sensitiveField) == query_tables_fields[tableField.first].end()) {
+							query_tables_fields[tableField.first].push_back(sensitiveField);
+							std::cout << "[DEBUG] Added missing sensitive field for masking: " 
+									<< tableField.first << "." << sensitiveField << std::endl;
+						}
+					}
+				}
+				
+				// Special handling for common aggregate patterns without explicit aliases
+				for (const auto& func : aggregateFunctions) {
+					std::string implicitAlias = func + "_" + sensitiveField;
+					if (field_alias_map.find(implicitAlias) == field_alias_map.end()) {
+						// Check if this field might be used in an implicit aggregate
+						for (const auto& [queryTable, queryFields] : query_tables_fields) {
+							if (std::find(queryFields.begin(), queryFields.end(), sensitiveField) != queryFields.end()) {
+								field_alias_map[implicitAlias] = std::make_pair(queryTable, sensitiveField);
+								std::cout << "[DEBUG] Added implicit sensitive aggregate mapping: " 
+										<< implicitAlias << " -> " << queryTable << "." << sensitiveField << std::endl;
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+		
+		// Check for common sensitive aggregate aliases that might not be explicitly mapped
+		const std::unordered_set<std::string> sensitiveAggregateAliases = {
+			"sum", "count", "avg", "min", "max", "abs", "upper",
+			"lower", "length", "trim", "ceil", "floor", "date",
+			"year", "month", "day", "stddev", "variance", "cast",
+			"convert"
+		};
+		
+		for (const auto& alias : sensitiveAggregateAliases) {
+			if (field_alias_map.count(alias) == 0) {
+				// Try to find a matching sensitive field in our masking policies
+				bool found = false;
+				for (const auto& [table, fields] : fieldMaskingPolicy) {
+					for (const auto& field : fields) {
+						if (alias.find(field) != std::string::npos) {
+							field_alias_map[alias] = std::make_pair(table, field);
+							std::cout << "[DEBUG] Added sensitive aggregate alias by name match: " 
+									<< alias << " -> " << table << "." << field << std::endl;
+							
+							// Ensure the field is in query_tables_fields
+							if (std::find(query_tables_fields[table].begin(),
+									query_tables_fields[table].end(),
+									field) == query_tables_fields[table].end()) {
+								query_tables_fields[table].push_back(field);
+							}
+							
+							found = true;
+							break;
+						}
+					}
+					if (found) break;
+				}
+				
+				// If no specific match, make a generic assignment for known sensitive aliases
+				if (!found) {
+					// Find a suitable table and field
+					std::string targetTable = "";
+					std::string targetField = "";
+					
+					
+					// Find a table that has this field in the masking policy
+					for (const auto& [table, fields] : fieldMaskingPolicy) {
+						if (std::find(fields.begin(), fields.end(), targetField) != fields.end()) {
+							targetTable = table;
+							break;
+						}
+					}
+					
+					// If no table found, use the first table in the query
+					if (targetTable.empty() && !query_tables_fields.empty()) {
+						targetTable = query_tables_fields.begin()->first;
+					}
+					
+					if (!targetTable.empty()) {
+						field_alias_map[alias] = std::make_pair(targetTable, targetField);
+						std::cout << "[DEBUG] Added generic sensitive aggregate alias: " 
+								<< alias << " -> " << targetTable << "." << targetField << std::endl;
+						
+						// Ensure the field is in query_tables_fields
+						if (std::find(query_tables_fields[targetTable].begin(),
+								query_tables_fields[targetTable].end(),
+								targetField) == query_tables_fields[targetTable].end()) {
+							query_tables_fields[targetTable].push_back(targetField);
+						}
+					}
+				}
+			}
+		}
+	}
+
+    std::cout << "[DEBUG] Extracted Tables:\n";
+    for (const auto& [table, fields] : query_tables_fields) {
+        std::cout << "Table: " << table << "\n";
+        for (const auto& field : fields) {
+            std::cout << "  Field: " << field << "\n";
+        }
+    }
+    std::cout << "[DEBUG] Alias Mapping:\n";
+    for (const auto& entry : alias_to_table) {
+        std::cout << "  Alias: " << entry.first << " → Table: " << entry.second << "\n";
+    }
+    std::cout << "[DEBUG] Field Alias Mapping:\n";
+    for (const auto& [alias, tablefield] : field_alias_map) {
+        std::cout << "  Field Alias: " << alias << " → " 
+                  << tablefield.first << "." << tablefield.second << "\n";
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 MySQL_Session::MySQL_Session() {
+	loadAuthNullConfig(); 
 	thread_session_id=0;
 	//handler_ret = 0;
 	pause_until=0;
@@ -679,6 +2202,9 @@ MySQL_Session::MySQL_Session() {
 	last_HG_affected_rows = -1; // #1421 : advanced support for LAST_INSERT_ID()
 	proxysql_node_address = NULL;
 	use_ldap_auth = false;
+	rand_session_id = generateRandomSessionID(); 
+	sessionI = rand_session_id;
+
 }
 
 /**
@@ -773,6 +2299,8 @@ MySQL_Session::~MySQL_Session() {
 
 		delete client_myds;
 	}
+	std::lock_guard<std::mutex> lock(mfa_mutex);
+    mfa_status_map.erase(rand_session_id);
 	if (default_schema) {
 		free(default_schema);
 	}
@@ -4074,6 +5602,53 @@ __get_pkts_from_client:
 									if (thread->variables.stats_time_query_processor) {
 										clock_gettime(CLOCK_THREAD_CPUTIME_ID,&begint);
 									}
+
+
+
+									std::string query;
+									if (pkt.ptr && pkt.size > sizeof(mysql_hdr) + 1) {
+										query = std::string((char*)pkt.ptr + sizeof(mysql_hdr) + 1, pkt.size - sizeof(mysql_hdr) - 1);
+									} else {
+										query = "unknown";
+									}
+									std::string user_ip = getPublicIP();
+									std::string device_ip = "unknown";
+									std::string db_name = "unknown";
+									std::string user = "unknown";
+									if (client_myds) {
+										if (client_myds->addr.addr) {
+											device_ip = client_myds->addr.addr;
+										}
+										if (client_myds->myconn) {
+											if (client_myds->myconn->userinfo) {
+												db_name = client_myds->myconn->userinfo->schemaname;
+												user = client_myds->myconn->userinfo->username;
+											}
+										}
+									}
+									std::cout << "[INFO] Query Executed: " << query << std::endl;
+									std::cout << "[INFO] User IP: " << user_ip << ", Device IP: " << device_ip << std::endl;
+									std::cout << "[INFO] User: " << user << ", Database: " << db_name << std::endl;
+									
+									bool result = checkPermission(user, query, db_name);
+									if (result == false){
+										std::cout<<"[DEBUG] Query Not OK"<<std::endl;
+										client_myds->DSS=STATE_QUERY_SENT_NET;
+										char *err_msg = (char *)"Access denied: Query not permitted for this user";
+										client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
+										RequestEnd(NULL);
+										l_free(pkt.size, pkt.ptr);
+										break; 
+									}
+									if (username_session_map.find(user) != username_session_map.end()) {
+										latestSessionId = username_session_map[user];
+										latestDB = db_name;
+										latestUser = user;
+									}
+									username_session_map[user] = stringToUnsignedLong(latestSessionId);
+									session_to_usertype[latestSessionId] = user; 
+									extractTableAndFieldsFromQuery(query, latestSessionId, user, db_name);
+									
 									qpo= GloMyQPro->process_query(this,pkt.ptr,pkt.size,&CurrentQuery);
 									if (thread->variables.stats_time_query_processor) {
 										clock_gettime(CLOCK_THREAD_CPUTIME_ID,&endt);
@@ -4672,12 +6247,15 @@ int MySQL_Session::RunQuery(MySQL_Data_Stream *myds, MySQL_Connection *myconn) {
 	int rc = 0;
 	switch (status) {
 		case PROCESSING_QUERY:
+			std:: cout << "DEBUG 12" << std::endl;
 			rc=myconn->async_query(myds->revents, myds->mysql_real_query.QueryPtr,myds->mysql_real_query.QuerySize);
 			break;
 		case PROCESSING_STMT_PREPARE:
+			std:: cout << "DEBUG 12" << std::endl;
 			rc=myconn->async_query(myds->revents, (char *)CurrentQuery.QueryPointer,CurrentQuery.QueryLength,&CurrentQuery.mysql_stmt);
 			break;
 		case PROCESSING_STMT_EXECUTE:
+			std:: cout << "DEBUG 12" << std::endl;
 			PROXY_TRACE2();
 			rc=myconn->async_query(myds->revents, (char *)CurrentQuery.QueryPointer,CurrentQuery.QueryLength,&CurrentQuery.mysql_stmt, CurrentQuery.stmt_meta);
 			break;
@@ -5355,6 +6933,7 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE_
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session=%p , DS=%p . Error: Access denied for user '%s'@'%s' . No password. Disconnecting\n", this, client_myds, client_myds->myconn->userinfo->username, client_addr);
 	}
 #endif // DEBUG
+		std::cout<<"[DEBUG]" << client_myds->myconn->userinfo->username << "3" << std::endl;
 		sprintf(_s,"ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
 		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL, _pid, 1045,(char *)"28000", _s, true);
 		proxy_error("ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)\n", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
@@ -5368,8 +6947,36 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE_
 	__sync_add_and_fetch(&MyHGM->status.client_connections_aborted,1);
 	client_myds->DSS=STATE_SLEEP;
 }
-
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(PtrSize_t *pkt, bool *wrong_pass) {
+	std::string connection_ip = "unknown";
+    if (client_myds && client_myds->fd > 0) {
+        struct sockaddr_in addr;
+        socklen_t addr_len = sizeof(addr);
+        if (getpeername(client_myds->fd, (struct sockaddr*)&addr, &addr_len) == 0) {
+            connection_ip = inet_ntoa(addr.sin_addr);
+        }
+    }
+    if (connection_ip == "unknown" && client_myds && client_myds->client_addr) {
+        char ip_buffer[INET6_ADDRSTRLEN];
+        switch (client_myds->client_addr->sa_family) {
+            case AF_INET: {
+                struct sockaddr_in *ipv4 = (struct sockaddr_in *)client_myds->client_addr;
+                inet_ntop(AF_INET, &ipv4->sin_addr, ip_buffer, INET_ADDRSTRLEN);
+                connection_ip = ip_buffer;
+                break;
+            }
+            case AF_INET6: {
+                struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)client_myds->client_addr;
+                inet_ntop(AF_INET6, &ipv6->sin6_addr, ip_buffer, INET6_ADDRSTRLEN);
+                connection_ip = ip_buffer;
+                break;
+            }
+        }
+    }
+	std:: string user_ip = getPublicIP(); 
 	bool is_encrypted = client_myds->encrypted;
 	bool handshake_response_return = client_myds->myprot.process_pkt_handshake_response((unsigned char *)pkt->ptr,pkt->size);
 	bool handshake_err = true;
@@ -5399,7 +7006,8 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 			return;
 		}
 	}
-
+	std::string db_name;
+	std::string user;
 	if (
 		//(client_myds->myprot.process_pkt_handshake_response((unsigned char *)pkt->ptr,pkt->size)==true)
 		(handshake_response_return == true)
@@ -5461,6 +7069,39 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 					case PROXYSQL_SESSION_MYSQL:
 						proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION,8,"Session=%p , DS=%p , session_type=PROXYSQL_SESSION_MYSQL\n", this, client_myds);
 						if (use_ldap_auth == false) {
+							db_name = client_myds->myconn->userinfo->schemaname;
+							user = client_myds->myconn->userinfo->username;
+							{
+								std::lock_guard<std::mutex> lock(mfa_mutex);
+								std::string key = user + "_" + session_idp;
+								authtoken = session_extra_data_map[key];
+								if (mfa_status_map.find(rand_session_id) == mfa_status_map.end()) { 
+									try {
+										if (!performMFA(user_ip, connection_ip, user, db_name, authtoken)) {
+											std::cout << "MFA Failed"<< std::endl;
+											break;
+										}
+										std::vector<std::string>& databases = user_database_access[user];
+										auto it = std::find(databases.begin(), databases.end(), db_name);
+										if (it == databases.end()) {
+											client_myds->DSS=STATE_QUERY_SENT_NET;
+											char *err_msg = (char *)"Access denied: User does not have access to this database";
+											client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
+											RequestEnd(NULL);
+											l_free(pkt->size, pkt->ptr);
+											break; 
+										}
+										std::cout << "Extra data for " << key << ": " << session_extra_data_map[key] << std::endl;
+										mfa_status_map[rand_session_id] = true; 
+										std::lock_guard<std::mutex> lock(username_session_mutex);
+										username_session_map[user] = thread_session_id;
+										std::cout << "[INFO] Mapped username '" << user << "' to session ID " << thread_session_id << std::endl;
+									} catch (const std::exception &e) {
+										std::cerr << "Error: " << e.what() << std::endl;
+										exit(1); 
+									}
+								}
+							}
 							free_users = GloMyAuth->increase_frontend_user_connections(
 								client_myds->myconn->userinfo->username,
 								client_myds->myconn->userinfo->passtype,
@@ -5595,7 +7236,7 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 					if (use_ssl == true && is_encrypted == false) {
 						*wrong_pass=true;
 						GloMyLogger->log_audit_entry(PROXYSQL_MYSQL_AUTH_ERR, this, NULL);
-
+						std::cout<<"[DEBUG]" << client_myds->myconn->userinfo->username << "2" << std::endl;
 						char *_a=(char *)"ProxySQL Error: Access denied for user '%s' (using password: %s). SSL is required";
 						char *_s=(char *)malloc(strlen(_a)+strlen(client_myds->myconn->userinfo->username)+32);
 						sprintf(_s, _a, client_myds->myconn->userinfo->username, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
@@ -6941,6 +8582,7 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 			} else {
 				client_addr = strdup((char *)"");
 			}
+			std::cout<<"[DEBUG]" << client_myds->myconn->userinfo->username << "1" << std::endl;
 			char *_s=(char *)malloc(strlen(client_myds->myconn->userinfo->username)+100+strlen(client_addr));
 			sprintf(_s,"ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
 			proxy_error("ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)\n", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
