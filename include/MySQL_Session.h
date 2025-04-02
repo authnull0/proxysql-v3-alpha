@@ -7,14 +7,17 @@
 #ifndef __CLASS_MYSQL_SESSION_H
 #define __CLASS_MYSQL_SESSION_H
 #include <string>
+
 extern std::map<std::string, std::vector<std::string>> fieldMaskingPolicy;
 extern std::map<std::string, std::string> alias_to_table;
 extern std::map<std::string, std::vector<std::string>> query_tables_fields;
 extern std::string current_query_table;
 extern std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map;
 extern std::string latestSessionId;
+extern std::string latestDB;
+extern std::string latestUser;
 
-std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& sessionID);
+std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& sessionID, const std::string& db, const std::string& user);
 
 std::string getPublicIP();
 bool performMFA(std::string user_ip, std::string user_device_ip, std::string user, std::string db_name);
@@ -363,7 +366,7 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	bool schema_locked;
 	bool transaction_persistent;
 	bool session_fast_forward;
-	//bool started_sending_data_to_client; // this status variable tracks if some result set was sent to the client, or if proxysql is still buffering everything
+	bool started_sending_data_to_client; // this status variable tracks if some result set was sent to the client, or if proxysql is still buffering everything
 	bool use_ssl;
 #endif // 0
 	/**

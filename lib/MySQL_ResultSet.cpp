@@ -339,9 +339,33 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROWS *rows) {
 // Structure to track field aliases
 // Maps alias to (table, original_field) pair
 // std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map;
-
+std::string normalizeColumnName(const std::string& columnName) {
+    std::string normalized;
+    // Remove all whitespace
+    for (char c : columnName) {
+        if (!std::isspace(c)) {
+            normalized += c;
+        }
+    }
+    return normalized;
+}
+std::map<std::string, std::vector<std::string>> lowerCasePolicy;
 unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
-	fieldMaskingPolicy = getMaskingPolicyForSession(latestSessionId);
+    fieldMaskingPolicy = getMaskingPolicyForSession(latestSessionId,latestDB,latestUser);
+	for (const auto& [table, fields] : fieldMaskingPolicy) {
+		std::string lowerTable = table;
+		std::transform(lowerTable.begin(), lowerTable.end(), lowerTable.begin(), ::tolower);
+		
+		std::vector<std::string> lowerFields;
+		for (const auto& field : fields) {
+			std::string lowerField = field;
+			std::transform(lowerField.begin(), lowerField.end(), lowerField.begin(), ::tolower);
+			lowerFields.push_back(lowerField);
+		}
+		
+		lowerCasePolicy[lowerTable] = lowerFields;
+	}
+	fieldMaskingPolicy = lowerCasePolicy;
     std::cout << "[DEBUG] Row Data: Processing" << std::endl;
     unsigned long *lengths = mysql_fetch_lengths(result);
     unsigned int pkt_length = 0;
@@ -350,42 +374,38 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
         std::vector<std::string> modifiedRow(num_fields);
         std::vector<char*> modifiedRowPtrs(num_fields);
 
-        // Get MYSQL_FIELD array which contains field metadata
         MYSQL_FIELD *fields = mysql_fetch_fields(result);
-
-        // Configuration for aggregate functions that should be masked
-        std::unordered_set<std::string> aggregatePrefixes = {"total_", "sum_", "avg_", "average_", "count_"};
-        std::unordered_set<std::string> aggregateExactNames = {"sum", "avg", "average", "count"};
         
-        // Configuration for sensitive subquery fields mapping: <field_alias, pair<table, original_field>>
-        std::unordered_map<std::string, std::pair<std::string, std::string>> sensitiveSubqueryFields = {
-            {"user_name", {"users", "name"}},
-            // Add more subquery field mappings as needed
-        };
-
+        // Define aggregate function patterns to match
+        std::unordered_set<std::string> aggregatePrefixes = {"sum", "count", "avg", "min", "max", "abs", "upper",
+		"lower", "length", "trim", "ceil", "floor", "date",
+		"year", "month", "day", "stddev", "variance", "cast",
+		"convert"};
+        std::unordered_set<std::string> aggregateExactNames = {"sum", "count", "avg", "min", "max", "abs", "upper",
+		"lower", "length", "trim", "ceil", "floor", "date",
+		"year", "month", "day", "stddev", "variance", "cast",
+		"convert"};
+        
+        std::unordered_map<std::string, std::pair<std::string, std::string>> subqueryFieldCache;
+        
         for (unsigned int i = 0; i < num_fields; i++) {
-            // Get original value
             modifiedRow[i] = row[i] ? row[i] : "NULL";
             
-            // Get field details from MySQL metadata
             std::string fieldName = std::string(fields[i].name);
             std::transform(fieldName.begin(), fieldName.end(), fieldName.begin(), ::tolower);
-            
-            // Get table name from MySQL metadata if available
+			std::string normalizedFieldName = normalizeColumnName(fieldName);
             std::string tableName = "";
             if (fields[i].table && fields[i].table[0] != '\0') {
                 tableName = std::string(fields[i].table);
                 std::transform(tableName.begin(), tableName.end(), tableName.begin(), ::tolower);
             }
-            
-            // Get original table name if available (for views/aliases)
+
             std::string origTableName = "";
             if (fields[i].org_table && fields[i].org_table[0] != '\0') {
                 origTableName = std::string(fields[i].org_table);
                 std::transform(origTableName.begin(), origTableName.end(), origTableName.begin(), ::tolower);
             }
             
-            // Get original field name if available
             std::string origFieldName = "";
             if (fields[i].org_name && fields[i].org_name[0] != '\0') {
                 origFieldName = std::string(fields[i].org_name);
@@ -398,8 +418,8 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                       << ", org_name=" << origFieldName << std::endl;
             
             bool masked = false;
-            
-            // Step 1: First try to use MySQL's metadata about the original table and field
+
+            // Check original metadata
             if (!origTableName.empty() && !origFieldName.empty()) {
                 if (fieldMaskingPolicy.count(origTableName) &&
                     std::find(fieldMaskingPolicy[origTableName].begin(),
@@ -410,8 +430,8 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                     std::cout << "[DEBUG] Masked using original metadata: " << origTableName << "." << origFieldName << std::endl;
                 }
             }
-            
-            // Step 2: If not masked yet, try with table.name from MySQL metadata
+
+            // Check current metadata
             if (!masked && !tableName.empty()) {
                 if (fieldMaskingPolicy.count(tableName) &&
                     std::find(fieldMaskingPolicy[tableName].begin(),
@@ -422,8 +442,30 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                     std::cout << "[DEBUG] Masked using metadata: " << tableName << "." << fieldName << std::endl;
                 }
             }
-            
-            // Step 3: Check if this is an aliased field from our parser
+			// Check field alias map
+			if (!masked && (field_alias_map.count(fieldName) || field_alias_map.count(normalizedFieldName))) {
+				std::string originalTable;
+				std::string originalField;
+				
+				if (field_alias_map.count(fieldName)) {
+					originalTable = field_alias_map[fieldName].first;
+					originalField = field_alias_map[fieldName].second;
+				} else {
+					originalTable = field_alias_map[normalizedFieldName].first;
+					originalField = field_alias_map[normalizedFieldName].second;
+				}
+				
+				if (!originalTable.empty() && fieldMaskingPolicy.count(originalTable) &&
+					std::find(fieldMaskingPolicy[originalTable].begin(),
+							fieldMaskingPolicy[originalTable].end(), 
+							originalField) != fieldMaskingPolicy[originalTable].end()) {
+					modifiedRow[i] = std::string(lengths[i], '*');
+					masked = true;
+					std::cout << "[DEBUG] Masked aliased field: " << fieldName 
+							<< " (maps to " << originalTable << "." << originalField << ")" << std::endl;
+				}
+			}
+            // Check field alias map
             if (!masked && field_alias_map.count(fieldName)) {
                 std::string originalTable = field_alias_map[fieldName].first;
                 std::string originalField = field_alias_map[fieldName].second;
@@ -439,48 +481,106 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                 }
             }
             
-            // Step 4: Dynamic case for aggregate functions on masked fields (SUM, AVG, etc.)
+            // Check subquery field cache
+            if (!masked && !fieldName.empty()) {
+                if (subqueryFieldCache.count(fieldName)) {
+                    auto& [cachedTable, cachedField] = subqueryFieldCache[fieldName];
+                    if (fieldMaskingPolicy.count(cachedTable) &&
+                        std::find(fieldMaskingPolicy[cachedTable].begin(),
+                                 fieldMaskingPolicy[cachedTable].end(), 
+                                 cachedField) != fieldMaskingPolicy[cachedTable].end()) {
+                        modifiedRow[i] = std::string(lengths[i], '*');
+                        masked = true;
+                        std::cout << "[DEBUG] Masked cached subquery field: " << fieldName 
+                                  << " (maps to " << cachedTable << "." << cachedField << ")" << std::endl;
+                    }
+                } else {
+                    // Check potential subquery patterns
+                    for (const auto& [table, maskedFields] : fieldMaskingPolicy) {
+                        for (const auto& field : maskedFields) {
+                            std::string tablePrefix = table.substr(0, table.length() - 1); 
+                            if (fieldName.find(tablePrefix) != std::string::npos && 
+                                fieldName.find(field) != std::string::npos) {
+                                modifiedRow[i] = std::string(lengths[i], '*');
+                                masked = true;
+                                subqueryFieldCache[fieldName] = std::make_pair(table, field);
+                                std::cout << "[DEBUG] Masked subquery field (pattern 1): " << fieldName 
+                                          << " (maps to " << table << "." << field << ")" << std::endl;
+                                break;
+                            }
+
+                            if (fieldName == field) {
+                                for (const auto& [queryTable, queryFields] : query_tables_fields) {
+                                    if (queryTable != table && 
+                                        std::find(queryFields.begin(), queryFields.end(), field) != queryFields.end()) {
+                                        modifiedRow[i] = std::string(lengths[i], '*');
+                                        masked = true;
+                                        subqueryFieldCache[fieldName] = std::make_pair(table, field);
+                                        std::cout << "[DEBUG] Masked subquery field (pattern 2): " << fieldName 
+                                                  << " (maps to " << table << "." << field << ")" << std::endl;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (masked) break;
+                    }
+                }
+            }
+
+			if (!masked && !tableName.empty()) {
+				if (fieldMaskingPolicy.count(tableName) && 
+					std::find(fieldMaskingPolicy[tableName].begin(),
+							fieldMaskingPolicy[tableName].end(), 
+							fieldName) != fieldMaskingPolicy[tableName].end()) {
+					modifiedRow[i] = std::string(lengths[i], '*');
+					masked = true;
+					std::cout << "[DEBUG] Masked field by name match: " << fieldName 
+							<< " (in table " << tableName << ")" << std::endl;
+				}
+			}
+
+            // Improved aggregate field detection and masking
             if (!masked) {
-                // Check if fieldName is an aggregate function
                 bool isAggregate = false;
                 std::string baseFieldName = fieldName;
-                std::string potentialTableName = "";
-                std::string potentialFieldName = "";
                 
-                // Check for prefix match (total_balance, avg_balance, etc.)
+                // Check if field name starts with any aggregate prefix
                 for (const auto& prefix : aggregatePrefixes) {
                     if (fieldName.find(prefix) == 0) {
                         isAggregate = true;
                         baseFieldName = fieldName.substr(prefix.length());
+                        std::cout << "[DEBUG] Detected aggregate prefix: " << prefix 
+                                  << ", base field: " << baseFieldName << std::endl;
                         break;
                     }
                 }
-                
-                // Check for exact match (sum, avg, count, etc.)
+
+                // Check if field name matches an exact aggregate name
                 if (!isAggregate && aggregateExactNames.count(fieldName) > 0) {
                     isAggregate = true;
+                    std::cout << "[DEBUG] Detected exact aggregate name: " << fieldName << std::endl;
                 }
                 
+                // If this is an aggregate field, check all tables and fields from the query
                 if (isAggregate) {
-                    // Try to determine the field this aggregate is based on
-                    // Look through query_tables_fields to find potential matches
                     for (const auto& [table, fields] : query_tables_fields) {
-                        for (const auto& field : fields) {
-                            // Check if baseFieldName contains or matches the field
-                            if (baseFieldName == field || 
-                                baseFieldName.find(field) != std::string::npos) {
-                                potentialTableName = table;
-                                potentialFieldName = field;
+                        // Skip if this table doesn't have masking policy
+                        if (fieldMaskingPolicy.count(table) == 0) continue;
+                        
+                        for (const auto& queryField : fields) {
+                            // If this field is masked and is either the base field or mentioned in the field name
+                            if (std::find(fieldMaskingPolicy[table].begin(),
+                                         fieldMaskingPolicy[table].end(), 
+                                         queryField) != fieldMaskingPolicy[table].end()) {
                                 
-                                // Check if this field should be masked
-                                if (fieldMaskingPolicy.count(table) &&
-                                    std::find(fieldMaskingPolicy[table].begin(),
-                                             fieldMaskingPolicy[table].end(), 
-                                             field) != fieldMaskingPolicy[table].end()) {
+                                // Check if baseFieldName contains this field or is empty (general aggregate)
+                                if (baseFieldName.empty() || baseFieldName == queryField || 
+                                    baseFieldName.find(queryField) != std::string::npos) {
                                     modifiedRow[i] = std::string(lengths[i], '*');
                                     masked = true;
                                     std::cout << "[DEBUG] Masked aggregate result of sensitive field: " << fieldName
-                                              << " (derived from " << table << "." << field << ")" << std::endl;
+                                              << " (derived from " << table << "." << queryField << ")" << std::endl;
                                     break;
                                 }
                             }
@@ -489,24 +589,8 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                     }
                 }
             }
-            
-            // Step 5: Dynamic case for subqueries from sensitive fields
-            if (!masked && sensitiveSubqueryFields.count(fieldName) > 0) {
-                auto& [table, field] = sensitiveSubqueryFields[fieldName];
-                
-                // Check if this field should be masked
-                if (fieldMaskingPolicy.count(table) &&
-                    std::find(fieldMaskingPolicy[table].begin(),
-                             fieldMaskingPolicy[table].end(), 
-                             field) != fieldMaskingPolicy[table].end()) {
-                    modifiedRow[i] = std::string(lengths[i], '*');
-                    masked = true;
-                    std::cout << "[DEBUG] Masked subquery field: " << fieldName 
-                              << " (maps to " << table << "." << field << ")" << std::endl;
-                }
-            }
-            
-            // Step 6: For any field that appears in any query_tables_fields
+
+            // Final check with query tables and fields
             if (!masked) {
                 for (const auto& [table, fields] : query_tables_fields) {
                     if (fieldMaskingPolicy.count(table)) {
@@ -543,8 +627,6 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
     num_rows++;
     return pkt_length;
 }
-
-
 
 
 

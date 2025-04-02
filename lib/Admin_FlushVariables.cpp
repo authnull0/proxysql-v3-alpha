@@ -125,7 +125,7 @@ extern char * proxysql_version;
 
 #include "proxysql_find_charset.h"
 
-//extern MySQL_Query_Cache *GloMyQC;
+extern Query_Cache *GloQC;
 extern MySQL_Authentication *GloMyAuth;
 extern PgSQL_Authentication *GloPgAuth;
 extern MySQL_LDAP_Authentication *GloMyLdapAuth;
