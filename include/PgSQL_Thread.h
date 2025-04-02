@@ -118,25 +118,6 @@ enum PgSQL_Thread_status_variable {
 	PG_st_var_END = 42 // to avoid ASAN complaining. TO FIX
 };
 
-
-struct CopyCmdMatcher {
-	re2::RE2::Options options;
-	re2::RE2 pattern;
-
-	CopyCmdMatcher() : 
-		options(RE2::Quiet), 
-		pattern(
-			R"(((?is)(?:--.*?$|/\*[\s\S]*?\*/|\s)*\bCOPY\b\s+[^;]*?\bFROM\b\s+STDIN\b(?:\s+WITH\s*\([^)]*\))?))",
-			options) {
-		//((?is)(?:--.*?$|/\*[\s\S]*?\*/|\s)*\bCOPY\b\s+[^;]*?\bFROM\b\s+STDIN\b(?:\s+WITH\s*\([^)]*\))?)
-	}
-
-	inline
-	bool match(const char* query, re2::StringPiece* matched = nullptr) const {
-		return re2::RE2::PartialMatch(query, pattern, matched);
-	}
-};
-
 class __attribute__((aligned(64))) PgSQL_Thread : public Base_Thread
 {
 private:
@@ -215,7 +196,7 @@ public:
 #ifdef IDLE_THREADS
 	PtrArray* idle_mysql_sessions;
 	PtrArray* resume_mysql_sessions;
-	CopyCmdMatcher *copy_cmd_matcher;
+
 	pgsql_conn_exchange_t myexchange;
 #endif // IDLE_THREADS
 
@@ -820,11 +801,9 @@ public:
 
 		int monitor_history;
 		int monitor_connect_interval;
-		int monitor_connect_interval_window;
 		int monitor_connect_timeout;
 		//! Monitor ping interval. Unit: 'ms'.
 		int monitor_ping_interval;
-		int monitor_ping_interval_window;
 		int monitor_ping_max_failures;
 		//! Monitor ping timeout. Unit: 'ms'.
 		int monitor_ping_timeout;
@@ -832,7 +811,6 @@ public:
 		int monitor_aws_rds_topology_discovery_interval;
 		//! Monitor read only timeout. Unit: 'ms'.
 		int monitor_read_only_interval;
-		int monitor_read_only_interval_window;
 		//! Monitor read only timeout. Unit: 'ms'.
 		int monitor_read_only_timeout;
 		int monitor_read_only_max_timeout_count;
@@ -870,7 +848,6 @@ public:
 		int monitor_local_dns_resolver_queue_maxsize;
 		char* monitor_username;
 		char* monitor_password;
-		char* monitor_dbname;
 		char* monitor_replication_lag_use_percona_heartbeat;
 		int ping_interval_server_msec;
 		int ping_timeout_server;

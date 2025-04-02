@@ -13,7 +13,7 @@ using json = nlohmann::json;
 #include "MySQL_Authentication.hpp"
 #include "MySQL_LDAP_Authentication.hpp"
 #include "MySQL_Variables.h"
-
+#include "MySQL_Protocol.h"
 #include <sstream>
 
 //#include <ma_global.h>
@@ -249,7 +249,7 @@ bool MySQL_Protocol::generate_pkt_ERR(bool send, void **ptr, unsigned int *len, 
 			case STATE_OK:
 				break;
 			case STATE_SLEEP:
-				if ((*myds)->sess->session_fast_forward) { // see issue #733
+				if ((*myds)->sess->session_fast_forward==true) { // see issue #733
 					break;
 				}
 			default:
@@ -1595,10 +1595,6 @@ int MySQL_Protocol::PPHR_1(unsigned char *pkt, unsigned int len, bool& ret, MyPr
 
 // this function was inline in process_pkt_handshake_response() , split for readibility
 bool MySQL_Protocol::PPHR_2(unsigned char *pkt, unsigned int len, bool& ret, MyProt_tmp_auth_vars& vars1) { // process_pkt_handshake_response inner 2
-
-	// if packet length is less than 4, it's a malformed packet.
-	if ((len - sizeof(mysql_hdr)) < 4) return false;
-
 	vars1.capabilities = CPY4(pkt);
 	// see bug #2916. If CLIENT_MULTI_STATEMENTS is set by the client
 	// we enforce setting CLIENT_MULTI_RESULTS, this is the proper and expected
@@ -1835,9 +1831,9 @@ void MySQL_Protocol::PPHR_5passwordTrue(
 #endif
 	(*myds)->sess->schema_locked = attr1.schema_locked;
 	(*myds)->sess->transaction_persistent = attr1.transaction_persistent;
-	(*myds)->sess->session_fast_forward=SESSION_FORWARD_TYPE_NONE; // default
+	(*myds)->sess->session_fast_forward=false; // default
 	if ((*myds)->sess->session_type == PROXYSQL_SESSION_MYSQL) {
-		(*myds)->sess->session_fast_forward = attr1.fast_forward ? SESSION_FORWARD_TYPE_PERMANENT : SESSION_FORWARD_TYPE_NONE;
+		(*myds)->sess->session_fast_forward = attr1.fast_forward;
 	}
 	(*myds)->sess->user_max_connections = attr1.max_connections;
 }
@@ -1856,7 +1852,7 @@ void MySQL_Protocol::PPHR_5passwordFalse_0(
 			(*myds)->sess->default_schema=strdup((char *)"main"); // just the pointer is passed
 			(*myds)->sess->schema_locked=false;
 			(*myds)->sess->transaction_persistent=false;
-			(*myds)->sess->session_fast_forward=SESSION_FORWARD_TYPE_NONE;
+			(*myds)->sess->session_fast_forward=false;
 			(*myds)->sess->user_max_connections=0;
 			vars1.password=l_strdup(mysql_thread___monitor_password);
 			ret=true;
@@ -1907,7 +1903,7 @@ void MySQL_Protocol::PPHR_5passwordFalse_auth2(
 #endif
 			(*myds)->sess->schema_locked=attr1.schema_locked;
 			(*myds)->sess->transaction_persistent=attr1.transaction_persistent;
-			(*myds)->sess->session_fast_forward=attr1.fast_forward ? SESSION_FORWARD_TYPE_PERMANENT : SESSION_FORWARD_TYPE_NONE;
+			(*myds)->sess->session_fast_forward=attr1.fast_forward;
 			(*myds)->sess->user_max_connections=attr1.max_connections;
 			if (strcmp(vars1.password, (char *) vars1.pass) == 0) {
 				if (backend_username) {
@@ -1932,7 +1928,7 @@ void MySQL_Protocol::PPHR_5passwordFalse_auth2(
 #endif
 						(*myds)->sess->schema_locked=attr1.schema_locked;
 						(*myds)->sess->transaction_persistent=attr1.transaction_persistent;
-						(*myds)->sess->session_fast_forward=attr1.fast_forward ? SESSION_FORWARD_TYPE_PERMANENT : SESSION_FORWARD_TYPE_NONE;
+						(*myds)->sess->session_fast_forward=attr1.fast_forward;
 						(*myds)->sess->user_max_connections=attr1.max_connections;
 						char *tmp_user=strdup((const char *)acct.username);
 						userinfo->set(backend_username, NULL, NULL, NULL);
@@ -2342,6 +2338,19 @@ bool MySQL_Protocol::PPHR_verify_password(MyProt_tmp_auth_vars& vars1, account_d
 	return ret;
 }
 
+#include <unordered_map>
+#include <mutex>
+#include <string>
+#include <random>
+std::string generateSessionIDnew() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dist(100000, 999999);
+    return std::to_string(dist(gen));
+}
+std::unordered_map<std::string, std::string> session_extra_data_map;
+std::string session_idp;
+
 /**
  * @brief Process handshake response from the client, and it needs to be called until
  *   the authentication is completed (successfully or failed)
@@ -2352,48 +2361,77 @@ bool MySQL_Protocol::PPHR_verify_password(MyProt_tmp_auth_vars& vars1, account_d
  */
 bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned int len) {
 #ifdef DEBUG
-	if (dump_pkt) { __dump_pkt(__func__,pkt,len); }
+    if (dump_pkt) { __dump_pkt(__func__, pkt, len); }
 #endif
-	bool ret = false;
-	auth_plugin_id = AUTH_UNKNOWN_PLUGIN;
 
-	enum proxysql_session_type session_type = (*myds)->sess->session_type;
-	MyProt_tmp_auth_vars vars1;
-	account_details_t account_details {};
-	dup_account_details_t dup_details { true, true, true };
+    bool ret = false;
+    auth_plugin_id = AUTH_UNKNOWN_PLUGIN;
 
-	vars1._ptr = pkt;
-	mysql_hdr hdr;
-	bool bool_rc = false;
-	memcpy(&hdr,pkt,sizeof(mysql_hdr));
-	//Copy4B(&hdr,pkt);
-	pkt     += sizeof(mysql_hdr);
+    enum proxysql_session_type session_type = (*myds)->sess->session_type;
+    MyProt_tmp_auth_vars vars1;
+    account_details_t account_details {};
+    dup_account_details_t dup_details { true, true, true };
 
-	// NOTE: 'mysqlsh' sends a 'COM_INIT_DB' as soon as the connection is openned
-	// before ProxySQL has sent 'Server Greeting' messsage. Because this packet is
-	// unexpected, we simple return 'false' and exit.
-	if (hdr.pkt_id == 0 && *pkt == 2) {
-		ret = false;
-		proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s' . Client is disconnecting\n", (*myds), (*myds)->sess, vars1.user);
-		goto __exit_process_pkt_handshake_response;
-	}
+    vars1._ptr = pkt;
+    mysql_hdr hdr;
+    bool bool_rc = false;
+    memcpy(&hdr, pkt, sizeof(mysql_hdr));
+    pkt += sizeof(mysql_hdr);
 
-	if ((*myds)->myconn->userinfo->username) { // authentication already started.
-		int rc = PPHR_1(pkt, len, ret, vars1);
-		if (rc == 1)
-			goto __exit_process_pkt_handshake_response;
-		if (rc == 2)
-			goto __do_auth;
-		assert(0);
-	}
+    bool_rc = PPHR_2(pkt, len, ret, vars1);
+    if (bool_rc == false)
+        goto __exit_process_pkt_handshake_response;
 
-	bool_rc = PPHR_2(pkt, len, ret, vars1);
-	if (bool_rc == false)
-		goto __exit_process_pkt_handshake_response;
+    std::cout << "[DEBUG BEFORE] User: " << (vars1.user ? (char*)vars1.user : "NULL") << std::endl;
 
+    if (vars1.user) {
+        std::string full_username = std::string(reinterpret_cast<char*>(vars1.user));
+        size_t comma_pos = full_username.find(',');
 
-	PPHR_3(vars1); // detect plugin id
-	proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s' , auth_plugin_id=%d\n", (*myds), (*myds)->sess, vars1.user, auth_plugin_id);
+        if (comma_pos == std::string::npos || comma_pos == full_username.length() - 1) {
+            std::cout << "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.\n";
+            ret = false;  // Reject authentication
+            goto __exit_process_pkt_handshake_response;
+        }
+
+        // Extract the username and extra data
+        std::string clean_user = full_username.substr(0, comma_pos);
+        std::string extra_data = full_username.substr(comma_pos + 1);
+
+        // Generate a session ID
+        session_idp = generateSessionIDnew();
+        {
+            session_extra_data_map[clean_user + "_" + session_idp] = extra_data;
+        }
+
+        // Modify the original packet (pkt) directly
+        strncpy(reinterpret_cast<char*>(vars1.user), clean_user.c_str(), clean_user.length());
+        vars1.user[clean_user.length()] = '\0';  // Null-terminate safely
+
+        std::cout << "[DEBUG] Updated user: " << clean_user 
+                  << " Session: " << session_idp 
+                  << " Extra data: " << extra_data << std::endl;
+    }
+
+    if (hdr.pkt_id == 0 && *pkt == 2) {
+        ret = false;
+        proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s' . Client is disconnecting\n",
+                    (*myds), (*myds)->sess, vars1.user);
+        goto __exit_process_pkt_handshake_response;
+    }
+
+    if ((*myds)->myconn->userinfo->username) { // authentication already started.
+        int rc = PPHR_1(pkt, len, ret, vars1);
+        if (rc == 1)
+            goto __exit_process_pkt_handshake_response;
+        if (rc == 2)
+            goto __do_auth;
+        assert(0);
+    }
+
+    PPHR_3(vars1); // Detect plugin id
+    proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s' , auth_plugin_id=%d\n",
+                (*myds), (*myds)->sess, vars1.user, auth_plugin_id);
 
 
 	if (sent_auth_plugin_id == AUTH_MYSQL_NATIVE_PASSWORD) {

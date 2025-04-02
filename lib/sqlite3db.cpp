@@ -764,13 +764,7 @@ void SQLite3_result::add_column_definition(int a, const char *b) {
  * @return An integer representing the result of the operation (SQLITE_ROW on success).
  */
 int SQLite3_result::add_row(sqlite3_stmt *stmt, bool skip) {
-	int rc = 0;
-	do {
-		rc = (*proxy_sqlite3_step)(stmt);
-		if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-			usleep(USLEEP_SQLITE_LOCKED);
-		}
-	} while (rc == SQLITE_BUSY || rc == SQLITE_LOCKED);
+	int rc=(*proxy_sqlite3_step)(stmt);
 	if (rc!=SQLITE_ROW) return rc;
 	if (skip==false) {
 		SQLite3_row *row=new SQLite3_row(columns);

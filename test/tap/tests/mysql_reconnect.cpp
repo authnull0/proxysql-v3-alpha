@@ -12,7 +12,11 @@
 #include <vector>
 #include <thread>
 
+#ifdef LIBMYSQL_HELPER8
+#include "mysql/mysql.h"
+#else
 #include "mysql.h"
+#endif
 
 #include "utils.h"
 #include "tap.h"

@@ -58,9 +58,8 @@ int main(int argc, char** argv) {
 	}
 	{
 		std::string current = get_admin_mysql_ifaces(proxysql_admin);
-		//char * expected = (char *)"0.0.0.0:6032;0.0.0.0:6031;/tmp/proxysql_admin.sock";
-		//ok(strcmp(current.c_str(),expected)==0, "Line: %d , Current admin-mysql_ifaces = %s . Expected = %s", __LINE__, current.c_str(), expected);
-		ok((current.empty() == false), "Line: %d , Current admin-mysql_ifaces = %s .", __LINE__, current.c_str());
+		char * expected = (char *)"0.0.0.0:6032;0.0.0.0:6031;/tmp/proxysql_admin.sock;/tmp/proxysql_myadmin.sock";
+		ok(strcmp(current.c_str(),expected)==0, "Line: %d , Current admin-mysql_ifaces = %s . Expected = %s", __LINE__, current.c_str(), expected);
 	}
 
 	diag("Changing admin-mysql_ifaces to: 0.0.0.0:6032;/tmp/proxysql_admin.sock");

@@ -34,4 +34,3 @@ class ProxySQL_ConfigFile {
 
 
 #endif /* __CLASS_PROXYSQL_CONFIGFILE_H */
-

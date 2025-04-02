@@ -12,8 +12,7 @@
 #include "MySQL_LDAP_Authentication.hpp"
 #include "MySQL_PreparedStatement.h"
 #include "ProxySQL_Cluster.hpp"
-#include "MySQL_Query_Cache.h"
-#include "PgSQL_Query_Cache.h"
+
 #include "MySQL_Query_Processor.h"
 #include "PgSQL_Query_Processor.h"
 
@@ -32,8 +31,7 @@ extern bool admin_proxysql_pgsql_paused;
 extern MySQL_Authentication *GloMyAuth;
 extern PgSQL_Authentication* GloPgAuth;
 extern MySQL_LDAP_Authentication *GloMyLdapAuth;
-extern MySQL_Query_Cache *GloMyQC;
-extern PgSQL_Query_Cache* GloPgQC;
+extern Query_Cache *GloQC;
 extern ProxySQL_Admin *GloAdmin;
 extern MySQL_Threads_Handler *GloMTH;
 extern PgSQL_Threads_Handler* GloPTH;
@@ -533,7 +531,7 @@ void ProxySQL_Admin::stats___mysql_global() {
 		free(query);
 	}
 
-	if (GloMyQC && (resultset= GloMyQC->SQL3_getStats())) {
+	if (GloQC && (resultset=GloQC->SQL3_getStats())) {
 		for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
 			SQLite3_row *r=*it;
 			int arg_len=0;
@@ -693,7 +691,7 @@ void ProxySQL_Admin::stats___pgsql_global() {
 		free(query);
 	}*/
 
-	if (GloPgQC && (resultset = GloPgQC->SQL3_getStats())) {
+	if (GloQC && (resultset = GloQC->SQL3_getStats())) {
 		for (std::vector<SQLite3_row*>::iterator it = resultset->rows.begin(); it != resultset->rows.end(); ++it) {
 			SQLite3_row* r = *it;
 			int arg_len = 0;

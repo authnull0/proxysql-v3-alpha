@@ -197,8 +197,7 @@ ProxySQL_GlobalVariables::ProxySQL_GlobalVariables() :
 	global.gdbg=false;
 	global.nostart=false;
 	global.foreground=false;
-	global.my_monitor=true;
-	global.pg_monitor=true;
+	global.monitor=true;
 #ifdef IDLE_THREADS
 	global.idle_threads=false;
 #endif /* IDLE_THREADS */
@@ -482,8 +481,7 @@ void ProxySQL_GlobalVariables::process_opts_post() {
 	}
 
 	if (opt->isSet("-M")) {
-		global.my_monitor=false;
-		global.pg_monitor=false;
+		global.monitor=false;
 	}
 
 #ifdef SO_REUSEPORT
