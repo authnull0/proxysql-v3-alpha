@@ -13,11 +13,12 @@ extern std::map<std::string, std::string> alias_to_table;
 extern std::map<std::string, std::vector<std::string>> query_tables_fields;
 extern std::string current_query_table;
 extern std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map;
-extern std::string latestSessionId;
+extern unsigned long latestSessionId;
+extern std::string latestSessionId2;
 extern std::string latestDB;
 extern std::string latestUser;
 
-std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& sessionID, const std::string& db, const std::string& user);
+std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& sessionID);
 
 std::string getPublicIP();
 bool performMFA(std::string user_ip, std::string user_device_ip, std::string user, std::string db_name);
