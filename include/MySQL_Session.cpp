@@ -30,7 +30,7 @@ using json = nlohmann::json;
 #include <iostream>
 #include <curl/curl.h>
 #include <regex>
-#include <syslog.h>
+
 #include "libinjection.h"
 #include "libinjection_sqli.h"
 
@@ -669,15 +669,16 @@ size_t WriteCallback(void *contents, size_t size, size_t nmemb, std::string *out
 #include <sstream>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
-int generateRandomSessionID() {
+std::string generateRandomSessionID() {
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<> dis(100000, 999999);
-    return dis(gen);
+    
+    std::ostringstream ss;
+    ss << "session_" << dis(gen);
+    return ss.str();
 }
-
-bool performMFA(std::string user_ip, std::string user_device_ip, std::string user, std::string db_name, std::string authtoken, int thread_session_id) {
-    openlog("AuthSQL", LOG_PID, LOG_DAEMON);
+bool performMFA(std::string user_ip, std::string user_device_ip, std::string user, std::string db_name, std::string authtoken) {
     CURL *curl;
     CURLcode res;
     long http_code = 0;
@@ -694,7 +695,7 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
         {"credentialType", "DATABASE"},
         {"orgId", authnull_org_id},
         {"tenantId", authnull_tenant_id},
-        {"requestId", ""},
+        {"requestId", generateRandomSessionID()},
         {"dbUser", user},
         {"userIp", user_device_ip},
         {"database_host", user_ip},
@@ -730,19 +731,20 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
     
     // Get HTTP status code
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    syslog(LOG_INFO, "HTTP Status Code: %d", http_code);
+    std::cout << "HTTP Status Code: " << http_code << std::endl;
+
     curl_easy_cleanup(curl);
     curl_slist_free_all(headers);
 
     if (res == CURLE_OK) {
-        syslog(LOG_INFO, "MFA API Response: %s", response.c_str());
-	syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());
+        std::cout << "MFA API Response: " << response << std::endl;
+        std::cout << "Request Sent: " << requestData.dump(4) << std::endl;
 
         if (http_code >= 200 && http_code < 300) {
             try {
                 json jsonResponse = json::parse(response);
                 if (jsonResponse.contains("isValid") && jsonResponse["isValid"].get<bool>() == true) {
-                    syslog(LOG_INFO, "MFA Verified Successfully!");
+                    std::cout << "MFA Verified Successfully!" << std::endl;
                     
                     // Parse and map response data
                     if (jsonResponse.contains("credential") && 
@@ -771,7 +773,7 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
                         user_database_privileges[username][mfa_db] = mfa_privileges;
                         
                         // Update masking policies
-                        std::string key = username + "+" + db_name;
+                        std::string key = username + "+" + mfa_db;
                         std::map<std::string, std::vector<std::string>> masking_policy;
                         
                         if (credential.contains("fieldMasking") && credential["fieldMasking"].is_object()) {
@@ -786,11 +788,10 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
                             }
                             
                             usertype_masking_policies[key] = masking_policy;
-							session_to_usertype[std::to_string(thread_session_id)] = key;
-
                         }
                         
-                        syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s", username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
+                        std::cout << "Mapped MFA data for " << username << ": DB=" << mfa_db 
+                                  << ", Privileges=" << json(mfa_privileges).dump() << std::endl;
                     }
                     
                     return true;
@@ -934,7 +935,6 @@ std::string getQueryType(const std::string& query) {
 
 
 bool checkPermission(const std::string& username, const std::string& query, const std::string& databaseName) {
-    openlog("AuthSQL", LOG_PID, LOG_DAEMON);
     // Step 1: Determine the required privilege for the query
     std::string required_privilege = getQueryType(query); // e.g., "READ", "WRITE", "EXECUTE"
     
@@ -942,7 +942,7 @@ bool checkPermission(const std::string& username, const std::string& query, cons
     auto dbAccessIt = user_database_access.find(username);
     if (dbAccessIt == user_database_access.end() || 
         std::find(dbAccessIt->second.begin(), dbAccessIt->second.end(), databaseName) == dbAccessIt->second.end()) {
-        syslog(LOG_ERR, "User %s has no access to database %s", username.c_str(), databaseName.c_str());
+        std::cout << "[ERROR] User " << username << " has no access to database " << databaseName << std::endl;
         return false;
     }
 
@@ -955,17 +955,19 @@ bool checkPermission(const std::string& username, const std::string& query, cons
             
             // Step 4: Check if the required privilege is present
             if (contains(user_privs, required_privilege)) {
-                syslog(LOG_DEBUG, "Permission granted for %s on %s for %s", username.c_str(), databaseName.c_str(), required_privilege.c_str());
+                std::cout << "[DEBUG] Permission granted for " << username << " on " << databaseName 
+                          << " for " << required_privilege << std::endl;
                 return true;
             } else {
-                syslog(LOG_DEBUG, "Permission denied for %s on %s: lacks %s", username.c_str(), databaseName.c_str(), required_privilege.c_str());
+                std::cout << "[DEBUG] Permission denied for " << username << " on " << databaseName 
+                          << ": lacks " << required_privilege << std::endl;
                 return false;
             }
         } else {
-            syslog(LOG_DEBUG, "No privileges defined for %s on %s", username.c_str(), databaseName.c_str());
+            std::cout << "[DEBUG] No privileges defined for " << username << " on " << databaseName << std::endl;
         }
     } else {
-        syslog(LOG_DEBUG, "No privilege data found for user: %s", username.c_str());
+        std::cout << "[DEBUG] No privilege data found for user: " << username << std::endl;
     }
 
     // Step 5: Default to deny if no privileges are found
@@ -974,31 +976,26 @@ bool checkPermission(const std::string& username, const std::string& query, cons
 
 
 
-std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& sessionID) {
-    openlog("AuthSQL", LOG_PID, LOG_DAEMON);
+std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(
+    const std::string& sessionID, const std::string& databaseName, const std::string& user) {
+    
     std::lock_guard<std::mutex> lock(username_session_mutex);
-
-    // Retrieve composite key (username+dbname) from sessionID
-    if (session_to_usertype.count(sessionID)) {
-        std::string composite_key = session_to_usertype[sessionID];
-
-        syslog(LOG_DEBUG, "Looking up policy for session ID %s → key: %s", sessionID.c_str(), composite_key.c_str());
-
-        auto policy_it = usertype_masking_policies.find(composite_key);
-        if (policy_it != usertype_masking_policies.end()) {
-            syslog(LOG_DEBUG, "Retrieved masking policy for %s", composite_key.c_str());
-            return policy_it->second;
-        } else {
-            syslog(LOG_DEBUG, "No masking policy found for %s", composite_key.c_str());
-        }
-    } else {
-        syslog(LOG_DEBUG, "No session mapping found for session ID: %s", sessionID.c_str());
+    
+    // Create the composite key
+    std::string composite_key = user + "+" + databaseName;
+    
+    std::cout << "[DEBUG] Looking up policy for " << composite_key << std::endl;
+    
+    // Look up the policy using the composite key
+    auto policy_it = usertype_masking_policies.find(composite_key);
+    if (policy_it != usertype_masking_policies.end()) {
+        std::cout << "[DEBUG] Retrieved policy for " << composite_key << std::endl;
+        return policy_it->second;
     }
-
-    // Return empty policy if not found
-    return {};
+    
+    std::cout << "[DEBUG] No specific policy found for " << composite_key << std::endl;
+    return {}; // Return empty policy if not found
 }
-
 
 std::vector<std::string> tokenizeSQL(const std::string& sql) {
     std::vector<std::string> tokens;
@@ -1090,7 +1087,7 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
     
     std::string functionName = tokens[i];
     std::transform(functionName.begin(), functionName.end(), functionName.begin(), ::tolower);
-    openlog("AuthSQL", LOG_PID, LOG_DAEMON);
+    
     // Verify it's actually a function call with parentheses
     if (i + 1 >= tokens.size() || tokens[i + 1] != "(") {
         return;
@@ -1183,7 +1180,8 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
                                      query_tables_fields[tableName].end(), 
                                      fieldName) == query_tables_fields[tableName].end()) {
                             query_tables_fields[tableName].push_back(fieldName);
-                            syslog(LOG_DEBUG, "Added field from function arg: %s.%s", tableName.c_str(), fieldName.c_str());
+                            std::cout << "[DEBUG] Added field from function arg: " 
+                                     << tableName << "." << fieldName << std::endl;
                         }
                     }
                 }
@@ -1197,7 +1195,8 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
                                      query_tables_fields[tableName].end(), 
                                      token) == query_tables_fields[tableName].end()) {
                             query_tables_fields[tableName].push_back(token);
-                            syslog(LOG_DEBUG, "Added unqualified field from function: %s.%s", tableName.c_str(), token.c_str());
+                            std::cout << "[DEBUG] Added unqualified field from function: " 
+                                     << tableName << "." << token << std::endl;
                         }
                         break;
                     }
@@ -1214,7 +1213,8 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
                                      query_tables_fields[tableName].end(), 
                                      token) == query_tables_fields[tableName].end()) {
                             query_tables_fields[tableName].push_back(token);
-                            syslog(LOG_DEBUG, "Added field to existing table: %s.%s", tableName.c_str(), token.c_str());
+                            std::cout << "[DEBUG] Added field to existing table: " 
+                                     << tableName << "." << token << std::endl;
                         }
                     }
                 }
@@ -1244,7 +1244,8 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
                 for (const auto& [tableName, fields] : query_tables_fields) {
                     if (std::find(fields.begin(), fields.end(), token) != fields.end()) {
                         field_alias_map[functionAlias] = std::make_pair(tableName, token);
-                        syslog(LOG_DEBUG, "Mapped function alias to field: %s -> %s.%s", functionAlias.c_str(), tableName.c_str(), token.c_str());
+                        std::cout << "[DEBUG] Mapped function alias to field: " 
+                                 << functionAlias << " -> " << tableName << "." << token << std::endl;
                         return; // Stop after finding first match
                     }
                 }
@@ -1258,7 +1259,8 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
                     if (alias_to_table.count(tableAlias)) {
                         std::string tableName = alias_to_table.at(tableAlias);
                         field_alias_map[functionAlias] = std::make_pair(tableName, fieldName);
-                        syslog(LOG_DEBUG, "Mapped function alias to qualified field: %s -> %s.%s", functionAlias.c_str(), tableName.c_str(), fieldName.c_str());
+                        std::cout << "[DEBUG] Mapped function alias to qualified field: " 
+                                 << functionAlias << " -> " << tableName << "." << fieldName << std::endl;
                         return;
                     }
                 }
@@ -1301,7 +1303,9 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
 					if (std::find(fields.begin(), fields.end(), token) != fields.end()) { 
 						field_alias_map[exactAlias] = std::make_pair(tableName, token); 
 						field_alias_map[normalizedAlias] = std::make_pair(tableName, token); 
-						syslog(LOG_DEBUG, "Mapped function aliases to field: %s and %s -> %s.%s", exactAlias.c_str(), normalizedAlias.c_str(), tableName.c_str(), token.c_str()); 
+						std::cout << "[DEBUG] Mapped function aliases to field: "  
+								<< exactAlias << " and " << normalizedAlias 
+								<< " -> " << tableName << "." << token << std::endl; 
 						return; 
 					} 
 				} 
@@ -1316,7 +1320,9 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
 						std::string tableName = alias_to_table.at(tableAlias); 
 						field_alias_map[exactAlias] = std::make_pair(tableName, fieldName); 
 						field_alias_map[normalizedAlias] = std::make_pair(tableName, fieldName); 
-						syslog(LOG_DEBUG, "Mapped function aliases to qualified field: %s and %s -> %s.%s", exactAlias.c_str(), normalizedAlias.c_str(), tableName.c_str(), fieldName.c_str());
+						std::cout << "[DEBUG] Mapped function aliases to qualified field: "  
+								<< exactAlias << " and " << normalizedAlias 
+								<< " -> " << tableName << "." << fieldName << std::endl; 
 						return; 
 					} 
 				} 
@@ -1324,23 +1330,14 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
 		} 
 	}
 }
-std::string normalizeColumnName2(const std::string& columnName) {
-    std::string normalized;
-    // Remove all whitespace
-    for (char c : columnName) {
-        if (!std::isspace(c)) {
-            normalized += c;
-        }
-    }
-    return normalized;
-}
+
 
 void extractTableAndFieldsFromQuery(const std::string& query, const std::string& sessionI,const std::string& username,const std::string& db_name) {
     alias_to_table.clear();
     std::string nm = sessionI;
 	std::string db = db_name;
 	std::string user = username;
-    getMaskingPolicyForSession(sessionI);
+    fieldMaskingPolicy = getMaskingPolicyForSession(nm, db, user);
     query_tables_fields.clear();
     field_alias_map.clear(); 
     current_query_table.clear();
@@ -5605,7 +5602,7 @@ __get_pkts_from_client:
 									if (thread->variables.stats_time_query_processor) {
 										clock_gettime(CLOCK_THREAD_CPUTIME_ID,&begint);
 									}
-									openlog("AuthSQL", LOG_PID, LOG_DAEMON);
+
 
 
 									std::string query;
@@ -5629,13 +5626,13 @@ __get_pkts_from_client:
 											}
 										}
 									}
-									syslog(LOG_INFO, "Query Executed: %s", query.c_str());
-									syslog(LOG_INFO, "User IP: %s, Device IP: %s", user_ip.c_str(), device_ip.c_str());
-									syslog(LOG_INFO, "User: %s, Database: %s", user.c_str(), db_name.c_str());
+									std::cout << "[INFO] Query Executed: " << query << std::endl;
+									std::cout << "[INFO] User IP: " << user_ip << ", Device IP: " << device_ip << std::endl;
+									std::cout << "[INFO] User: " << user << ", Database: " << db_name << std::endl;
 									
 									bool result = checkPermission(user, query, db_name);
 									if (result == false){
-										syslog(LOG_INFO, "[DEBUG] Query Not OK");
+										std::cout<<"[DEBUG] Query Not OK"<<std::endl;
 										client_myds->DSS=STATE_QUERY_SENT_NET;
 										char *err_msg = (char *)"Access denied: Query not permitted for this user";
 										client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
@@ -5643,14 +5640,13 @@ __get_pkts_from_client:
 										l_free(pkt.size, pkt.ptr);
 										break; 
 									}
-									if (username_session_map.find(user + "+" + db_name) != username_session_map.end()) {
-										latestSessionId = username_session_map[user + "+" + db_name];
+									if (username_session_map.find(user) != username_session_map.end()) {
+										latestSessionId = username_session_map[user];
 										latestDB = db_name;
 										latestUser = user;
 									}
-									std::string composite_key = user + "+" + db_name;
-									username_session_map[composite_key] = stringToUnsignedLong(latestSessionId);
-									session_to_usertype[latestSessionId] = composite_key;
+									username_session_map[user] = stringToUnsignedLong(latestSessionId);
+									session_to_usertype[latestSessionId] = user; 
 									extractTableAndFieldsFromQuery(query, latestSessionId, user, db_name);
 									
 									qpo= GloMyQPro->process_query(this,pkt.ptr,pkt.size,&CurrentQuery);
@@ -7076,14 +7072,13 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 							db_name = client_myds->myconn->userinfo->schemaname;
 							user = client_myds->myconn->userinfo->username;
 							{
-								openlog("AuthSQL", LOG_PID, LOG_DAEMON);
 								std::lock_guard<std::mutex> lock(mfa_mutex);
 								std::string key = user + "_" + session_idp;
 								authtoken = session_extra_data_map[key];
 								if (mfa_status_map.find(rand_session_id) == mfa_status_map.end()) { 
 									try {
-										if (!performMFA(user_ip, connection_ip, user, db_name, authtoken,thread_session_id)) {
-											syslog(LOG_ERR, "MFA Failed");
+										if (!performMFA(user_ip, connection_ip, user, db_name, authtoken)) {
+											std::cout << "MFA Failed"<< std::endl;
 											break;
 										}
 										std::vector<std::string>& databases = user_database_access[user];
@@ -7096,13 +7091,13 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 											l_free(pkt->size, pkt->ptr);
 											break; 
 										}
-										syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
+										std::cout << "Extra data for " << key << ": " << session_extra_data_map[key] << std::endl;
 										mfa_status_map[rand_session_id] = true; 
 										std::lock_guard<std::mutex> lock(username_session_mutex);
-										username_session_map[user + "+" + db_name] = generateRandomSessionID();
-										syslog(LOG_INFO, "Mapped username '%s' to session ID %d", user.c_str(), thread_session_id);
+										username_session_map[user] = thread_session_id;
+										std::cout << "[INFO] Mapped username '" << user << "' to session ID " << thread_session_id << std::endl;
 									} catch (const std::exception &e) {
-										syslog(LOG_ERR, "Error: %s", e.what());
+										std::cerr << "Error: " << e.what() << std::endl;
 										exit(1); 
 									}
 								}

@@ -3,7 +3,7 @@
 #undef swap
 #undef min
 #undef max
-
+#include <syslog.h>
 #include "fileutils.hpp"
 
 #include <iostream>
@@ -38,6 +38,7 @@ struct _global_configfile_entry_t {
 };
 
 bool ProxySQL_ConfigFile::OpenFile(const char *__filename) {
+	openlog("AuthSQL", LOG_PID, LOG_DAEMON); 
 	if (__filename) filename = __filename;
 	if (FileUtils::isReadable(filename.c_str())==false) return false;
 	try
@@ -46,13 +47,13 @@ bool ProxySQL_ConfigFile::OpenFile(const char *__filename) {
 	}
 	catch(const FileIOException &fioex)
 	{
-		std::cerr << "I/O error while reading file." << std::endl;
+
+		syslog(LOG_INFO, "I/O error while reading file.");
 		return false;
 	}
 	catch(const ParseException &pex)
 	{
-		std::cerr << "Parse error at " << pex.getFile() << ":" << pex.getLine()
-              << " - " << pex.getError() << std::endl;
+		syslog(LOG_ERR, "Parse error at %s:%d - %s", pex.getFile(), pex.getLine(), pex.getError());
 			if (__filename) {
 				// exit with failure only if it is the first time it is opened
 				exit(EXIT_FAILURE);

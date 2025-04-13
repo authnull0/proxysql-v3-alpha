@@ -350,8 +350,8 @@ std::string normalizeColumnName(const std::string& columnName) {
 std::map<std::string, std::vector<std::string>> lowerCasePolicy;
 unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
 	openlog("AuthSQL", LOG_PID, LOG_DAEMON);
-	syslog(LOG_DEBUG, "[DEBUG] ROW session ID: %lu", latestSessionId);
 	std::string session_id = std::to_string(myds->sess->thread_session_id);
+	syslog(LOG_DEBUG, "[DEBUG] ROW session ID: %s", session_id);
     fieldMaskingPolicy = getMaskingPolicyForSession(session_id);
 	for (const auto& [table, fields] : fieldMaskingPolicy) {
 		std::string lowerTable = table;

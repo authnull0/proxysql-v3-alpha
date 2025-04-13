@@ -13,8 +13,6 @@ extern std::map<std::string, std::string> alias_to_table;
 extern std::map<std::string, std::vector<std::string>> query_tables_fields;
 extern std::string current_query_table;
 extern std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map;
-extern unsigned long latestSessionId;
-extern std::string latestSessionId2;
 extern std::string latestDB;
 extern std::string latestUser;
 

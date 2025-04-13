@@ -12,7 +12,7 @@
 namespace clickhouse {
     class Client;
 }
-//s
+
 class ClickHouse_Session {
    public:
 	SQLite3DB *sessdb;

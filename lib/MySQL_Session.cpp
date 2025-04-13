@@ -643,7 +643,6 @@ std::map<std::string, std::string> alias_to_table;
 std::map<std::string, std::vector<std::string>> query_tables_fields;
 std::string current_query_table;
 std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map;
-unsigned long latestSessionId;
 std::string latestDB;
 std::string latestUser;
 std::vector<std::regex> read_patterns;
@@ -676,7 +675,7 @@ int generateRandomSessionID() {
     return dis(gen);
 }
 
-bool performMFA(std::string user_ip, std::string user_device_ip, std::string user, std::string db_name, std::string authtoken, int thread_session_id) {
+bool performMFA(std::string user_ip, std::string user_device_ip, std::string user, std::string db_name, std::string authtoken, int thread_session_i) {
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
     CURL *curl;
     CURLcode res;
@@ -786,7 +785,7 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
                             }
                             
                             usertype_masking_policies[key] = masking_policy;
-							session_to_usertype[std::to_string(thread_session_id)] = key;
+							session_to_usertype[std::to_string(thread_session_i)] = key;
 
                         }
                         
@@ -978,8 +977,7 @@ std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
     std::lock_guard<std::mutex> lock(username_session_mutex);
 
-    // Retrieve composite key (username+dbname) from sessionID
-    if (session_to_usertype.count(sessionID)) {
+	if (session_to_usertype.count(sessionID)) {
         std::string composite_key = session_to_usertype[sessionID];
 
         syslog(LOG_DEBUG, "Looking up policy for session ID %s → key: %s", sessionID.c_str(), composite_key.c_str());
@@ -2983,7 +2981,9 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 			newsess->mirror=true;
 			newsess->client_myds->destroy_queues();
 		} else {
-			newsess=(MySQL_Session *)thread->mirror_queue_mysql_sessions_cache->remove_index_fast(0);
+			newsess = (MySQL_Session *)thread->mirror_queue_mysql_sessions_cache->remove_index_fast(0);
+			newsess->thread_session_id = __sync_fetch_and_add(&glovars.thread_id, 1);
+			syslog(LOG_DEBUG, "[MIRROR] Assigned session ID %lu to reused mirror session", newsess->thread_session_id);
 		}
 		newsess->client_myds->myconn->userinfo->set(client_myds->myconn->userinfo);
 		newsess->to_process=1;
@@ -5643,6 +5643,7 @@ __get_pkts_from_client:
 										l_free(pkt.size, pkt.ptr);
 										break; 
 									}
+									
 									std::string composite_key = user + "+" + db_name;
 									unsigned long session_id = this->thread_session_id;
 									// Map session if not already done
@@ -5650,7 +5651,7 @@ __get_pkts_from_client:
 										username_session_map[composite_key] = session_id;
 										session_to_usertype[std::to_string(session_id)] = composite_key;
 										syslog(LOG_DEBUG, "[DEBUG] Mapped new session ID %lu to %s", session_id, composite_key.c_str());
-									} else {
+									}  else {
 										syslog(LOG_DEBUG, "[DEBUG] Reusing session ID %lu for %s", session_id, composite_key.c_str());
 									}
 
