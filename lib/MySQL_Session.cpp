@@ -629,16 +629,14 @@ void MySQL_Session::set_status(enum session_status e) {
 
 
 static std::unordered_map<std::string, unsigned long> username_session_map;
-static std::mutex username_session_mutex;
 std::unordered_map<std::string, std::vector<std::string>> user_database_access;
 std::unordered_map<std::string, std::string> session_to_usertype;
-std::string sessionI;
 std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies;
 std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges;
 
 
 std::string current_table;
-std::map<std::string, std::vector<std::string>> fieldMaskingPolicy;
+// std::map<std::string, std::vector<std::string>> fieldMaskingPolicy;
 std::map<std::string, std::string> alias_to_table;
 std::map<std::string, std::vector<std::string>> query_tables_fields;
 std::string current_query_table;
@@ -766,11 +764,11 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
                         }
                         
                         // Update data structures
-                        user_database_access[username] = {mfa_db};
-                        user_database_privileges[username][mfa_db] = mfa_privileges;
+                        user_database_access[username + "+" + db_name + "+" +std::to_string(thread_session_i)] = {mfa_db};
+                        user_database_privileges[username][mfa_db+"+"+std::to_string(thread_session_i)] = mfa_privileges;
                         
                         // Update masking policies
-                        std::string key = username + "+" + db_name;
+                        std::string key = username + "+" + db_name + "+" +std::to_string(thread_session_i);
                         std::map<std::string, std::vector<std::string>> masking_policy;
                         
                         if (credential.contains("fieldMasking") && credential["fieldMasking"].is_object()) {
@@ -809,7 +807,6 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
     return false;
 }
 std::unordered_map<std::string, bool> mfa_status_map; 
-std::mutex mfa_mutex;
 
 std::string getPublicIP() {
     CURL *curl;
@@ -932,13 +929,13 @@ std::string getQueryType(const std::string& query) {
 }
 
 
-bool checkPermission(const std::string& username, const std::string& query, const std::string& databaseName) {
+bool checkPermission(const std::string& username, const std::string& query, const std::string& databaseName,const std::string& sessionId) {
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
     // Step 1: Determine the required privilege for the query
     std::string required_privilege = getQueryType(query); // e.g., "READ", "WRITE", "EXECUTE"
-    
+    std::string key = username + "+" + databaseName + "+" +sessionId;
     // Step 2: Check if the username has access to the specified database
-    auto dbAccessIt = user_database_access.find(username);
+    auto dbAccessIt = user_database_access.find(key);
     if (dbAccessIt == user_database_access.end() || 
         std::find(dbAccessIt->second.begin(), dbAccessIt->second.end(), databaseName) == dbAccessIt->second.end()) {
         syslog(LOG_ERR, "User %s has no access to database %s", username.c_str(), databaseName.c_str());
@@ -948,7 +945,8 @@ bool checkPermission(const std::string& username, const std::string& query, cons
     // Step 3: Fetch the user's privileges for the specific database
     auto userPrivsIt = user_database_privileges.find(username);
     if (userPrivsIt != user_database_privileges.end()) {
-        auto dbPrivsIt = userPrivsIt->second.find(databaseName);
+		std::string keyWithSession = databaseName + "+" + sessionId;
+        auto dbPrivsIt = userPrivsIt->second.find(keyWithSession);
         if (dbPrivsIt != userPrivsIt->second.end()) {
             std::vector<std::string> user_privs = dbPrivsIt->second;
             
@@ -973,27 +971,17 @@ bool checkPermission(const std::string& username, const std::string& query, cons
 
 
 
-std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& sessionID) {
+std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& user,const std::string& db_name,const std::string& sessionID) {
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
-    std::lock_guard<std::mutex> lock(username_session_mutex);
-
-	if (session_to_usertype.count(sessionID)) {
-        std::string composite_key = session_to_usertype[sessionID];
-
-        syslog(LOG_DEBUG, "Looking up policy for session ID %s → key: %s", sessionID.c_str(), composite_key.c_str());
-
-        auto policy_it = usertype_masking_policies.find(composite_key);
-        if (policy_it != usertype_masking_policies.end()) {
-            syslog(LOG_DEBUG, "Retrieved masking policy for %s", composite_key.c_str());
-            return policy_it->second;
-        } else {
-            syslog(LOG_DEBUG, "No masking policy found for %s", composite_key.c_str());
-        }
-    } else {
-        syslog(LOG_DEBUG, "No session mapping found for session ID: %s", sessionID.c_str());
-    }
-
-    // Return empty policy if not found
+	std::string composite_key = user + "+" + db_name + "+" +sessionID;
+	syslog(LOG_DEBUG, "Looking up policy for session ID %s → key: %s", sessionID.c_str(), composite_key.c_str());
+	auto policy_it = usertype_masking_policies.find(composite_key);
+	if (policy_it != usertype_masking_policies.end()) {
+		syslog(LOG_DEBUG, "Retrieved masking policy for %s", composite_key.c_str());
+		return policy_it->second;
+	} else {
+		syslog(LOG_DEBUG, "No masking policy found for %s", composite_key.c_str());
+	}
     return {};
 }
 
@@ -1338,7 +1326,7 @@ void extractTableAndFieldsFromQuery(const std::string& query, const unsigned lon
     std::string nm = std::to_string(sessionI);
 	std::string db = db_name;
 	std::string user = username;
-    getMaskingPolicyForSession(std::to_string(sessionI));
+    auto fieldMaskingPolicy=getMaskingPolicyForSession(user,db,std::to_string(sessionI));
     query_tables_fields.clear();
     field_alias_map.clear(); 
     current_query_table.clear();
@@ -2204,8 +2192,6 @@ MySQL_Session::MySQL_Session() {
 	proxysql_node_address = NULL;
 	use_ldap_auth = false;
 	rand_session_id = generateRandomSessionID(); 
-	sessionI = rand_session_id;
-
 }
 
 /**
@@ -2300,7 +2286,6 @@ MySQL_Session::~MySQL_Session() {
 
 		delete client_myds;
 	}
-	std::lock_guard<std::mutex> lock(mfa_mutex);
     mfa_status_map.erase(rand_session_id);
 	if (default_schema) {
 		free(default_schema);
@@ -5632,8 +5617,8 @@ __get_pkts_from_client:
 									syslog(LOG_INFO, "Query Executed: %s", query.c_str());
 									syslog(LOG_INFO, "User IP: %s, Device IP: %s", user_ip.c_str(), device_ip.c_str());
 									syslog(LOG_INFO, "User: %s, Database: %s", user.c_str(), db_name.c_str());
-									
-									bool result = checkPermission(user, query, db_name);
+									std::string seid = std::to_string(this->thread_session_id); 
+									bool result = checkPermission(user, query, db_name,seid);
 									if (result == false){
 										syslog(LOG_INFO, "[DEBUG] Query Not OK");
 										client_myds->DSS=STATE_QUERY_SENT_NET;
@@ -5643,19 +5628,7 @@ __get_pkts_from_client:
 										l_free(pkt.size, pkt.ptr);
 										break; 
 									}
-									
-									std::string composite_key = user + "+" + db_name;
 									unsigned long session_id = this->thread_session_id;
-									// Map session if not already done
-									if (username_session_map.find(composite_key) == username_session_map.end()) {
-										username_session_map[composite_key] = session_id;
-										session_to_usertype[std::to_string(session_id)] = composite_key;
-										syslog(LOG_DEBUG, "[DEBUG] Mapped new session ID %lu to %s", session_id, composite_key.c_str());
-									}  else {
-										syslog(LOG_DEBUG, "[DEBUG] Reusing session ID %lu for %s", session_id, composite_key.c_str());
-									}
-
-									// Now use session_id directly
 									extractTableAndFieldsFromQuery(query, session_id, user, db_name);
 									syslog(LOG_DEBUG, "[DEBUG] process_query using session ID: %lu", session_id);
 									qpo= GloMyQPro->process_query(this,pkt.ptr,pkt.size,&CurrentQuery);
@@ -7082,7 +7055,6 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 							user = client_myds->myconn->userinfo->username;
 							{
 								openlog("AuthSQL", LOG_PID, LOG_DAEMON);
-								std::lock_guard<std::mutex> lock(mfa_mutex);
 								std::string key = user + "_" + session_idp;
 								authtoken = session_extra_data_map[key];
 								if (mfa_status_map.find(rand_session_id) == mfa_status_map.end()) { 
@@ -7091,7 +7063,7 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 											syslog(LOG_ERR, "MFA Failed");
 											break;
 										}
-										std::vector<std::string>& databases = user_database_access[user];
+										std::vector<std::string>& databases = user_database_access[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
 										auto it = std::find(databases.begin(), databases.end(), db_name);
 										if (it == databases.end()) {
 											client_myds->DSS=STATE_QUERY_SENT_NET;
@@ -7102,14 +7074,8 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 											break; 
 										}
 										syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
-										mfa_status_map[rand_session_id] = true; 
-										std::lock_guard<std::mutex> lock(username_session_mutex);
-										std::string composite_key = user + "+" + db_name;
 										unsigned long thread_session_id = client_myds->sess->thread_session_id;
-										syslog(LOG_DEBUG, "Mapping session ID %lu to policy key %s", thread_session_id, composite_key.c_str());
-										session_to_usertype[std::to_string(thread_session_id)] = composite_key;
 										syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
-										syslog(LOG_DEBUG, "[DEBUG] performMFA (session ID): %lu", username_session_map[composite_key]);
 										syslog(LOG_INFO, "Mapped username '%s' to session ID %d", user.c_str(), thread_session_id);
 									} catch (const std::exception &e) {
 										syslog(LOG_ERR, "Error: %s", e.what());

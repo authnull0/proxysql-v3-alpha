@@ -8,7 +8,7 @@
 #define __CLASS_MYSQL_SESSION_H
 #include <string>
 
-extern std::map<std::string, std::vector<std::string>> fieldMaskingPolicy;
+// extern std::map<std::string, std::vector<std::string>> fieldMaskingPolicy;
 extern std::map<std::string, std::string> alias_to_table;
 extern std::map<std::string, std::vector<std::string>> query_tables_fields;
 extern std::string current_query_table;
@@ -16,7 +16,7 @@ extern std::unordered_map<std::string, std::pair<std::string, std::string>> fiel
 extern std::string latestDB;
 extern std::string latestUser;
 
-std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& sessionID);
+std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& user,const std::string& db_name,const std::string& sessionID);
 
 std::string getPublicIP();
 bool performMFA(std::string user_ip, std::string user_device_ip, std::string user, std::string db_name);

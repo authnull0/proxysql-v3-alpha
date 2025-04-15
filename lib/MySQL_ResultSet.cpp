@@ -349,10 +349,18 @@ std::string normalizeColumnName(const std::string& columnName) {
 }
 std::map<std::string, std::vector<std::string>> lowerCasePolicy;
 unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
+	lowerCasePolicy.clear();
+	alias_to_table.clear(); // Clear the map of alias to table
+    query_tables_fields.clear(); // Clear the map of query tables fields
+    current_query_table.clear(); // Clear the current query table string
+	field_alias_map.clear();
 	openlog("AuthSQL", LOG_PID, LOG_DAEMON);
+	std::string user = myds->myconn->userinfo->username;
+	std::string db_name = myds->myconn->userinfo->schemaname;
 	std::string session_id = std::to_string(myds->sess->thread_session_id);
-	syslog(LOG_DEBUG, "[DEBUG] ROW session ID: %s", session_id);
-    fieldMaskingPolicy = getMaskingPolicyForSession(session_id);
+	syslog(LOG_DEBUG, "[DEBUG] ROW session key: %s", session_id.c_str());
+    auto fieldMaskingPolicy = getMaskingPolicyForSession(user,db_name,session_id);
+
 	for (const auto& [table, fields] : fieldMaskingPolicy) {
 		std::string lowerTable = table;
 		std::transform(lowerTable.begin(), lowerTable.end(), lowerTable.begin(), ::tolower);
