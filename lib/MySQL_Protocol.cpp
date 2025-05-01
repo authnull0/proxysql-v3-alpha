@@ -7,7 +7,7 @@ using json = nlohmann::json;
 #include "cpp.h"
 #include "re2/re2.h"
 #include "re2/regexp.h"
-
+#include <syslog.h>
 #include "MySQL_PreparedStatement.h"
 #include "MySQL_Data_Stream.h"
 #include "MySQL_Authentication.hpp"
@@ -2363,7 +2363,7 @@ bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned
 #ifdef DEBUG
     if (dump_pkt) { __dump_pkt(__func__, pkt, len); }
 #endif
-
+	openlog("AuthSQL", LOG_PID, LOG_DAEMON);
     bool ret = false;
     auth_plugin_id = AUTH_UNKNOWN_PLUGIN;
 
@@ -2382,14 +2382,14 @@ bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned
     if (bool_rc == false)
         goto __exit_process_pkt_handshake_response;
 
-    std::cout << "[DEBUG BEFORE] User: " << (vars1.user ? (char*)vars1.user : "NULL") << std::endl;
+    syslog(LOG_DEBUG, "[DEBUG BEFORE] User: %s", vars1.user ? (char*)vars1.user : "NULL");
 
     if (vars1.user) {
         std::string full_username = std::string(reinterpret_cast<char*>(vars1.user));
         size_t comma_pos = full_username.find(',');
 
         if (comma_pos == std::string::npos || comma_pos == full_username.length() - 1) {
-            std::cout << "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.\n";
+            syslog(LOG_ERR, "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.");
             ret = false;  // Reject authentication
             goto __exit_process_pkt_handshake_response;
         }
@@ -2408,9 +2408,7 @@ bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned
         strncpy(reinterpret_cast<char*>(vars1.user), clean_user.c_str(), clean_user.length());
         vars1.user[clean_user.length()] = '\0';  // Null-terminate safely
 
-        std::cout << "[DEBUG] Updated user: " << clean_user 
-                  << " Session: " << session_idp 
-                  << " Extra data: " << extra_data << std::endl;
+        syslog(LOG_DEBUG, "[DEBUG] Updated user: %s Session: %s Extra data: %s", clean_user.c_str(), session_idp.c_str(), extra_data.c_str());
     }
 
     if (hdr.pkt_id == 0 && *pkt == 2) {
