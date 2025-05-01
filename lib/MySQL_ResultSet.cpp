@@ -421,8 +421,22 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                 std::transform(origFieldName.begin(), origFieldName.end(), origFieldName.begin(), ::tolower);
             }
             
-            syslog(LOG_DEBUG, "Field metadata: name=%s, table=%s, org_table=%s, org_name=%s", fieldName.c_str(), tableName.c_str(), origTableName.c_str(), origFieldName.c_str());
-            
+            //syslog(LOG_DEBUG, "Field metadata: name=%s, table=%s, org_table=%s, org_name=%s", fieldName.c_str(), tableName.c_str(), origTableName.c_str(), origFieldName.c_str());
+            nlohmann::json logData = {
+				{"level", "debug"},
+				{"message", "Field metadata"},
+				{"field", {
+					{"name", fieldName},
+					{"table", tableName},
+					{"org_table", origTableName},
+					{"org_name", origFieldName}
+				}},
+				{"timestamp", std::chrono::system_clock::now().time_since_epoch().count()}
+			};
+			
+			// Convert to string and log
+			std::string jsonStr = logData.dump();
+			syslog(LOG_DEBUG, "%s", jsonStr.c_str());
             bool masked = false;
 
             // Check original metadata
@@ -433,8 +447,22 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                              origFieldName) != fieldMaskingPolicy[origTableName].end()) {
                     modifiedRow[i] = std::string(lengths[i], '*');
                     masked = true;
-                    syslog(LOG_DEBUG, "Masked using original metadata: %s.%s", origTableName.c_str(), origFieldName.c_str());
-                }
+                    //syslog(LOG_DEBUG, "Masked using original metadata: %s.%s", origTableName.c_str(), origFieldName.c_str());
+					nlohmann::json logData = {
+						{"level", "debug"},
+						{"event", "field_masked"},
+						{"metadata", {
+							{"table", origTableName},
+							{"field", origFieldName}
+						}},
+						{"message", "Masked using original metadata"},
+						{"timestamp", std::chrono::system_clock::now().time_since_epoch().count()}
+					};
+					
+					// Convert to string and log
+					std::string jsonStr = logData.dump();
+					syslog(LOG_DEBUG, "%s", jsonStr.c_str());			
+				}
             }
 
             // Check current metadata
@@ -445,8 +473,23 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                              fieldName) != fieldMaskingPolicy[tableName].end()) {
                     modifiedRow[i] = std::string(lengths[i], '*');
                     masked = true;
-                    syslog(LOG_DEBUG, "Masked using metadata: %s.%s", tableName.c_str(), fieldName.c_str());
-                }
+                    //syslog(LOG_DEBUG, "Masked using metadata: %s.%s", tableName.c_str(), fieldName.c_str());
+					nlohmann::json logData = {
+						{"level", "debug"},
+						{"event", "field_masked"},
+						{"metadata", {
+							{"table", tableName},
+							{"field", fieldName},
+							{"masking_type", "current_metadata"}
+						}},
+						{"message", "Masked using metadata"},
+						{"timestamp", std::chrono::system_clock::now().time_since_epoch().count()}
+					};
+					
+					// Convert to string and log
+					std::string jsonStr = logData.dump();
+					syslog(LOG_DEBUG, "%s", jsonStr.c_str());			
+				}
             }
 			// Check field alias map
 			if (!masked && (field_alias_map.count(fieldName) || field_alias_map.count(normalizedFieldName))) {
@@ -467,7 +510,20 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
 							originalField) != fieldMaskingPolicy[originalTable].end()) {
 					modifiedRow[i] = std::string(lengths[i], '*');
 					masked = true;
-					syslog(LOG_DEBUG, "Masked aliased field: %s (maps to %s.%s)", fieldName.c_str(), originalTable.c_str(), originalField.c_str());
+					//syslog(LOG_DEBUG, "Masked aliased field: %s (maps to %s.%s)", fieldName.c_str(), originalTable.c_str(), originalField.c_str());
+					nlohmann::json logData = {
+						{"level", "debug"},
+						{"event", "field_masked"},
+						{"message", "Masked using metadata"},
+						{"metadata", {
+							{"table", tableName},
+							{"field", fieldName},
+							{"masking_type", "current_metadata"}
+						}}
+					};
+					
+					std::string jsonStr = logData.dump();
+					syslog(LOG_DEBUG, "%s", jsonStr.c_str());			
 				}
 			}
             // Check field alias map
@@ -481,8 +537,22 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                              originalField) != fieldMaskingPolicy[originalTable].end()) {
                     modifiedRow[i] = std::string(lengths[i], '*');
                     masked = true;
-                    syslog(LOG_DEBUG, "Masked aliased field: %s (maps to %s.%s)", fieldName.c_str(), originalTable.c_str(), originalField.c_str());
-                }
+                    //syslog(LOG_DEBUG, "Masked aliased field: %s (maps to %s.%s)", fieldName.c_str(), originalTable.c_str(), originalField.c_str());
+					nlohmann::json logData = {
+						{"level", "debug"},
+						{"event", "field_masked"},
+						{"message", "Masked aliased field"},
+						{"metadata", {
+							{"field", fieldName},
+							{"original_table", originalTable},
+							{"original_field", originalField},
+							{"masking_type", "alias_mapping"}
+						}}
+					};
+			
+					std::string jsonStr = logData.dump();
+					syslog(LOG_DEBUG, "%s", jsonStr.c_str());			
+				}
             }
             
             // Check subquery field cache
@@ -495,8 +565,22 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                                  cachedField) != fieldMaskingPolicy[cachedTable].end()) {
                         modifiedRow[i] = std::string(lengths[i], '*');
                         masked = true;
-                        syslog(LOG_DEBUG, "Masked cached subquery field: %s (maps to %s.%s)", fieldName.c_str(), cachedTable.c_str(), cachedField.c_str());
-                    }
+                        //syslog(LOG_DEBUG, "Masked cached subquery field: %s (maps to %s.%s)", fieldName.c_str(), cachedTable.c_str(), cachedField.c_str());
+						nlohmann::json logData = {
+							{"level", "debug"},
+							{"event", "field_masked"},
+							{"message", "Masked cached subquery field"},
+							{"metadata", {
+								{"field", fieldName},
+								{"original_table", cachedTable},
+								{"original_field", cachedField},
+								{"masking_type", "subquery_cache"}
+							}}
+						};
+			
+						std::string jsonStr = logData.dump();
+						syslog(LOG_DEBUG, "%s", jsonStr.c_str());			
+					}
                 } else {
                     // Check potential subquery patterns
                     for (const auto& [table, maskedFields] : fieldMaskingPolicy) {
@@ -507,8 +591,22 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                                 modifiedRow[i] = std::string(lengths[i], '*');
                                 masked = true;
                                 subqueryFieldCache[fieldName] = std::make_pair(table, field);
-                                syslog(LOG_DEBUG, "Masked subquery field (pattern 1): %s (maps to %s.%s)", fieldName.c_str(), table.c_str(), field.c_str());
-                                break;
+                                //syslog(LOG_DEBUG, "Masked subquery field (pattern 1): %s (maps to %s.%s)", fieldName.c_str(), table.c_str(), field.c_str());
+								nlohmann::json logData = {
+									{"level", "debug"},
+									{"event", "field_masked"},
+									{"message", "Masked subquery field (pattern 1)"},
+									{"metadata", {
+										{"field", fieldName},
+										{"original_table", table},
+										{"original_field", field},
+										{"masking_type", "subquery_pattern_1"}
+									}}
+								};
+					
+								std::string jsonStr = logData.dump();
+								syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+								break;
                             }
 
                             if (fieldName == field) {
@@ -518,8 +616,22 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                                         modifiedRow[i] = std::string(lengths[i], '*');
                                         masked = true;
                                         subqueryFieldCache[fieldName] = std::make_pair(table, field);
-                                        syslog(LOG_DEBUG, "Masked subquery field (pattern 2): %s (maps to %s.%s)", fieldName.c_str(), table.c_str(), field.c_str());
-                                        break;
+                                        //syslog(LOG_DEBUG, "Masked subquery field (pattern 2): %s (maps to %s.%s)", fieldName.c_str(), table.c_str(), field.c_str());
+										nlohmann::json logData = {
+											{"level", "debug"},
+											{"event", "field_masked"},
+											{"message", "Masked subquery field (pattern 2)"},
+											{"metadata", {
+												{"field", fieldName},
+												{"original_table", table},
+												{"original_field", field},
+												{"masking_type", "subquery_pattern_2"}
+											}}
+										};
+							
+										std::string jsonStr = logData.dump();
+										syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+										break;
                                     }
                                 }
                             }
@@ -536,7 +648,21 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
 							fieldName) != fieldMaskingPolicy[tableName].end()) {
 					modifiedRow[i] = std::string(lengths[i], '*');
 					masked = true;
-					syslog(LOG_DEBUG, "Masked field by name match: %s (in table %s)",fieldName.c_str(), tableName.c_str());
+					//syslog(LOG_DEBUG, "Masked field by name match: %s (in table %s)",fieldName.c_str(), tableName.c_str());
+					nlohmann::json logData = {
+						{"level", "debug"},
+						{"event", "field_masked"},
+						{"message", "Masked field by name match"},
+						{"metadata", {
+							{"field", fieldName},
+							{"original_table", tableName},
+							{"original_field", fieldName},
+							{"masking_type", "direct_match"}
+						}}
+					};
+			
+					std::string jsonStr = logData.dump();
+					syslog(LOG_DEBUG, "%s", jsonStr.c_str());			
 				}
 			}
 
@@ -550,15 +676,39 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                     if (fieldName.find(prefix) == 0) {
                         isAggregate = true;
                         baseFieldName = fieldName.substr(prefix.length());
-                        syslog(LOG_DEBUG, "Detected aggregate prefix: %s, base field: %s", prefix.c_str(), baseFieldName.c_str());
-                        break;
+                        //syslog(LOG_DEBUG, "Detected aggregate prefix: %s, base field: %s", prefix.c_str(), baseFieldName.c_str());
+                        nlohmann::json logData = {
+							{"level", "debug"},
+							{"event", "aggregate_prefix_detected"},
+							{"message", "Detected aggregate prefix"},
+							{"metadata", {
+								{"prefix", prefix},
+								{"base_field", baseFieldName},
+								{"original_field", fieldName}
+							}}
+						};
+				
+						std::string jsonStr = logData.dump();
+						syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+						break;
                     }
                 }
 
                 // Check if field name matches an exact aggregate name
                 if (!isAggregate && aggregateExactNames.count(fieldName) > 0) {
                     isAggregate = true;
-                    syslog(LOG_DEBUG, "Detected exact aggregate name: %s", fieldName.c_str());
+                    nlohmann::json logData = {
+						{"level", "debug"},
+						{"event", "aggregate_exact_name_detected"},
+						{"message", "Detected exact aggregate name"},
+						{"metadata", {
+							{"field", fieldName}
+						}}
+					};
+				
+					std::string jsonStr = logData.dump();
+					syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+					//syslog(LOG_DEBUG, "Detected exact aggregate name: %s", fieldName.c_str());
                 }
                 
                 // If this is an aggregate field, check all tables and fields from the query
@@ -578,8 +728,22 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                                     baseFieldName.find(queryField) != std::string::npos) {
                                     modifiedRow[i] = std::string(lengths[i], '*');
                                     masked = true;
-                                    syslog(LOG_DEBUG, "Masked aggregate result of sensitive field: %s (derived from %s.%s)", fieldName.c_str(), table.c_str(), queryField.c_str());
-                                    break;
+                                    //syslog(LOG_DEBUG, "Masked aggregate result of sensitive field: %s (derived from %s.%s)", fieldName.c_str(), table.c_str(), queryField.c_str());
+                                    nlohmann::json logData = {
+										{"level", "debug"},
+										{"event", "aggregate_masked"},
+										{"message", "Masked aggregate result of sensitive field"},
+										{"metadata", {
+											{"field", fieldName},
+											{"original_table", table},
+											{"original_field", queryField},
+											{"masking_type", "aggregate_sensitive_field"}
+										}}
+									};
+				
+									std::string jsonStr = logData.dump();
+									syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+									break;
                                 }
                             }
                         }
@@ -599,7 +763,20 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
                                            field) != fieldMaskingPolicy[table].end()) {
                                     modifiedRow[i] = std::string(lengths[i], '*');
                                     masked = true;
-                                    syslog(LOG_DEBUG, "Masked field from query tables: %s.%s", table.c_str(), field.c_str());
+                                    nlohmann::json logData = {
+										{"level", "debug"},
+										{"event", "masked_from_query_table"},
+										{"message", "Masked field from query tables"},
+										{"metadata", {
+											{"field", field},
+											{"original_table", table},
+											{"masking_type", "query_table_sensitive_field"}
+										}}
+									};
+			
+									std::string jsonStr = logData.dump();
+									syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+									//syslog(LOG_DEBUG, "Masked field from query tables: %s.%s", table.c_str(), field.c_str());
                                     break;
                                 }
                             }
