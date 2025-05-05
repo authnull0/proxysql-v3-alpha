@@ -2341,7 +2341,7 @@ std::unordered_map<std::string, std::vector<std::string>> user_database_access;
 std::unordered_map<std::string, std::string> session_to_usertype;
 std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies;
 std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges;
-std::unordered_map<uint32_t, std::string> session_to_iamUSer;
+std::unordered_map<uint32_t, std::string> session_to_iamUser;
 
 #include <unordered_map>
 #include <mutex>
@@ -2650,7 +2650,7 @@ bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned
 				
 						syslog(LOG_INFO, "Mapped username '%s' to thread session ID: %u",
 							   iamUser.c_str(), threadSessionId);
-						syslog(LOG_INFO, "[INFO] Username extracted: %s", iamUSer.c_str());
+						syslog(LOG_INFO, "[INFO] Username extracted: %s", iamUser.c_str());
 					} else {
 						syslog(LOG_WARNING, "[WARNING] 'username' field not found in response");
 					}
