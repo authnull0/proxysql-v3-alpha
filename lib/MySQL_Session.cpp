@@ -5792,6 +5792,13 @@ __get_pkts_from_client:
 											}
 										}
 									}
+									std::string iamUser = "unknown";
+
+									// Check if thread_session_id exists in the map
+									auto it = session_to_iamUSer.find(thread_session_id);
+									if (it != session_to_iamUSer.end()) {
+ 									   iamUser = it->second;
+									}
 									syslog(LOG_INFO, "Query Executed: %s", query.c_str());
 									nlohmann::json logData1 = {
 										{"level", "info"},
@@ -5799,7 +5806,9 @@ __get_pkts_from_client:
 										{"message", "User and device IP information"},
 										{"metadata", {
 											{"user_ip", user_ip},
-											{"device_ip", device_ip}
+											{"device_ip", device_ip},
+											{"thread_session_id", thread_session_id},
+											{"iam_user", iamUser}
 										}}
 									};
 									
@@ -5818,7 +5827,7 @@ __get_pkts_from_client:
 									
 									std::string jsonStr2 = logData2.dump();
 									syslog(LOG_INFO, "%s", jsonStr2.c_str());
-									
+									syslog(LOG_INFO, "IAM User: %s mapped to Thread Session ID: %u", iamUser.c_str(), threadSessionId);
 									syslog(LOG_INFO, "User IP: %s, Device IP: %s", user_ip.c_str(), device_ip.c_str());
 									syslog(LOG_INFO, "User: %s, Database: %s", user.c_str(), db_name.c_str());
 									std::string seid = std::to_string(this->thread_session_id); 
