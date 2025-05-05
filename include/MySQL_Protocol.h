@@ -11,6 +11,10 @@
 #include <random>
 extern std::unordered_map<std::string, std::string> session_extra_data_map;
 extern std::string session_idp;
+extern std::unordered_map<std::string, std::vector<std::string>> user_database_access;
+extern std::unordered_map<std::string, std::string> session_to_usertype;
+extern std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies;
+extern std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges;
 #define RESULTSET_BUFLEN 16300
 
 extern MySQL_Variables mysql_variables;
