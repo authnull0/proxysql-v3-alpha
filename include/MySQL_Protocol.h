@@ -15,7 +15,7 @@ extern std::unordered_map<std::string, std::vector<std::string>> user_database_a
 extern std::unordered_map<std::string, std::string> session_to_usertype;
 extern std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies;
 extern std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges;
-extern std::unordered_map<uint32_t, std::string> session_to_iamUSer;
+extern std::unordered_map<uint32_t, std::string> session_to_iamUser;
 #define RESULTSET_BUFLEN 16300
 
 extern MySQL_Variables mysql_variables;
