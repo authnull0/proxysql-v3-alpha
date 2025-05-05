@@ -2646,7 +2646,7 @@ bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned
 						uint32_t threadSessionId = (*myds)->sess->thread_session_id;
 
 						// Store mapping
-						session_to_iamUSer[threadSessionId] = iamUser;
+						session_to_iamUser[threadSessionId] = iamUser;
 				
 						syslog(LOG_INFO, "Mapped username '%s' to thread session ID: %u",
 							   iamUser.c_str(), threadSessionId);
