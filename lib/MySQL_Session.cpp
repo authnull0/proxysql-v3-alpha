@@ -281,6 +281,7 @@ void* kill_query_thread(void *arg) {
 			default:
 				break;
 		}
+		syslog(LOG_DEBUG, "[DEBUG BEFORE] rrrrrrrr");
 		ret=mysql_real_connect(mysql, ka->get_host_address(), ka->username, ka->password, NULL, ka->port, NULL, 0);
 	} else {
 		switch (ka->kill_type) {
@@ -293,6 +294,7 @@ void* kill_query_thread(void *arg) {
 			default:
 				break;
 		}
+		syslog(LOG_DEBUG, "[DEBUG BEFORE] rrrrrrrr");
 		ret=mysql_real_connect(mysql,"localhost",ka->username,ka->password,NULL,0,ka->hostname,0);
 	}
 	if (!ret) {
@@ -629,10 +631,7 @@ void MySQL_Session::set_status(enum session_status e) {
 
 
 static std::unordered_map<std::string, unsigned long> username_session_map;
-std::unordered_map<std::string, std::vector<std::string>> user_database_access;
-std::unordered_map<std::string, std::string> session_to_usertype;
-std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies;
-std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges;
+
 
 
 std::string current_table;
@@ -733,7 +732,7 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
 
     if (res == CURLE_OK) {
         syslog(LOG_INFO, "MFA API Response: %s", response.c_str());
-	syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());
+		syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());
 
         if (http_code >= 200 && http_code < 300) {
             try {
@@ -7110,6 +7109,7 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE_
 #ifdef DEBUG
 	if (client_myds->myconn->userinfo->password) {
 		char *tmp_pass=strdup(client_myds->myconn->userinfo->password);
+		syslog(LOG_INFO, "Original password text: %s", tmp_pass);
 		int lpass = strlen(tmp_pass);
 		for (int i=2; i<lpass-1; i++) {
 			tmp_pass[i]='*';
@@ -7120,7 +7120,8 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE_
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session=%p , DS=%p . Error: Access denied for user '%s'@'%s' . No password. Disconnecting\n", this, client_myds, client_myds->myconn->userinfo->username, client_addr);
 	}
 #endif // DEBUG
-		std::cout<<"[DEBUG]" << client_myds->myconn->userinfo->username << "3" << std::endl;
+		std::cout<<"[DEBUG]" << client_myds->myconn->userinfo->username << "30000000000000000000000" << std::endl;
+		syslog(LOG_INFO, "Original password text: %s", client_myds->myconn->userinfo->password);
 		sprintf(_s,"ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
 		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL, _pid, 1045,(char *)"28000", _s, true);
 		proxy_error("ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)\n", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
@@ -7264,10 +7265,10 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 								authtoken = session_extra_data_map[key];
 								if (mfa_status_map.find(rand_session_id) == mfa_status_map.end()) { 
 									try {
-										if (!performMFA(user_ip, connection_ip, user, db_name, authtoken,thread_session_id)) {
-											syslog(LOG_ERR, "MFA Failed");
-											break;
-										}
+										// if (!performMFA(user_ip, connection_ip, user, db_name, authtoken,thread_session_id)) {
+										// 	syslog(LOG_ERR, "MFA Failed");
+										// 	break;
+										// }
 										std::vector<std::string>& databases = user_database_access[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
 										auto it = std::find(databases.begin(), databases.end(), db_name);
 										if (it == databases.end()) {

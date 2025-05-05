@@ -2337,7 +2337,10 @@ bool MySQL_Protocol::PPHR_verify_password(MyProt_tmp_auth_vars& vars1, account_d
 
 	return ret;
 }
-
+std::unordered_map<std::string, std::vector<std::string>> user_database_access;
+std::unordered_map<std::string, std::string> session_to_usertype;
+std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies;
+std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges;
 #include <unordered_map>
 #include <mutex>
 #include <string>
@@ -2359,11 +2362,123 @@ std::string session_idp;
  *      true: the authentication completed
  *      false: the authentication failed, or more data is needed
  */
+
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <iomanip> // For hex formatting
+#include <openssl/aes.h>
+#include <openssl/rand.h>
+#include <openssl/evp.h>
+#include <stdexcept>
+#include <ctime>
+#include <random>
+#include <sstream>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+using namespace std;
+
+// Fixed key for AES-256 - MUST match the Go key exactly
+const string KEY_STRING = "84sF#v7Fpt!L#PesYb^AezXrUn2kE%5v";
+const int KEY_SIZE_BYTES = 32; // AES-256 key size
+const int BLOCK_SIZE_BYTES = 16; // AES block size
+
+// Helper function to convert byte array to hex string
+string bytes_to_hex(const unsigned char* bytes, int len) {
+    stringstream ss;
+    ss << hex << setfill('0');
+    for (int i = 0; i < len; ++i) {
+        ss << setw(2) << static_cast<int>(bytes[i]);
+    }
+    return ss.str();
+}
+std::string getPublicIP2() {
+    CURL *curl;
+    CURLcode res;
+    std::string readBuffer;
+
+    curl = curl_easy_init();
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.ipify.org");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, 
+            +[](void *ptr, size_t size, size_t nmemb, std::string *data) -> size_t {
+                data->append((char *)ptr, size * nmemb);
+                return size * nmemb;
+            });
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+        res = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+    }
+    return readBuffer;
+}
+// Helper function to convert hex string to byte vector
+vector<unsigned char> hex_to_bytes(const string& hex) {
+    vector<unsigned char> bytes;
+    for (size_t i = 0; i < hex.length(); i += 2) {
+        string byteString = hex.substr(i, 2);
+        unsigned char byte = (unsigned char)stoi(byteString, nullptr, 16);
+        bytes.push_back(byte);
+    }
+    return bytes;
+}
+
+string DecryptFromGoOpenSSL(const string &encryptedHex) {
+    vector<unsigned char> ciphertext_with_iv = hex_to_bytes(encryptedHex);
+    if (ciphertext_with_iv.size() < BLOCK_SIZE_BYTES) {
+        cerr << "Error: Ciphertext too short!" << endl;
+        return "";
+    }
+
+    vector<unsigned char> iv(ciphertext_with_iv.begin(), ciphertext_with_iv.begin() + BLOCK_SIZE_BYTES);
+    vector<unsigned char> ciphertext(ciphertext_with_iv.begin() + BLOCK_SIZE_BYTES, ciphertext_with_iv.end());
+    vector<unsigned char> decrypted_text(ciphertext.size());
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        throw runtime_error("EVP_CIPHER_CTX_new failed");
+    }
+
+    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cfb(), nullptr, (const unsigned char*)KEY_STRING.data(), iv.data())) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw runtime_error("EVP_DecryptInit_ex failed");
+    }
+
+    int len;
+    if (1 != EVP_DecryptUpdate(ctx, decrypted_text.data(), &len, ciphertext.data(), ciphertext.size())) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw runtime_error("EVP_DecryptUpdate failed");
+    }
+    int decrypted_len = len;
+
+    if (1 != EVP_DecryptFinal_ex(ctx, decrypted_text.data() + len, &len)) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw runtime_error("EVP_DecryptFinal_ex failed");
+    }
+    decrypted_len += len;
+
+    EVP_CIPHER_CTX_free(ctx);
+
+    return string(decrypted_text.begin(), decrypted_text.begin() + decrypted_len);
+}
+int authnull_org_id2;
+int authnull_tenant_id2;
+std::string authnull_api_url2;
+void loadAuthNullConfig2() {
+    authnull_org_id2 = GloVars.confFile->get_int("authnull", "org_id", 0);
+    authnull_tenant_id2 = GloVars.confFile->get_int("authnull", "tenant_id", 0);
+    authnull_api_url2 = GloVars.confFile->get_string("authnull", "api_url", "");
+}
+size_t WriteCallback2(void *contents, size_t size, size_t nmemb, std::string *output) {
+    size_t totalSize = size * nmemb;
+    output->append((char *)contents, totalSize);
+    return totalSize;
+}
 bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned int len) {
 #ifdef DEBUG
     if (dump_pkt) { __dump_pkt(__func__, pkt, len); }
 #endif
-	openlog("AuthSQL", LOG_PID, LOG_DAEMON);
+    openlog("AuthSQL", LOG_PID, LOG_DAEMON);
     bool ret = false;
     auth_plugin_id = AUTH_UNKNOWN_PLUGIN;
 
@@ -2377,38 +2492,302 @@ bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned
     bool bool_rc = false;
     memcpy(&hdr, pkt, sizeof(mysql_hdr));
     pkt += sizeof(mysql_hdr);
-
+    std::string pass;
     bool_rc = PPHR_2(pkt, len, ret, vars1);
     if (bool_rc == false)
         goto __exit_process_pkt_handshake_response;
 
     syslog(LOG_DEBUG, "[DEBUG BEFORE] User: %s", vars1.user ? (char*)vars1.user : "NULL");
-
+	syslog(6, "Thread session ID: %u", (*myds)->sess->thread_session_id);
     if (vars1.user) {
         std::string full_username = std::string(reinterpret_cast<char*>(vars1.user));
         size_t comma_pos = full_username.find(',');
-
+       
+        // Error handling for malformed username
         if (comma_pos == std::string::npos || comma_pos == full_username.length() - 1) {
-            syslog(LOG_ERR, "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.");
+            syslog(LOG_ERR, "[ERROR] Invalid username format for: %s", full_username.c_str());
+            std::cout << "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.\n";
             ret = false;  // Reject authentication
             goto __exit_process_pkt_handshake_response;
         }
-
+       
         // Extract the username and extra data
         std::string clean_user = full_username.substr(0, comma_pos);
         std::string extra_data = full_username.substr(comma_pos + 1);
-
-        // Generate a session ID
-        session_idp = generateSessionIDnew();
-        {
+       
+        std::string username = clean_user;
+        if (clean_user == "admin") {
+            std::cout << "[DEBUG] User '" << clean_user << "' is an admin - Skipping authentication checks." << std::endl;
+            syslog(LOG_INFO, "[INFO] User '%s' is an admin - Skipping authentication checks", clean_user.c_str());
+           
+            // Generate a session ID for admin user too
+            session_idp = generateSessionIDnew();
             session_extra_data_map[clean_user + "_" + session_idp] = extra_data;
+           
+            // Modify the original packet (pkt) directly
+            strncpy(reinterpret_cast<char*>(vars1.user), clean_user.c_str(), clean_user.length());
+            vars1.user[clean_user.length()] = '\0';  // Null-terminate safely
+           
+            std::cout << "[DEBUG] Admin login: " << clean_user
+                      << " Session: " << session_idp
+                      << " Extra data: " << extra_data << std::endl;
+        } else {
+            // Regular user auth path
+            loadAuthNullConfig2();
+            
+            // Check if vars1.db is not null before dereferencing
+            std::string db_name = "default_db";
+            if (vars1.db != nullptr) {
+                db_name = std::string(reinterpret_cast<char*>(vars1.db));
+            }
+            uint32_t thread_session_i = (*myds)->sess->thread_session_id;
+            std::string ip = std::string(reinterpret_cast<char*>((*myds)->addr.addr));
+			std::string user_ip = getPublicIP2();
+            session_idp = generateSessionIDnew();
+            {
+                session_extra_data_map[clean_user + "_" + session_idp] = extra_data;
+            }
+           
+            // Modify the original packet (pkt) directly
+            strncpy(reinterpret_cast<char*>(vars1.user), clean_user.c_str(), clean_user.length());
+            vars1.user[clean_user.length()] = '\0';  // Null-terminate safely
+           
+            std::cout << "[DEBUG] Updated user: " << clean_user
+                      << " Session: " << session_idp
+                      << " Extra data: " << extra_data << std::endl;
+            
+            // API Authentication section with error handling
+            CURL *curl = nullptr;
+            CURLcode res;
+            long http_code = 0;
+            std::string response = "";
+            bool auth_success = false;
+            struct curl_slist *headers = nullptr;
+            
+            try {
+                curl = curl_easy_init();
+                if (!curl) {
+                    syslog(LOG_ERR, "[ERROR] CURL Initialization Failed!");
+                    throw std::runtime_error("CURL init failed");
+                }
+                
+                std::time_t epoch_time = std::time(nullptr);
+                nlohmann::json requestData = {
+                    {"credentialType", "DATABASE"},
+					{"requestId", ""},
+        			{"userIp", user_ip},
+                    {"orgId", authnull_org_id2},
+                    {"tenantId", authnull_tenant_id2},
+                    {"dbUser", clean_user},
+                    {"database_host", ip},
+                    {"hostname", db_name},
+                    {"databaseType", "mysql"},
+                    {"databaseName", db_name},
+                    {"token", extra_data},
+                    {"timestamp", epoch_time}
+                };
+
+                std::string json_payload = requestData.dump();
+                headers = curl_slist_append(headers, "Content-Type: application/json");
+
+                curl_easy_setopt(curl, CURLOPT_URL, authnull_api_url2.c_str());
+                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+                curl_easy_setopt(curl, CURLOPT_POST, 1L);
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload.c_str());
+                curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback2);
+                curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+                curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+                curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+                // Set timeout to prevent hanging - adjusted to allow more response time
+                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L); // 30 seconds total timeout
+                curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L); // 10 seconds connect timeout
+                
+                // Set low speed detection to abort extremely slow transfers
+                // Only abort if getting less than 50 bytes per second for 15 seconds
+                curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 15L);
+                curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 50L);
+                res = curl_easy_perform(curl);
+                if (res != CURLE_OK) {
+                    syslog(LOG_ERR, "[ERROR] CURL request failed: %s", curl_easy_strerror(res));
+                    throw std::runtime_error(std::string("CURL error: ") + curl_easy_strerror(res));
+                }
+                
+                // Get HTTP status code
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+                syslog(LOG_INFO, "HTTP Status Code: %d", http_code);
+                
+                // Check HTTP status code
+                if (http_code != 200) {
+                    syslog(LOG_ERR, "[ERROR] AuthNull API returned non-200 status: %ld", http_code);
+                    throw std::runtime_error("API returned non-200 status code");
+                }
+
+                // Parse JSON response
+                json jsonResponse;
+                try {
+                    jsonResponse = json::parse(response);
+                    syslog(LOG_INFO, "[INFO] Successfully parsed API response");
+                    
+                    // Log full response for debugging
+                    syslog(LOG_DEBUG, "[DEBUG] Full API response: %s", response.c_str());
+                    
+                    // Check for isValid field to validate authentication
+                    if (jsonResponse.contains("isValid")) {
+                        bool isValid = jsonResponse["isValid"].get<bool>();
+                        if (!isValid) {
+                            syslog(LOG_WARNING, "[WARNING] Authentication rejected by API (isValid=false)");
+                            throw std::runtime_error("Authentication rejected by API");
+                        }
+                    }
+                    
+                    syslog(LOG_INFO, "MFA API Response: %s", response.c_str());
+					syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());
+
+					if (http_code >= 200 && http_code < 300) {
+						try {
+							json jsonResponse = json::parse(response);
+							if (jsonResponse.contains("isValid") && jsonResponse["isValid"].get<bool>() == true) {
+								syslog(LOG_INFO, "MFA Verified Successfully!");
+								
+								// Parse and map response data
+								if (jsonResponse.contains("credential") && 
+									jsonResponse["credential"].contains("credentialSubject")) {
+									
+									auto& credential = jsonResponse["credential"]["credentialSubject"];
+
+									std::string mfa_db = credential["databaseName"].get<std::string>();
+									
+									// Extract privileges
+									std::vector<std::string> mfa_privileges;
+									if (credential.contains("privilege") && credential["privilege"].is_array()) {
+										mfa_privileges = credential["privilege"].get<std::vector<std::string>>();
+									}
+									
+									// Extract tables
+									std::vector<std::string> mfa_tables;
+									if (credential.contains("tables") && credential["tables"].is_array()) {
+										mfa_tables = credential["tables"].get<std::vector<std::string>>();
+									}
+									
+									// Update data structures
+									user_database_access[username + "+" + db_name + "+" +std::to_string(thread_session_i)] = {mfa_db};
+									user_database_privileges[username][mfa_db+"+"+std::to_string(thread_session_i)] = mfa_privileges;
+									
+									// Update masking policies
+									std::string key = username + "+" + db_name + "+" +std::to_string(thread_session_i);
+									std::map<std::string, std::vector<std::string>> masking_policy;
+									
+									if (credential.contains("fieldMasking") && credential["fieldMasking"].is_object()) {
+										auto& fieldMasking = credential["fieldMasking"];
+										
+										for (auto& table : mfa_tables) {
+											if (fieldMasking.contains(table)) {
+												masking_policy[table] = fieldMasking[table].get<std::vector<std::string>>();
+											} else {
+												masking_policy[table] = {};
+											}
+										}
+										
+										usertype_masking_policies[key] = masking_policy;
+										session_to_usertype[std::to_string(thread_session_i)] = key;
+
+									}
+									
+									syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s", username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
+								}
+							} else {
+								std::cerr << "MFA Failed! Response: " << jsonResponse.dump(4) << std::endl;
+							}
+						} catch (json::exception &e) {
+							std::cerr << "JSON Parsing Error: " << e.what() << " | Response: " << response << std::endl;
+						}
+					} else {
+						std::cerr << "HTTP Error: Status Code " << http_code << ", Response: " << response << std::endl;
+					}
+                    if (jsonResponse["credential"].contains("credentialSubject") && 
+						jsonResponse["credential"]["credentialSubject"].contains("password")) {
+						
+						std::string password = jsonResponse["credential"]["credentialSubject"]["password"].get<std::string>();
+						syslog(LOG_INFO, "[INFO] Extracted password from API response");
+                        
+                        // Decrypt the credential
+                        try {
+                            pass = DecryptFromGoOpenSSL(password);
+                            if (pass.empty()) {
+                                syslog(LOG_ERR, "[ERROR] Decrypted password is empty");
+                                throw std::runtime_error("Empty decrypted password");
+                            }
+                            auth_success = true;
+                        } catch (const std::exception& e) {
+                            syslog(LOG_ERR, "[ERROR] Failed to decrypt credential: %s", e.what());
+                            throw;
+                        }
+                    } else {
+                        // This matches your example JSON where credential is null
+                        syslog(LOG_ERR, "[ERROR] Credential field is null or missing in API response");
+                        throw std::runtime_error("Credential field is null or missing in API response");
+                    }
+                } catch (const json::parse_error& e) {
+                    syslog(LOG_ERR, "[ERROR] Failed to parse API response as JSON: %s", e.what());
+                    throw;
+                }
+            } catch (const std::exception& e) {
+                syslog(LOG_ERR, "[ERROR] Exception during authentication process: %s", e.what());
+                auth_success = false;
+                ret = false;
+            }
+            
+            // Clean up CURL resources - must happen regardless of success/failure
+            if (headers) {
+                curl_slist_free_all(headers);
+                headers = nullptr;
+            }
+            if (curl) {
+                curl_easy_cleanup(curl);
+                curl = nullptr;
+            }
+            
+            // If authentication failed, exit
+            if (!auth_success) {
+                syslog(LOG_WARNING, "[WARNING] Authentication failed for user '%s'", clean_user.c_str());
+                ret = false;
+                goto __exit_process_pkt_handshake_response;
+            }
+            
+            // If we got here, we have a valid password in 'pass'
+            syslog(LOG_DEBUG, "[DEBUG] Successfully authenticated user: %s", clean_user.c_str());
+            
+            // Scramble the password for MySQL protocol
+            char reply[SHA_DIGEST_LENGTH+1];
+            proxy_scramble(reply, (*myds)->myconn->scramble_buff, pass.c_str());
+            
+            // Replace the client's scrambled password with our newly scrambled credential
+            if (vars1.pass) {
+                free(vars1.pass);
+                vars1.pass = nullptr; // Good practice after freeing
+            }
+            
+            vars1.pass = (unsigned char*)malloc(SHA_DIGEST_LENGTH);
+            if (!vars1.pass) {
+                syslog(LOG_ERR, "[ERROR] Failed to allocate memory for scrambled password");
+                ret = false;
+                goto __exit_process_pkt_handshake_response;
+            }
+            
+            memcpy(vars1.pass, reply, SHA_DIGEST_LENGTH);
+            vars1.pass_len = SHA_DIGEST_LENGTH; 
+            
+            // Debug logging for scrambled password
+            #ifdef DEBUG_PASSWORDS
+            std::ostringstream oss;
+            for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+                oss << std::hex << std::setw(2) << std::setfill('0') << (int)vars1.pass[i];
+            }
+            syslog(LOG_DEBUG, "[DEBUG] Scrambled password (HEX): %s", oss.str().c_str());
+            #endif
+            
+            syslog(LOG_INFO, "[INFO] Updated user: %s Session: %s", clean_user.c_str(), session_idp.c_str());
         }
-
-        // Modify the original packet (pkt) directly
-        strncpy(reinterpret_cast<char*>(vars1.user), clean_user.c_str(), clean_user.length());
-        vars1.user[clean_user.length()] = '\0';  // Null-terminate safely
-
-        syslog(LOG_DEBUG, "[DEBUG] Updated user: %s Session: %s Extra data: %s", clean_user.c_str(), session_idp.c_str(), extra_data.c_str());
     }
 
     if (hdr.pkt_id == 0 && *pkt == 2) {
@@ -2430,7 +2809,6 @@ bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned
     PPHR_3(vars1); // Detect plugin id
     proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s' , auth_plugin_id=%d\n",
                 (*myds), (*myds)->sess, vars1.user, auth_plugin_id);
-
 
 	if (sent_auth_plugin_id == AUTH_MYSQL_NATIVE_PASSWORD) {
 		switch (auth_plugin_id) {
