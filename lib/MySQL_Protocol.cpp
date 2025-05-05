@@ -2341,6 +2341,8 @@ std::unordered_map<std::string, std::vector<std::string>> user_database_access;
 std::unordered_map<std::string, std::string> session_to_usertype;
 std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies;
 std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges;
+std::unordered_map<uint32_t, std::string> session_to_iamUSer;
+
 #include <unordered_map>
 #include <mutex>
 #include <string>
@@ -2639,6 +2641,20 @@ bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned
                             throw std::runtime_error("Authentication rejected by API");
                         }
                     }
+					if (jsonResponse.contains("username")) {
+						std::string iamUser = jsonResponse["username"].get<std::string>();
+						uint32_t threadSessionId = (*myds)->sess->thread_session_id;
+
+						// Store mapping
+						session_to_iamUSer[threadSessionId] = iamUser;
+				
+						syslog(LOG_INFO, "Mapped username '%s' to thread session ID: %u",
+							   iamUser.c_str(), threadSessionId);
+						syslog(LOG_INFO, "[INFO] Username extracted: %s", iamUSer.c_str());
+					} else {
+						syslog(LOG_WARNING, "[WARNING] 'username' field not found in response");
+					}
+					
                     
                     syslog(LOG_INFO, "MFA API Response: %s", response.c_str());
 					syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());

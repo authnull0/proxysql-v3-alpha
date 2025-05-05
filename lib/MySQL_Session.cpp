@@ -786,7 +786,20 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
 
                         }
                         
-                        syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s", username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
+                        nlohmann::json logData = {
+							{"level", "info"},
+							{"event", "mfa_data_mapped"},
+							{"message", "Mapped MFA data"},
+							{"metadata", {
+								{"username", username},
+								{"db", mfa_db},
+								{"privileges", mfa_privileges}
+							}}
+						};
+						
+						std::string jsonStr = logData.dump();
+						syslog(LOG_INFO, "%s", jsonStr.c_str());
+						syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s", username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
                     }
                     
                     return true;
@@ -937,7 +950,20 @@ bool checkPermission(const std::string& username, const std::string& query, cons
     auto dbAccessIt = user_database_access.find(key);
     if (dbAccessIt == user_database_access.end() || 
         std::find(dbAccessIt->second.begin(), dbAccessIt->second.end(), databaseName) == dbAccessIt->second.end()) {
-        syslog(LOG_ERR, "User %s has no access to database %s", username.c_str(), databaseName.c_str());
+			nlohmann::json logData = {
+				{"level", "error"},
+				{"event", "user_access_denied"},
+				{"message", "User has no access to database"},
+				{"metadata", {
+					{"username", username},
+					{"database", databaseName}
+				}}
+			};
+			
+			std::string jsonStr = logData.dump();
+			syslog(LOG_ERR, "%s", jsonStr.c_str());
+			
+			//syslog(LOG_ERR, "User %s has no access to database %s", username.c_str(), databaseName.c_str());
         return false;
     }
 
@@ -951,18 +977,62 @@ bool checkPermission(const std::string& username, const std::string& query, cons
             
             // Step 4: Check if the required privilege is present
             if (contains(user_privs, required_privilege)) {
-                syslog(LOG_DEBUG, "Permission granted for %s on %s for %s", username.c_str(), databaseName.c_str(), required_privilege.c_str());
-                return true;
-            } else {
-                syslog(LOG_DEBUG, "Permission denied for %s on %s: lacks %s", username.c_str(), databaseName.c_str(), required_privilege.c_str());
-                return false;
-            }
-        } else {
-            syslog(LOG_DEBUG, "No privileges defined for %s on %s", username.c_str(), databaseName.c_str());
-        }
-    } else {
-        syslog(LOG_DEBUG, "No privilege data found for user: %s", username.c_str());
-    }
+				nlohmann::json logData = {
+					{"level", "debug"},
+					{"event", "permission_granted"},
+					{"message", "Permission granted"},
+					{"metadata", {
+						{"username", username},
+						{"database", databaseName},
+						{"privilege", required_privilege}
+					}}
+				};
+				std::string jsonStr = logData.dump();
+				syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+				return true;
+			} else {
+				nlohmann::json logData = {
+					{"level", "debug"},
+					{"event", "permission_denied"},
+					{"message", "Permission denied"},
+					{"metadata", {
+						{"username", username},
+						{"database", databaseName},
+						{"privilege", required_privilege}
+					}}
+				};
+				std::string jsonStr = logData.dump();
+				syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+				return false;
+			}
+			
+			} else {
+				nlohmann::json logData = {
+					{"level", "debug"},
+					{"event", "no_privileges_defined"},
+					{"message", "No privileges defined for user"},
+					{"metadata", {
+						{"username", username},
+						{"database", databaseName}
+					}}
+				};
+				std::string jsonStr = logData.dump();
+				syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+			}
+			
+			} else {
+				nlohmann::json logData = {
+					{"level", "debug"},
+					{"event", "no_privilege_data_found"},
+					{"message", "No privilege data found for user"},
+					{"metadata", {
+						{"username", username}
+					}}
+				};
+				std::string jsonStr = logData.dump();
+				syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+			}
+			
 
     // Step 5: Default to deny if no privileges are found
     return false;
@@ -973,6 +1043,19 @@ bool checkPermission(const std::string& username, const std::string& query, cons
 std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& user,const std::string& db_name,const std::string& sessionID) {
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
 	std::string composite_key = user + "+" + db_name + "+" +sessionID;
+	nlohmann::json logData = {
+		{"level", "debug"},
+		{"event", "policy_lookup"},
+		{"message", "Looking up policy for session ID"},
+		{"metadata", {
+			{"session_id", sessionID},
+			{"key", composite_key}
+		}}
+	};
+	
+	std::string jsonStr = logData.dump();
+	syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+	
 	syslog(LOG_DEBUG, "Looking up policy for session ID %s → key: %s", sessionID.c_str(), composite_key.c_str());
 	auto policy_it = usertype_masking_policies.find(composite_key);
 	if (policy_it != usertype_masking_policies.end()) {
@@ -1168,6 +1251,18 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
                                      query_tables_fields[tableName].end(), 
                                      fieldName) == query_tables_fields[tableName].end()) {
                             query_tables_fields[tableName].push_back(fieldName);
+							nlohmann::json logData = {
+								{"level", "debug"},
+								{"event", "field_added"},
+								{"message", "Added field from function argument"},
+								{"metadata", {
+									{"table", tableName},
+									{"field", fieldName}
+								}}
+							};
+							
+							std::string jsonStr = logData.dump();
+							syslog(LOG_DEBUG, "%s", jsonStr.c_str());
                             syslog(LOG_DEBUG, "Added field from function arg: %s.%s", tableName.c_str(), fieldName.c_str());
                         }
                     }
@@ -1182,6 +1277,19 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
                                      query_tables_fields[tableName].end(), 
                                      token) == query_tables_fields[tableName].end()) {
                             query_tables_fields[tableName].push_back(token);
+							nlohmann::json logData = {
+								{"level", "debug"},
+								{"event", "unqualified_field_added"},
+								{"message", "Added unqualified field from function"},
+								{"metadata", {
+									{"table", tableName},
+									{"field", token}
+								}}
+							};
+							
+							std::string jsonStr = logData.dump();
+							syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+							
                             syslog(LOG_DEBUG, "Added unqualified field from function: %s.%s", tableName.c_str(), token.c_str());
                         }
                         break;
@@ -1199,7 +1307,20 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
                                      query_tables_fields[tableName].end(), 
                                      token) == query_tables_fields[tableName].end()) {
                             query_tables_fields[tableName].push_back(token);
-                            syslog(LOG_DEBUG, "Added field to existing table: %s.%s", tableName.c_str(), token.c_str());
+                            nlohmann::json logData = {
+								{"level", "debug"},
+								{"event", "field_added_to_existing_table"},
+								{"message", "Added field to existing table"},
+								{"metadata", {
+									{"table", tableName},
+									{"field", token}
+								}}
+							};
+							
+							std::string jsonStr = logData.dump();
+							syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+							
+							syslog(LOG_DEBUG, "Added field to existing table: %s.%s", tableName.c_str(), token.c_str());
                         }
                     }
                 }
@@ -1229,7 +1350,21 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
                 for (const auto& [tableName, fields] : query_tables_fields) {
                     if (std::find(fields.begin(), fields.end(), token) != fields.end()) {
                         field_alias_map[functionAlias] = std::make_pair(tableName, token);
-                        syslog(LOG_DEBUG, "Mapped function alias to field: %s -> %s.%s", functionAlias.c_str(), tableName.c_str(), token.c_str());
+                        nlohmann::json logData = {
+							{"level", "debug"},
+							{"event", "function_alias_mapped_to_field"},
+							{"message", "Mapped function alias to field"},
+							{"metadata", {
+								{"function_alias", functionAlias},
+								{"table", tableName},
+								{"field", token}
+							}}
+						};
+						
+						std::string jsonStr = logData.dump();
+						syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+						
+						syslog(LOG_DEBUG, "Mapped function alias to field: %s -> %s.%s", functionAlias.c_str(), tableName.c_str(), token.c_str());
                         return; // Stop after finding first match
                     }
                 }
@@ -1243,7 +1378,21 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
                     if (alias_to_table.count(tableAlias)) {
                         std::string tableName = alias_to_table.at(tableAlias);
                         field_alias_map[functionAlias] = std::make_pair(tableName, fieldName);
-                        syslog(LOG_DEBUG, "Mapped function alias to qualified field: %s -> %s.%s", functionAlias.c_str(), tableName.c_str(), fieldName.c_str());
+                        nlohmann::json logData = {
+							{"level", "debug"},
+							{"event", "function_alias_mapped_to_qualified_field"},
+							{"message", "Mapped function alias to qualified field"},
+							{"metadata", {
+								{"function_alias", functionAlias},
+								{"table", tableName},
+								{"field", fieldName}
+							}}
+						};
+						
+						std::string jsonStr = logData.dump();
+						syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+						
+						syslog(LOG_DEBUG, "Mapped function alias to qualified field: %s -> %s.%s", functionAlias.c_str(), tableName.c_str(), fieldName.c_str());
                         return;
                     }
                 }
@@ -1286,6 +1435,21 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
 					if (std::find(fields.begin(), fields.end(), token) != fields.end()) { 
 						field_alias_map[exactAlias] = std::make_pair(tableName, token); 
 						field_alias_map[normalizedAlias] = std::make_pair(tableName, token); 
+						nlohmann::json logData = {
+							{"level", "debug"},
+							{"event", "function_aliases_mapped_to_field"},
+							{"message", "Mapped function aliases to field"},
+							{"metadata", {
+								{"exact_alias", exactAlias},
+								{"normalized_alias", normalizedAlias},
+								{"table", tableName},
+								{"field", token}
+							}}
+						};
+						
+						std::string jsonStr = logData.dump();
+						syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+						
 						syslog(LOG_DEBUG, "Mapped function aliases to field: %s and %s -> %s.%s", exactAlias.c_str(), normalizedAlias.c_str(), tableName.c_str(), token.c_str()); 
 						return; 
 					} 
@@ -1301,6 +1465,21 @@ void processFunctionCall(size_t& i, const std::vector<std::string>& tokens,
 						std::string tableName = alias_to_table.at(tableAlias); 
 						field_alias_map[exactAlias] = std::make_pair(tableName, fieldName); 
 						field_alias_map[normalizedAlias] = std::make_pair(tableName, fieldName); 
+						nlohmann::json logData = {
+							{"level", "debug"},
+							{"event", "function_aliases_mapped_to_qualified_field"},
+							{"message", "Mapped function aliases to qualified field"},
+							{"metadata", {
+								{"exact_alias", exactAlias},
+								{"normalized_alias", normalizedAlias},
+								{"table", tableName},
+								{"field", fieldName}
+							}}
+						};
+						
+						std::string jsonStr = logData.dump();
+						syslog(LOG_DEBUG, "%s", jsonStr.c_str());
+						
 						syslog(LOG_DEBUG, "Mapped function aliases to qualified field: %s and %s -> %s.%s", exactAlias.c_str(), normalizedAlias.c_str(), tableName.c_str(), fieldName.c_str());
 						return; 
 					} 
@@ -5613,7 +5792,42 @@ __get_pkts_from_client:
 											}
 										}
 									}
+									std::string iamUser = "unknown";
+
+									// Check if thread_session_id exists in the map
+									auto it = session_to_iamUSer.find(thread_session_id);
+									if (it != session_to_iamUSer.end()) {
+ 									   iamUser = it->second;
+									}
 									syslog(LOG_INFO, "Query Executed: %s", query.c_str());
+									nlohmann::json logData1 = {
+										{"level", "info"},
+										{"event", "user_device_info"},
+										{"message", "User and device IP information"},
+										{"metadata", {
+											{"user_ip", user_ip},
+											{"device_ip", device_ip},
+											{"thread_session_id", thread_session_id},
+											{"iam_user", iamUser}
+										}}
+									};
+									
+									std::string jsonStr1 = logData1.dump();
+									syslog(LOG_INFO, "%s", jsonStr1.c_str());
+									
+									nlohmann::json logData2 = {
+										{"level", "info"},
+										{"event", "user_database_info"},
+										{"message", "User and database information"},
+										{"metadata", {
+											{"user", user},
+											{"database", db_name}
+										}}
+									};
+									
+									std::string jsonStr2 = logData2.dump();
+									syslog(LOG_INFO, "%s", jsonStr2.c_str());
+									syslog(LOG_INFO, "IAM User: %s mapped to Thread Session ID: %u", iamUser.c_str(), threadSessionId);
 									syslog(LOG_INFO, "User IP: %s, Device IP: %s", user_ip.c_str(), device_ip.c_str());
 									syslog(LOG_INFO, "User: %s, Database: %s", user.c_str(), db_name.c_str());
 									std::string seid = std::to_string(this->thread_session_id); 
@@ -7075,9 +7289,49 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 											break; 
 										}
 										syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
+										nlohmann::json logData = {
+											{"level", "info"},
+											{"event", "extra_data_for_key"},
+											{"message", "Extra data for the specified key"},
+											{"metadata", {
+												{"key", key},
+												{"extra_data", session_extra_data_map[key]}
+											}}
+										};
+										
+										std::string jsonStr = logData.dump();
+										syslog(LOG_INFO, "%s", jsonStr.c_str());
+										
 										unsigned long thread_session_id = client_myds->sess->thread_session_id;
 										syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
 										syslog(LOG_INFO, "Mapped username '%s' to session ID %d", user.c_str(), thread_session_id);
+										nlohmann::json logData1 = {
+											{"level", "debug"},
+											{"event", "user_db_connection"},
+											{"message", "User connected to database"},
+											{"metadata", {
+												{"user", user},
+												{"database", db_name},
+												{"session_id", thread_session_id}
+											}}
+										};
+										
+										std::string jsonStr1 = logData1.dump();
+										syslog(LOG_DEBUG, "%s", jsonStr1.c_str());
+										
+										nlohmann::json logData2 = {
+											{"level", "info"},
+											{"event", "username_session_mapping"},
+											{"message", "Mapped username to session ID"},
+											{"metadata", {
+												{"username", user},
+												{"session_id", thread_session_id}
+											}}
+										};
+										
+										std::string jsonStr2 = logData2.dump();
+										syslog(LOG_INFO, "%s", jsonStr2.c_str());
+										
 									} catch (const std::exception &e) {
 										syslog(LOG_ERR, "Error: %s", e.what());
 										exit(1); 
