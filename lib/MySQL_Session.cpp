@@ -5795,8 +5795,8 @@ __get_pkts_from_client:
 									std::string iamUser = "unknown";
 
 									// Check if thread_session_id exists in the map
-									auto it = session_to_iamUSer.find(thread_session_id);
-									if (it != session_to_iamUSer.end()) {
+									auto it = session_to_iamUser.find(thread_session_id);
+									if (it != session_to_iamUser.end()) {
  									   iamUser = it->second;
 									}
 									syslog(LOG_INFO, "Query Executed: %s", query.c_str());
