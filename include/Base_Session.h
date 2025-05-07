@@ -49,6 +49,8 @@ class Base_Session {
 	//this pointer is always initialized inside handler().
 	// it is an attempt to start simplifying the complexing of handler()
 	uint32_t thread_session_id;
+	int authnull_org_id2;
+	int authnull_tenant_id2;
 	unsigned long long last_insert_id;
 	int last_HG_affected_rows;
 	enum session_status status;

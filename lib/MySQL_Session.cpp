@@ -5799,18 +5799,30 @@ __get_pkts_from_client:
 									if (it != session_to_iamUser.end()) {
  									   iamUser = it->second;
 									}
+								    loadAuthNullConfig();
+									int org_id_value = authnull_org_id;
+									int tenant_id_value = authnull_tenant_id;
 									syslog(LOG_INFO, "Query Executed: %s", query.c_str());
-									nlohmann::json logData1 = {
+									nlohmann::json queryLog = {
 										{"level", "info"},
-										{"event", "user_device_info"},
-										{"message", "User and device IP information"},
+										{"event", "query_executed"},
+										{"message", "Query Executed"},
 										{"metadata", {
+											{"query", query},
 											{"user_ip", user_ip},
 											{"device_ip", device_ip},
 											{"thread_session_id", thread_session_id},
-											{"iam_user", iamUser}
+											{"iam_user", iamUser},
+											{"orgId", org_id_value},
+											{"tenantId", tenant_id_value}
 										}}
 									};
+								
+									// Log the query execution as a JSON string to syslog
+									syslog(LOG_INFO, "%s", queryLog.dump().c_str());
+								
+									// Optionally, print to console for verification
+									std::cout << queryLog.dump(4) << std::endl;
 									
 									std::string jsonStr1 = logData1.dump();
 									syslog(LOG_INFO, "%s", jsonStr1.c_str());
