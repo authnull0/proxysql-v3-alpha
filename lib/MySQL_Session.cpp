@@ -5824,7 +5824,7 @@ __get_pkts_from_client:
 									// Optionally, print to console for verification
 									std::cout << queryLog.dump(4) << std::endl;
 									
-									std::string jsonStr1 = logData1.dump();
+									std::string jsonStr1 = queryLog.dump();
 									syslog(LOG_INFO, "%s", jsonStr1.c_str());
 									
 									nlohmann::json logData2 = {
@@ -5832,7 +5832,7 @@ __get_pkts_from_client:
 										{"event", "user_database_info"},
 										{"message", "User and database information"},
 										{"metadata", {
-											{"user", user},
+											{"db_user", user},
 											{"database", db_name}
 										}}
 									};
