@@ -5802,6 +5802,7 @@ __get_pkts_from_client:
 								    loadAuthNullConfig();
 									int org_id_value = authnull_org_id;
 									int tenant_id_value = authnull_tenant_id;
+									std::string requestId = "";
 									syslog(LOG_INFO, "Query Executed: %s", query.c_str());
 									nlohmann::json queryLog = {
 										{"level", "info"},
@@ -5814,7 +5815,8 @@ __get_pkts_from_client:
 											{"thread_session_id", thread_session_id},
 											{"iam_user", iamUser},
 											{"orgId", org_id_value},
-											{"tenantId", tenant_id_value}
+											{"tenantId", tenant_id_value},
+											{"request_id",requestId}
 										}}
 									};
 								
@@ -5839,13 +5841,6 @@ __get_pkts_from_client:
 									
 									std::string jsonStr2 = logData2.dump();
 									syslog(LOG_INFO, "%s", jsonStr2.c_str());
-									nlohmann::json combinedLog = {
-										{"query_execution", queryLog},
-										{"user_database_info", logData2}
-									};
-									
-									// Log to syslog
-									syslog(LOG_INFO, "%s", combinedLog.dump().c_str());
 									
 									// Optionally print to console
 									std::cout << combinedLog.dump(4) << std::endl;
