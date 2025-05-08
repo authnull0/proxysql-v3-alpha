@@ -5841,9 +5841,7 @@ __get_pkts_from_client:
 									
 									std::string jsonStr2 = logData2.dump();
 									syslog(LOG_INFO, "%s", jsonStr2.c_str());
-									
-									// Optionally print to console
-									std::cout << combinedLog.dump(4) << std::endl;
+						
 									syslog(LOG_INFO, "IAM User: %s mapped to Thread Session ID: %u", iamUser.c_str(), thread_session_id);
 									syslog(LOG_INFO, "User IP: %s, Device IP: %s", user_ip.c_str(), device_ip.c_str());
 									syslog(LOG_INFO, "User: %s, Database: %s", user.c_str(), db_name.c_str());
