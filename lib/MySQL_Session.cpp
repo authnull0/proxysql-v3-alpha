@@ -5816,7 +5816,9 @@ __get_pkts_from_client:
 											{"iam_user", iamUser},
 											{"orgId", org_id_value},
 											{"tenantId", tenant_id_value},
-											{"request_id",requestId}
+											{"request_id",requestId},
+											{"db_user", user},
+											{"database", db_name}
 										}}
 									};
 								
