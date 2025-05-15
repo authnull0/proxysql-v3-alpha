@@ -8,6 +8,7 @@ using json = nlohmann::json;
 #define PROXYJSON
 #include "PgSQL_HostGroups_Manager.h"
 #include "proxysql.h"
+#include <syslog.h>
 #include "cpp.h"
 #include "MySQL_PreparedStatement.h"
 #include "PgSQL_Data_Stream.h"
@@ -794,6 +795,8 @@ void PgSQL_Connection_Placeholder::set_is_client() {
 void PgSQL_Connection_Placeholder::process_rows_in_ASYNC_STMT_EXECUTE_STORE_RESULT_CONT(unsigned long long& processed_bytes) {
 	PROXY_TRACE2();
 	// there is more than 1 row
+	openlog("AuthSQL", LOG_PID, LOG_DAEMON);
+	syslog(LOG_DEBUG, "[DEBUG] 1111111111111");
 	unsigned long long total_size=0;
 	long long unsigned int irs = 0;
 	MYSQL_ROWS *ir = query.stmt->result.data;
@@ -1774,6 +1777,21 @@ handler_again:
 
 		if (result_type == 1) {
 			std::unique_ptr<PGresult, decltype(&PQclear)> result(get_result(), PQclear);
+			if (result) {
+				int rows = PQntuples(result.get());
+				int cols = PQnfields(result.get());
+
+				std::cout << "Rows: " << rows << ", Columns: " << cols << std::endl;
+
+				for (int i = 0; i < rows; ++i) {
+					for (int j = 0; j < cols; ++j) {
+						std::cout << PQgetvalue(result.get(), i, j) << "\t";
+					}
+					std::cout << std::endl;
+				}
+			} else {
+				std::cout << "No result or query failed." << std::endl;
+			}
 
 			if (result) {
 

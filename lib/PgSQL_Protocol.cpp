@@ -5,6 +5,7 @@
 #include "PgSQL_Authentication.h"
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_Protocol.h"
+#include <syslog.h>
 extern "C" {
 #include "usual/time.h"
 }
@@ -293,68 +294,57 @@ void SQLite3_to_Postgres(PtrSizeArray *psa, SQLite3_result *result, char *error,
 		pkt.to_PtrSizeArray(psa);
 	}
 }
+// PgSQL_Protocol.cpp
+
+// PgSQL_Protocol.cpp
+
+#include <syslog.h>
+#include <stdarg.h>
+#include <algorithm>
+#include <string.h>
+
 void PG_pkt::write_DataRow(const char *tupdesc, ...) {
-	int ncol = strlen(tupdesc);
-	va_list ap;
+    if (ptr == NULL)
+        return;
 
-	start_packet('D');
-	put_uint16(ncol);
+    va_list argList;
+    va_start(argList, tupdesc);
 
-	va_start(ap, tupdesc);
-	for (int i = 0; i < ncol; i++) {
-		char tmp[128];
-		char *tmp2 = NULL;
-		const char *val = NULL;
+    unsigned short ncol = 0;
+    if (tupdesc) {
+        ncol = strlen(tupdesc);
+    }
 
-		if (tupdesc[i] == 'i') {
-			snprintf(tmp, sizeof(tmp), "%d", va_arg(ap, int));
-			val = tmp;
-		} else if (tupdesc[i] == 'q' || tupdesc[i] == 'N') {
-			snprintf(tmp, sizeof(tmp), "%" PRIu64, va_arg(ap, uint64_t));
-			val = tmp;
-		} else if (tupdesc[i] == 's') {
-			val = va_arg(ap, char *);
-		} else if (tupdesc[i] == 'b') {
-			int blen = va_arg(ap, int);
-			if (blen >= 0) {
-				uint8_t *bval = va_arg(ap, uint8_t *);
-				size_t required = 2 + blen * 2 + 1;
-				tmp2 = (char *)malloc(required);
-				strcpy(tmp2, "\\x");
-				for (int j = 0; j < blen; j++)
-					sprintf(tmp2 + (2 + j * 2), "%02x", bval[j]);
-				val = tmp2;
-			} else {
-				(void) va_arg(ap, uint8_t *);
-				val = NULL;
-			}
-		} else if (tupdesc[i] == 'T') {
-			usec_t time = va_arg(ap, usec_t);
-			val = format_time_s(time, tmp, sizeof(tmp));
-		} else {
-			fprintf(stderr, "bad tupdesc: %s", tupdesc);
-			assert(0);
-		}
+    put_char('D');
+    put_uint32(0); // Placeholder for length
 
-		if (val) {
-			int len = strlen(val);
-			put_uint32(len);
-			put_bytes(val, len);
-			if (tmp2 != NULL) {
-				free(tmp2);
-				tmp2 = NULL;
-			}
-		} else {
-			/* NULL */
-			put_uint32(-1);
-		}
-	}
-	va_end(ap);
+    put_uint16(ncol);
 
-	/* set correct length */
-	finish_packet();
+    for (int i = 0; i < ncol; i++) {
+        const char *val = va_arg(argList, const char *);
+        int len = 0;
+        if (val) {
+            len = strlen(val);
+            syslog(LOG_INFO, "PG_pkt::write_DataRow: Field %d, len=%d, data='%.*s'",
+                   i, len, std::min(16, len), val);
+            put_uint32(len);
+            put_bytes(val, len);
+        } else {
+            syslog(LOG_INFO, "PG_pkt::write_DataRow: Field %d is NULL", i);
+            put_uint32(-1);
+        }
+    }
+
+    va_end(argList);
+
+    // Go back and fill in the correct length
+    unsigned int current_pos = this->size; // Use 'size' instead of 'pos'
+    this->size = 1;
+    put_uint32(current_pos - 1);
+    this->size = current_pos;
+
+    syslog(LOG_INFO, "PG_pkt::write_DataRow: Finished packet, size=%u", size);
 }
-
 PtrSize_t * PG_pkt::get_PtrSize(unsigned c) {
 	PtrSize_t * pkt = (PtrSize_t *)malloc(sizeof(PtrSize_t));
 	pkt->ptr = ptr;
@@ -366,15 +356,17 @@ PtrSize_t * PG_pkt::get_PtrSize(unsigned c) {
 }
 
 void PG_pkt::to_PtrSizeArray(PtrSizeArray *psa, unsigned c) {
-	psa->add(ptr, size);
-	size = 0;
-	if (c != 0) {
-		capacity = l_near_pow_2(c);
-		ptr = (char *)malloc(capacity);
-	} else {
-		capacity = 0;
-		ptr = NULL;
-	}
+    psa->add(ptr, size);
+    syslog(LOG_INFO, "PG_pkt::to_PtrSizeArray: Added packet to psa. size=%u, ptr=%p, psa->len=%u", 
+           size, ptr, psa->len);  // CRITICAL LOGGING
+    size = 0;
+    if (c != 0) {
+        capacity = l_near_pow_2(c);
+        ptr = (char *)malloc(capacity);
+    } else {
+        capacity = 0;
+        ptr = NULL;
+    }
 }
 
 bool PgSQL_Protocol::generate_pkt_initial_handshake(bool send, void** _ptr, unsigned int* len, uint32_t* _thread_id, bool deprecate_eof_active) {
@@ -712,12 +704,174 @@ char* extract_password(const pgsql_hdr* hdr, uint32_t* len) {
 	if (len) *len = pass_len;
 	return pass;
 }
+#include <unordered_map>
+#include <mutex>
+#include <string>
+#include <random>
+#include <iostream>
+#include <sstream>
+#include <iomanip>
+#include <openssl/aes.h>
+#include <openssl/rand.h>
+#include <openssl/evp.h>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+
+// Global data structures for user access control and session management
+std::unordered_map<std::string, std::vector<std::string>> user_database_access2;
+std::unordered_map<std::string, std::string> session_to_usertype2;
+std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies2;
+std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges2;
+std::unordered_map<std::string, std::string> session_extra_data_map2;
+
+// Fixed key for AES-256 - MUST match the Go key exactly
+const std::string KEY_STRING2 = "84sF#v7Fpt!L#PesYb^AezXrUn2kE%5v";
+const int KEY_SIZE_BYTES2 = 32; // AES-256 key size
+const int BLOCK_SIZE_BYTES2 = 16; // AES block size
+
+// AuthNull configuration variables
+int authnull_org_id2;
+int authnull_tenant_id2;
+std::string authnull_api_url2;
+
+/**
+ * @brief Generate a unique session ID
+ * @return Random session ID as string
+ */
+std::string generateSessionID2() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dist(100000, 999999);
+    return std::to_string(dist(gen));
+}
+
+/**
+ * @brief Get public IP address of the server
+ * @return IP address as string
+ */
+std::string getPublicIP3() {
+    CURL *curl;
+    CURLcode res;
+    std::string readBuffer;
+
+    curl = curl_easy_init();
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.ipify.org");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, 
+            +[](void *ptr, size_t size, size_t nmemb, std::string *data) -> size_t {
+                data->append((char *)ptr, size * nmemb);
+                return size * nmemb;
+            });
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+        res = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+    }
+    return readBuffer;
+}
+
+/**
+ * @brief Helper function to convert byte array to hex string
+ */
+std::string bytes_to_hex2(const unsigned char* bytes, int len) {
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (int i = 0; i < len; ++i) {
+        ss << std::setw(2) << static_cast<int>(bytes[i]);
+    }
+    return ss.str();
+}
+
+/**
+ * @brief Helper function to convert hex string to byte vector
+ */
+std::vector<unsigned char> hex_to_bytes2(const std::string& hex) {
+    std::vector<unsigned char> bytes;
+    for (size_t i = 0; i < hex.length(); i += 2) {
+        std::string byteString = hex.substr(i, 2);
+        unsigned char byte = (unsigned char)stoi(byteString, nullptr, 16);
+        bytes.push_back(byte);
+    }
+    return bytes;
+}
+
+/**
+ * @brief Decrypt data from Go OpenSSL
+ */
+std::string DecryptFromGoOpenSSL2(const std::string &encryptedHex) {
+    std::vector<unsigned char> ciphertext_with_iv = hex_to_bytes2(encryptedHex);
+    if (ciphertext_with_iv.size() < BLOCK_SIZE_BYTES2) {
+        std::cerr << "Error: Ciphertext too short!" << std::endl;
+        return "";
+    }
+
+    std::vector<unsigned char> iv(ciphertext_with_iv.begin(), ciphertext_with_iv.begin() + BLOCK_SIZE_BYTES2);
+    std::vector<unsigned char> ciphertext(ciphertext_with_iv.begin() + BLOCK_SIZE_BYTES2, ciphertext_with_iv.end());
+    std::vector<unsigned char> decrypted_text(ciphertext.size());
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        throw std::runtime_error("EVP_CIPHER_CTX_new failed");
+    }
+
+    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cfb(), nullptr, (const unsigned char*)KEY_STRING2.data(), iv.data())) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("EVP_DecryptInit_ex failed");
+    }
+
+    int len;
+    if (1 != EVP_DecryptUpdate(ctx, decrypted_text.data(), &len, ciphertext.data(), ciphertext.size())) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("EVP_DecryptUpdate failed");
+    }
+    int decrypted_len = len;
+
+    if (1 != EVP_DecryptFinal_ex(ctx, decrypted_text.data() + len, &len)) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("EVP_DecryptFinal_ex failed");
+    }
+    decrypted_len += len;
+
+    EVP_CIPHER_CTX_free(ctx);
+
+    return std::string(decrypted_text.begin(), decrypted_text.begin() + decrypted_len);
+}
+
+/**
+ * @brief Load AuthNull configuration from config file
+ */
+const char* get_auth_method_string(AUTHENTICATION_METHOD method) {
+    switch (method) {
+        case AUTHENTICATION_METHOD::NO_PASSWORD: return "NO_PASSWORD";
+        case AUTHENTICATION_METHOD::CLEAR_TEXT_PASSWORD: return "CLEAR_TEXT_PASSWORD";
+        case AUTHENTICATION_METHOD::MD5_PASSWORD: return "MD5_PASSWORD";
+        case AUTHENTICATION_METHOD::SASL_SCRAM_SHA_256: return "SASL_SCRAM_SHA_256";
+        case AUTHENTICATION_METHOD::SASL_SCRAM_SHA_256_PLUS: return "SASL_SCRAM_SHA_256_PLUS";
+        default: return "UNKNOWN_METHOD";
+    }
+}
+
+void loadAuthNullConfig2() {
+    authnull_org_id2 = GloVars.confFile->get_int("authnull", "org_id", 0);
+    authnull_tenant_id2 = GloVars.confFile->get_int("authnull", "tenant_id", 0);
+    authnull_api_url2 = GloVars.confFile->get_string("authnull", "api_url", "");
+}
+
+/**
+ * @brief cURL write callback
+ */
+size_t WriteCallback2(void *contents, size_t size, size_t nmemb, std::string *output) {
+    size_t totalSize = size * nmemb;
+    output->append((char *)contents, totalSize);
+    return totalSize;
+}
 
 EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char* pkt, unsigned int len) {
 #ifdef DEBUG
 	//if (dump_pkt) { __dump_pkt(__func__, pkt, len); }
 #endif
-
+	openlog("AuthSQL", LOG_PID, LOG_DAEMON);
 	char* user = NULL;
 	char* pass = NULL;
 
@@ -746,13 +900,37 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 	}
 
 	user = (char*)(*myds)->myconn->conn_params.get_value(PG_USER);
+    std::string full_username;
+    size_t comma_pos;
+    std::string clean_user;
+	std::string pass2;
+    std::string extra_data;
+    std::string session_idp;
+	std::string username;
+	uint32_t thread_session_i;
 
-	if (!user || *user == '\0') {
-		proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. Client password pkt before startup packet.\n", (*myds), (*myds)->sess, user);
-		generate_error_packet(true, false, "client password pkt before startup packet", PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION, true);
+    if (!user || *user == '\0') {
+        proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. Client password pkt before startup packet.\n", (*myds), (*myds)->sess, user);
+        generate_error_packet(true, false, "client password pkt before startup packet", PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION, true);
+        goto __exit_process_pkt_handshake_response;
+    }
+
+    full_username = std::string(user);
+    comma_pos = full_username.find(',');
+	if (comma_pos == std::string::npos || comma_pos == full_username.length() - 1) {
+		syslog(LOG_ERR, "[ERROR] Invalid username format for: %s", full_username.c_str());
+		std::cout << "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.\n";
+		ret = EXECUTION_STATE::FAILED;
 		goto __exit_process_pkt_handshake_response;
 	}
-
+    clean_user = full_username.substr(0, comma_pos);
+    extra_data = full_username.substr(comma_pos + 1);
+    
+    username = clean_user;
+    thread_session_i = (*myds)->sess->thread_session_id;
+	session_extra_data_map[clean_user + "_" + std::to_string(thread_session_i)] = extra_data;
+	strncpy(user, clean_user.c_str(), clean_user.length());
+	user[clean_user.length()] = '\0'; 
 	password = GloPgAuth->lookup((char*)user, USERNAME_FRONTEND, &_ret_use_ssl, &default_hostgroup, &transaction_persistent, &fast_forward, &max_connections, &sha1_pass, &attributes);
 
 	if (password) {
@@ -797,6 +975,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 	}
 
 	if (password) {
+		syslog(LOG_INFO, "PostgreSQL Auth Method: %s", get_auth_method_string((*myds)->auth_method));
 		proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s' , auth_method=%s\n", (*myds), (*myds)->sess, user, AUTHENTICATION_METHOD_STR[(int)(*myds)->auth_method]);
 		switch ((*myds)->auth_method) {
 		case AUTHENTICATION_METHOD::MD5_PASSWORD:
@@ -804,7 +983,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 			uint32_t pass_len = 0;
 			pass = extract_password(&hdr, &pass_len);
 			using_password = (pass_len > 0);
-
+			
 			if (pass_len) {
 				if (pass[pass_len - 1] == 0) {
 					pass_len--; // remove the extra 0 if present
@@ -839,6 +1018,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 			}
 
 			if (strlen(md5_string) == pass_len && strcmp(md5_string, pass) == 0) {
+				syslog(LOG_DEBUG, "Row Data: Processing 1");
 				ret = EXECUTION_STATE::SUCCESSFUL;
 			}
 		}
@@ -854,8 +1034,206 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 				generate_error_packet(true, false, "empty password returned by client", PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION, true);
 				break;
 			}
+			if (user) {
+				if (clean_user == "admin") {
+					// Admin user follows normal authentication flow
+				} else {
+					loadAuthNullConfig2();
+					std::string db_name = "default_db";
+					const char* db = (*myds)->myconn->conn_params.get_value(PG_DATABASE);
+					if (db != nullptr) {
+						db_name = std::string(db);
+					}
+					uint32_t thread_session_i = (*myds)->sess->thread_session_id;
+					std::string ip = std::string(reinterpret_cast<char*>((*myds)->addr.addr));
+					std::string user_ip = getPublicIP3();
+					std::string key = clean_user + "_" + std::to_string(thread_session_i);
+					
+					// Retrieve the stored extra data
+					std::string extra_data;
+					auto it = session_extra_data_map.find(key);
+					if (it != session_extra_data_map.end()) {
+						extra_data = it->second;
+						syslog(LOG_INFO, "Found extra data for key %s", key.c_str());
+					} else {
+						syslog(LOG_WARNING, "Key %s not found in session_extra_data_map", key.c_str());
+					}
+					
+					CURL* curl = nullptr;
+					CURLcode res;
+					long http_code = 0;
+					std::string response = "";
+					struct curl_slist* headers = nullptr;
+
+					try {
+						curl = curl_easy_init();
+						if (!curl) {
+							syslog(LOG_ERR, "[ERROR] CURL Initialization Failed!");
+							throw std::runtime_error("CURL init failed");
+						}
+						
+						std::time_t epoch_time = std::time(nullptr);
+						nlohmann::json requestData = {
+							{"credentialType", "DATABASE"},
+							{"requestId", ""},
+							{"userIp", user_ip},
+							{"orgId", authnull_org_id2},
+							{"tenantId", authnull_tenant_id2},
+							{"dbUser", clean_user},
+							{"database_host", ip},
+							{"hostname", db_name},
+							{"databaseType", "mysql"},
+							{"databaseName", db_name},
+							{"token", extra_data},
+							{"timestamp", epoch_time}
+						};
+
+						std::string json_payload = requestData.dump();
+						headers = curl_slist_append(headers, "Content-Type: application/json");
+
+						curl_easy_setopt(curl, CURLOPT_URL, authnull_api_url2.c_str());
+						curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+						curl_easy_setopt(curl, CURLOPT_POST, 1L);
+						curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload.c_str());
+						curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback2);
+						curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+						curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+						curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+						curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L); 
+						curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+						curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 15L);
+						curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 50L);
+						
+						res = curl_easy_perform(curl);
+						if (res != CURLE_OK) {
+							syslog(LOG_ERR, "[ERROR] CURL request failed: %s", curl_easy_strerror(res));
+							throw std::runtime_error(std::string("CURL error: ") + curl_easy_strerror(res));
+						}
+						
+						curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+						syslog(LOG_INFO, "HTTP Status Code: %d", http_code);
+						
+						if (http_code != 200) {
+							syslog(LOG_ERR, "[ERROR] AuthNull API returned non-200 status: %ld", http_code);
+							throw std::runtime_error("API returned non-200 status code");
+						}
+
+						// Parse JSON response
+						json jsonResponse;
+						try {
+							jsonResponse = json::parse(response);
+							syslog(LOG_INFO, "[INFO] Successfully parsed API response");
+							syslog(LOG_DEBUG, "[DEBUG] Full API response: %s", response.c_str());
+							
+							if (jsonResponse.contains("isValid")) {
+								bool isValid = jsonResponse["isValid"].get<bool>();
+								if (!isValid) {
+									syslog(LOG_WARNING, "[WARNING] Authentication rejected by API (isValid=false)");
+									throw std::runtime_error("Authentication rejected by API");
+								}
+							}
+							
+							syslog(LOG_INFO, "MFA API Response: %s", response.c_str());
+							syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());
+
+							if (http_code >= 200 && http_code < 300) {
+								try {
+									if (jsonResponse.contains("isValid") && jsonResponse["isValid"].get<bool>() == true) {
+										syslog(LOG_INFO, "MFA Verified Successfully!");
+										
+										// Parse and map response data
+										if (jsonResponse.contains("credential") && 
+											jsonResponse["credential"].contains("credentialSubject")) {
+											
+											auto& credential = jsonResponse["credential"]["credentialSubject"];
+
+											std::string mfa_db = credential["databaseName"].get<std::string>();
+											
+											// Extract privileges
+											std::vector<std::string> mfa_privileges;
+											if (credential.contains("privilege") && credential["privilege"].is_array()) {
+												mfa_privileges = credential["privilege"].get<std::vector<std::string>>();
+											}
+											
+											// Extract tables
+											std::vector<std::string> mfa_tables;
+											if (credential.contains("tables") && credential["tables"].is_array()) {
+												mfa_tables = credential["tables"].get<std::vector<std::string>>();
+											}
+											
+											// Update data structures
+											user_database_access2[username + "+" + db_name + "+" +std::to_string(thread_session_i)] = {mfa_db};
+											user_database_privileges2[username][mfa_db+"+"+std::to_string(thread_session_i)] = mfa_privileges;
+											
+											// Update masking policies
+											std::string key = username + "+" + db_name + "+" +std::to_string(thread_session_i);
+											std::map<std::string, std::vector<std::string>> masking_policy;
+											
+											if (credential.contains("fieldMasking") && credential["fieldMasking"].is_object()) {
+												auto& fieldMasking = credential["fieldMasking"];
+												
+												for (auto& table : mfa_tables) {
+													if (fieldMasking.contains(table)) {
+														masking_policy[table] = fieldMasking[table].get<std::vector<std::string>>();
+													} else {
+														masking_policy[table] = {};
+													}
+												}
+												
+												usertype_masking_policies2[key] = masking_policy;
+												session_to_usertype2[std::to_string(thread_session_i)] = key;
+											}
+											
+											syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s", 
+												username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
+											
+											// Get password from credential
+											if (credential.contains("password")) {
+												std::string password2 = credential["password"].get<std::string>();
+												syslog(LOG_INFO, "[INFO] Extracted password from API response");
+												
+												// Decrypt the credential
+												try {
+													std::string decrypted_pass = DecryptFromGoOpenSSL2(password2);
+													pass2 = decrypted_pass;
+												} catch (const std::exception& e) {
+													syslog(LOG_ERR, "[ERROR] Failed to decrypt credential: %s", e.what());
+												}
+											} else {
+												syslog(LOG_WARNING, "[WARNING] No password field in credential");
+											}
+										}
+									} else {
+										syslog(LOG_ERR, "MFA Failed! Response: %s", jsonResponse.dump(4).c_str());
+									}
+								} catch (json::exception &e) {
+									syslog(LOG_ERR, "JSON Parsing Error: %s | Response: %s", e.what(), response.c_str());
+								}
+							} else {
+								syslog(LOG_ERR, "HTTP Error: Status Code %ld, Response: %s", http_code, response.c_str());
+							}
+						} catch (const json::parse_error& e) {
+							syslog(LOG_ERR, "[ERROR] Failed to parse API response as JSON: %s", e.what());
+							throw;
+						}
+					} catch (const std::exception& e) {
+						syslog(LOG_ERR, "[ERROR] Exception during authentication process: %s", e.what());
+					}
+					
+					if (curl) curl_easy_cleanup(curl);
+					if (headers) curl_slist_free_all(headers);
+				}
+			}
+			if (pass) {
+				free(pass);
+			}
+
+
+			pass = strdup(pass2.c_str());  // Replace client's password with yours
+			pass_len = pass2.length();
 
 			if (strlen(password) == pass_len && strcmp(password, pass) == 0) {
+				syslog(LOG_DEBUG, "Row Data: Processing 2");
 				ret = EXECUTION_STATE::SUCCESSFUL;
 			}
 		}
@@ -873,62 +1251,46 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 			}
 
 			PgCredentials stored_user_info{ '\0' };
-			strncpy(stored_user_info.name, user, MAX_USERNAME);
-			strncpy(stored_user_info.passwd, password, MAX_PASSWORD);
 
 			if (!(*myds)->scram_state->server_nonce) {
-				/* process as SASLInitialResponse */
 				int pos = get_string((const char*)hdr.data.ptr, hdr.data.size, &mech);
-
-				if (pos == 0) {
-					proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. SASL mechanism not found.\n", (*myds), (*myds)->sess, user);
+				if (pos == 0 || strcmp(mech, "SCRAM-SHA-256") != 0) {
+					generate_error_packet(true, false, "Invalid or missing SASL mechanism", 
+										PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION, true);
 					break;
 				}
 
 				read_pos = pos;
-
-				proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. Selected SASL mechanism: %s.\n", (*myds), (*myds)->sess, user, mech);
-				if (strcmp(mech, "SCRAM-SHA-256") != 0) {
-					proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. Client selected an invalid SASL authentication mechanism: %s.\n", (*myds), (*myds)->sess, user, mech);
-					generate_error_packet(true, false, "client selected an invalid SASL authentication mechanism", 
-						PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION, true);
+				if (!get_uint32be(((unsigned char*)hdr.data.ptr) + read_pos, &length) || 
+					(hdr.data.size - read_pos - 4) < length) {
+					generate_error_packet(true, false, "Malformed SASL packet", 
+										PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION, true);
 					break;
 				}
-
-				if (get_uint32be(((unsigned char*)hdr.data.ptr) + read_pos, &length) == false) {
-					proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. Malformed packet.\n", (*myds), (*myds)->sess, user);
-					break;
-				}
-
+				
 				read_pos += 4;
-
-				if ((hdr.data.size - read_pos) < length) {
-					proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. Malformed packet.\n", (*myds), (*myds)->sess, user);
+				
+				// Use the data directly from the packet for SCRAM authentication
+				if (!scram_handle_client_first(
+						(*myds)->scram_state,
+						&stored_user_info,
+						((const unsigned char*)hdr.data.ptr) + read_pos,
+						length
+					)) {
+					generate_error_packet(true, false, "SASL authentication failed", 
+										PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION, true);
 					break;
 				}
-
-				// check mem boundry
-
-				if (!scram_handle_client_first((*myds)->scram_state, &stored_user_info, ((const unsigned char*)hdr.data.ptr) + read_pos, length)) {
-					proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. SASL authentication failed\n", (*myds), (*myds)->sess, user);
-					generate_error_packet(true, false, "SASL authentication failed", PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION, true);
-					break;
-				}
-
 				ret = EXECUTION_STATE::PENDING;
-			}
-			else {
+			} else {
 				/* process as SASLResponse */
-				//length = mbuf_avail_for_read(&pkt->data);
-				//if (!mbuf_get_bytes(&pkt->data, length, &data))
-				//	return false;
-
 				data = (const unsigned char*)hdr.data.ptr;
 				length = hdr.data.size;
 
 				if (scram_handle_client_final((*myds)->scram_state, &stored_user_info, data, length)) {
 					/* save SCRAM keys for user */
 					if (!(*myds)->scram_state->adhoc) {
+						syslog(LOG_DEBUG, "Row Data: Successfully processed SCRAM authentication");
 						memcpy(stored_user_info.scram_ClientKey,
 							(*myds)->scram_state->ClientKey,
 							sizeof((*myds)->scram_state->ClientKey));
@@ -940,14 +1302,13 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 
 					free_scram_state((*myds)->scram_state);
 					(*myds)->scram_state = NULL;
-					//if (!finish_client_login(client))
-					//	return false;
-					//welcome_client();
 					ret = EXECUTION_STATE::SUCCESSFUL;
 				}
 				else {
-					proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. SASL authentication failed.\n", (*myds), (*myds)->sess, user);
-					//generate_error_packet(false, "SASL authentication failed", NULL, true);
+					proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. SASL authentication failed.\n", 
+							(*myds), (*myds)->sess, user);
+					generate_error_packet(true, false, "SASL authentication failed", 
+										PGSQL_ERROR_CODES::ERRCODE_PROTOCOL_VIOLATION, true);
 				}
 			}
 		}
@@ -1373,9 +1734,8 @@ bool PgSQL_Protocol::generate_ok_packet(bool send, bool ready, const char* msg, 
 //	}
 //	return true;
 //}
-
-
 unsigned int PgSQL_Protocol::copy_row_description_to_PgSQL_Query_Result(bool send, PgSQL_Query_Result* pg_query_result, const PGresult* result) {
+	syslog(LOG_INFO, "turning : 10");
 	assert(pg_query_result);
 	assert(result);
 	
@@ -1433,68 +1793,78 @@ unsigned int PgSQL_Protocol::copy_row_description_to_PgSQL_Query_Result(bool sen
 }
 
 unsigned int PgSQL_Protocol::copy_row_to_PgSQL_Query_Result(bool send, PgSQL_Query_Result* pg_query_result, const PGresult* result) {
-	assert(pg_query_result);
-	assert(result);
-	assert(pg_query_result->num_fields);
-
-	const unsigned int numRows = PQntuples(result);
-	unsigned int total_size = 0;
-	for (unsigned int i = 0; i < numRows; i++) {
-		unsigned int size = 1 + 4 + 2; // 'D', length, field count
-		for (unsigned int j = 0; j < pg_query_result->num_fields; j++) {
-			size += PQgetlength(result, i, j) + 4; // length, value
-		}
-		total_size += size;
-
-		bool alloced_new_buffer = false;
-		unsigned char* _ptr = pg_query_result->buffer_reserve_space(size);
-
-		// buffer is not enough to store the new row. Remember we have already pushed data to PSarrayOUT
-		if (_ptr == NULL) {
-			_ptr = (unsigned char*)l_alloc(size);
-			alloced_new_buffer = true;
-		}
-
-		PG_pkt pgpkt(_ptr, size);
-
-		pgpkt.put_char('D');
-		pgpkt.put_uint32(size - 1);
-		pgpkt.put_uint16(pg_query_result->num_fields);
-		int column_value_len = 0;
-		for (unsigned int j = 0; j < pg_query_result->num_fields; j++) {
-			column_value_len = PQgetlength(result, i, j);
-			if (column_value_len == 0 && PQgetisnull(result, i, j) == 1) {
-				column_value_len = -1; /*0xFFFFFFFF*/
-			}
-			pgpkt.put_uint32(column_value_len);
-			if (column_value_len > 0) {
-				pgpkt.put_bytes(PQgetvalue(result, i, j), column_value_len);
-			}
-		}
-
-		if (send == true) { 
-			// not supported
-			//(*myds)->PSarrayOUT->add((void*)_ptr, size); 
-		}
-
-		pg_query_result->resultset_size += size;
-
-		if (alloced_new_buffer) {
-			// we created new buffer
-			//pg_query_result->buffer_to_PSarrayOut();
-			pg_query_result->PSarrayOUT.add(_ptr, size);
-		}
-
-		pg_query_result->pkt_count++;
-	}
-
-	pg_query_result->num_rows += numRows;
-
-	return total_size;
+    assert(pg_query_result);
+    assert(result);
+    assert(pg_query_result->num_fields);
+    
+    const unsigned int numRows = PQntuples(result);
+    const unsigned int numFields = pg_query_result->num_fields;
+    unsigned int total_size = 0;
+    
+    // Log number of rows and fields clearly
+    syslog(LOG_INFO, "Processing results - Total Rows: %u | Total Fields: %u", numRows, numFields);
+    
+    for (unsigned int i = 0; i < numRows; i++) {
+        // Build row data string for logging
+        std::string row_data = "";
+        for (unsigned int j = 0; j < numFields; j++) {
+            if (PQgetisnull(result, i, j)) {
+                row_data += "NULL\t";
+            } else {
+                row_data += std::string(PQgetvalue(result, i, j)) + "\t";
+            }
+        }
+        
+        // Log each row with distinct marker
+        syslog(LOG_INFO, "ROW[%u]: %s", i, row_data.c_str());
+        
+        // --- Build data packet ---
+        unsigned int size = 1 + 4 + 2;
+        for (unsigned int j = 0; j < numFields; j++) {
+            size += PQgetlength(result, i, j) + 4;
+        }
+        total_size += size;
+        
+        bool alloced_new_buffer = false;
+        unsigned char* _ptr = pg_query_result->buffer_reserve_space(size); // Fixed pointer syntax
+        if (_ptr == NULL) {
+            _ptr = (unsigned char*)malloc(size); // Fixed allocation call
+            alloced_new_buffer = true;
+        }
+        
+        PG_pkt pgpkt(_ptr, size);
+        pgpkt.put_char('D');
+        pgpkt.put_uint32(size - 1);
+        pgpkt.put_uint16(numFields);
+        
+        for (unsigned int j = 0; j < numFields; j++) {
+            int column_value_len = PQgetlength(result, i, j);
+            if (column_value_len == 0 && PQgetisnull(result, i, j)) {
+                column_value_len = -1;
+            }
+            pgpkt.put_uint32(column_value_len);
+            if (column_value_len > 0) {
+                pgpkt.put_bytes(PQgetvalue(result, i, j), column_value_len);
+            }
+        }
+        
+        if (alloced_new_buffer) {
+            pg_query_result->PSarrayOUT.add(_ptr, size);
+        }
+        
+        pg_query_result->resultset_size += size;
+        pg_query_result->pkt_count++;
+    }
+    
+    pg_query_result->num_rows += numRows;
+    syslog(LOG_INFO, "Successfully processed all rows. Final row count: %u", pg_query_result->num_rows);
+    
+    return total_size;
 }
 
 unsigned int PgSQL_Protocol::copy_command_completion_to_PgSQL_Query_Result(bool send, PgSQL_Query_Result* pg_query_result, const PGresult* result, 
 	bool extract_affected_rows) {
+	syslog(LOG_INFO, "turning : 9");
 	assert(pg_query_result);
 	assert(result);
 
@@ -1543,6 +1913,7 @@ unsigned int PgSQL_Protocol::copy_command_completion_to_PgSQL_Query_Result(bool 
 }
 
 unsigned int PgSQL_Protocol::copy_error_to_PgSQL_Query_Result(bool send, PgSQL_Query_Result* pg_query_result, const PGresult* result) {
+	syslog(LOG_INFO, "turning : 8");
 	assert(pg_query_result);
 	assert(result);
 
@@ -1690,6 +2061,7 @@ unsigned int PgSQL_Protocol::copy_error_to_PgSQL_Query_Result(bool send, PgSQL_Q
 }
 
 unsigned int PgSQL_Protocol::copy_empty_query_response_to_PgSQL_Query_Result(bool send, PgSQL_Query_Result* pg_query_result, const PGresult* result) {
+	syslog(LOG_INFO, "turning : 7");
 	assert(pg_query_result);
 	// we are currently not using result. It is just for future use
 
@@ -1726,7 +2098,8 @@ unsigned int PgSQL_Protocol::copy_empty_query_response_to_PgSQL_Query_Result(boo
 }
 
 unsigned int PgSQL_Protocol::copy_ready_status_to_PgSQL_Query_Result(bool send, PgSQL_Query_Result* pg_query_result, PGTransactionStatusType txn_status) {
-	assert(pg_query_result);
+	
+	syslog(LOG_INFO, "turning : 6");assert(pg_query_result);
 
 	char txn_state = 'I';
 	if (txn_status == PQTRANS_INTRANS)
@@ -1768,6 +2141,7 @@ unsigned int PgSQL_Protocol::copy_ready_status_to_PgSQL_Query_Result(bool send, 
 }
 
 unsigned int PgSQL_Protocol::copy_buffer_to_PgSQL_Query_Result(bool send, PgSQL_Query_Result* pg_query_result, const PSresult* result) {
+	syslog(LOG_INFO, "turning : 5");
 	assert(pg_query_result);
 	assert(result && result->len && result->data);
 
@@ -1806,6 +2180,7 @@ unsigned int PgSQL_Protocol::copy_buffer_to_PgSQL_Query_Result(bool send, PgSQL_
 }
 
 PgSQL_Query_Result::PgSQL_Query_Result() {
+	syslog(LOG_INFO, "turning : 4");
 	buffer = NULL;
 	transfer_started = false;
 	buffer_used = 0;
@@ -1818,6 +2193,7 @@ PgSQL_Query_Result::PgSQL_Query_Result() {
 }
 
 PgSQL_Query_Result::~PgSQL_Query_Result() {
+	syslog(LOG_DEBUG, "[DEBUG] 22222222222");
 	PtrSize_t pkt;
 	while (PSarrayOUT.len) {
 		PSarrayOUT.remove_index_fast(0, &pkt);
@@ -1835,6 +2211,7 @@ void PgSQL_Query_Result::buffer_init() {
 		buffer = (unsigned char*)malloc(PGSQL_RESULTSET_BUFLEN);
 	}
 	buffer_used = 0;
+	syslog(LOG_INFO, "turning : 2");
 }
 
 void PgSQL_Query_Result::init(PgSQL_Protocol* _proto, PgSQL_Data_Stream* _myds, PgSQL_Connection* _conn) {
@@ -1845,24 +2222,27 @@ void PgSQL_Query_Result::init(PgSQL_Protocol* _proto, PgSQL_Data_Stream* _myds, 
 	myds = _myds;
 	buffer_init();
 	reset();
-
+	syslog(LOG_INFO, "turning : 1");
 	if (proto == NULL) {
 		return; // this is a mirror
 	}
 }
 
 unsigned int PgSQL_Query_Result::add_row_description(const PGresult* result) {
+	syslog(LOG_INFO, "EPFFFFFFFFFFF : 3");
 	const unsigned int res = proto->copy_row_description_to_PgSQL_Query_Result(false, this, result);
 	result_packet_type |= PGSQL_QUERY_RESULT_TUPLE;
 	return res;
 }
 
 unsigned int PgSQL_Query_Result::add_row(const PGresult* result) {
+	syslog(LOG_INFO, "EPFFFFFFFFFFF : 1");
 
 	return proto->copy_row_to_PgSQL_Query_Result(false,this, result);
 }
 
 unsigned int PgSQL_Query_Result::add_row(const PSresult* result) {
+	syslog(LOG_INFO, "EPFFFFFFFFFFF : 2");
 
 	const unsigned int res = proto->copy_buffer_to_PgSQL_Query_Result(false, this, result);
 	result_packet_type |= PGSQL_QUERY_RESULT_TUPLE; // temporary
@@ -1918,34 +2298,97 @@ unsigned int PgSQL_Query_Result::add_ready_status(PGTransactionStatusType txn_st
 }
 
 bool PgSQL_Query_Result::get_resultset(PtrSizeArray* PSarrayFinal) {
-	transfer_started = true;
-	// Ready packet confirms that the result is complete
-	const bool result_complete = (result_packet_type & PGSQL_QUERY_RESULT_READY);
-	if (result_complete == true) {
-		assert(buffer_used == 0); // we still have data in the buffer
-	} else {
-		buffer_to_PSarrayOut();
-	}
+    syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Starting get_resultset");
 
-	if (proto) {
-		PSarrayFinal->copy_add(&PSarrayOUT, 0, PSarrayOUT.len);
-		while (PSarrayOUT.len)
-			PSarrayOUT.remove_index(PSarrayOUT.len - 1, NULL);
-	}
-	if (result_complete) 
-		reset(); // reset only if result is complete
-	return result_complete;
+    transfer_started = true;
+
+    // Ready packet confirms that the result is complete
+    const bool result_complete = (result_packet_type & PGSQL_QUERY_RESULT_READY);
+
+    if (result_complete == true) {
+        assert(buffer_used == 0); // we still have data in the buffer
+    } else {
+        buffer_to_PSarrayOut();
+    }
+
+    if (proto) {
+        syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Dumping PSarrayOUT Contents Before Copying to PSarrayFinal (PSarrayOUT.len = %u)", PSarrayOUT.len);
+        for (unsigned int i = 0; i < PSarrayOUT.len; ++i) {
+            PtrSize_t* pkt = PSarrayOUT.index(i);
+            if (pkt && pkt->ptr && pkt->size > 0) {
+                std::string data_str;
+                // Try to interpret the packet as a data row ('D')
+                if (((char*)pkt->ptr)[0] == 'D' && pkt->size > 6) {
+                    unsigned short num_fields = ntohs(*(unsigned short*)((char*)pkt->ptr + 5));
+                    unsigned char* data_ptr = (unsigned char*)pkt->ptr + 7;
+                    data_str += "Data Row: ";
+                    for (int f = 0; f < num_fields; ++f) {
+                        int len = ntohl(*(int*)data_ptr);
+                        data_ptr += 4;
+                        if (len > 0) {
+                            data_str += std::string((char*)data_ptr, len) + "\t";
+                            data_ptr += len;
+                        } else if (len == -1) {
+                            data_str += "NULL\t";
+                        }
+                    }
+                    syslog(LOG_INFO, "%s (Size: %u)", data_str.c_str(), pkt->size);
+                } else if (((char*)pkt->ptr)[0] == 'T') {
+                    syslog(LOG_INFO, "Row Description Packet (Size: %u)", pkt->size);
+                } else if (((char*)pkt->ptr)[0] == 'C') {
+                    syslog(LOG_INFO, "Command Completion Packet (Size: %u)", pkt->size);
+                } else if (((char*)pkt->ptr)[0] == 'E') {
+                    syslog(LOG_INFO, "Error Packet (Size: %u)", pkt->size);
+                } else if (((char*)pkt->ptr)[0] == 'Z') {
+                    syslog(LOG_INFO, "Ready Status Packet (Size: %u)", pkt->size);
+                } else {
+                    syslog(LOG_INFO, "Unknown Packet Type (First Char: %c, Size: %u)", ((char*)pkt->ptr)[0], pkt->size);
+                    // You might want to dump the raw bytes if it's not a known type
+                    // for (unsigned int k = 0; k < pkt->size; ++k) {
+                    //     syslog(LOG_INFO, "Byte [%u]: %02X", k, ((unsigned char*)pkt->ptr)[k]);
+                    // }
+                }
+            } else {
+                syslog(LOG_INFO, "Empty or invalid packet in PSarrayOUT at index %u", i);
+            }
+        }
+
+        PSarrayFinal->copy_add(&PSarrayOUT, 0, PSarrayOUT.len);
+        syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Copied to PSarrayFinal (PSarrayFinal->len = %u)", PSarrayFinal->len); // CRITICAL LOG
+        while (PSarrayOUT.len)
+            PSarrayOUT.remove_index(PSarrayOUT.len - 1, NULL);
+    }
+
+    if (result_complete)
+        reset(); // reset only if result is complete
+
+    syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Returning, PSarrayFinal->len = %u", PSarrayFinal->len);
+    return result_complete;
 }
 
+
 void PgSQL_Query_Result::buffer_to_PSarrayOut() {
-	if (buffer_used == 0)
-		return;	// exit immediately if the buffer is empty
-	if (buffer_used < PGSQL_RESULTSET_BUFLEN / 2) {
-		buffer = (unsigned char*)realloc(buffer, buffer_used);
-	}
-	PSarrayOUT.add(buffer, buffer_used);
-	buffer = (unsigned char*)malloc(PGSQL_RESULTSET_BUFLEN);
-	buffer_used = 0;
+    syslog(LOG_INFO, "PgSQL_Query_Result::buffer_to_PSarrayOut: PSarrayOUT.len before = %u, buffer_used = %u", PSarrayOUT.len, buffer_used);
+    if (buffer_used > 0) {
+        unsigned char* buffer_copy = (unsigned char*)malloc(buffer_used);
+        if (buffer_copy) {
+            memcpy(buffer_copy, buffer, buffer_used);
+            PSarrayOUT.add(buffer_copy, buffer_used);
+            syslog(LOG_INFO, "PgSQL_Query_Result::buffer_to_PSarrayOut: Added %u bytes to PSarrayOUT", buffer_used);
+        } else {
+            syslog(LOG_ERR, "PgSQL_Query_Result::buffer_to_PSarrayOut: Failed to allocate buffer for PSarrayOUT");
+        }
+        buffer_used = 0;
+        if (buffer) {
+            free(buffer);
+            buffer = (unsigned char*)malloc(PGSQL_RESULTSET_BUFLEN);
+            syslog(LOG_DEBUG, "PgSQL_Query_Result::buffer_to_PSarrayOut: Reallocated internal buffer");
+        } else {
+            buffer = (unsigned char*)malloc(PGSQL_RESULTSET_BUFLEN);
+            syslog(LOG_DEBUG, "PgSQL_Query_Result::buffer_to_PSarrayOut: Allocated internal buffer");
+        }
+    }
+    syslog(LOG_INFO, "PgSQL_Query_Result::buffer_to_PSarrayOut: PSarrayOUT.len after = %u", PSarrayOUT.len);
 }
 
 unsigned long long PgSQL_Query_Result::current_size() {

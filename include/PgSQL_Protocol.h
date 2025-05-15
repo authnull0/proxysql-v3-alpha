@@ -6,6 +6,17 @@
 #include "MySQL_Protocol.h"
 
 
+extern std::map<std::string, std::string> alias_to_table2;
+extern std::map<std::string, std::vector<std::string>> query_tables_fields2;
+extern std::string current_query_table2;
+extern std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map2;
+
+extern std::unordered_map<std::string, std::vector<std::string>> user_database_access2;
+extern std::unordered_map<std::string, std::string> session_to_usertype2;
+extern std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies2;
+extern std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges2;
+std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession2(const std::string& user,const std::string& db_name,const std::string& sessionID);
+
 /* no-auth modes */
 #define PG_PKT_AUTH_ANY        -1	/* same as trust but without username check */
 #define PG_PKT_AUTH_TRUST      AUTH_OK
