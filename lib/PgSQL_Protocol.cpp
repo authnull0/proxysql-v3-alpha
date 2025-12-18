@@ -1082,7 +1082,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							{"dbUser", clean_user},
 							{"database_host", ip},
 							{"hostname", db_name},
-							{"databaseType", "mysql"},
+							{"databaseType", "postgres"},
 							{"databaseName", db_name},
 							{"token", extra_data},
 							{"timestamp", epoch_time}
