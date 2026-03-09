@@ -1092,7 +1092,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							{"tenantId", authnull_tenant_id2},
 							{"dbUser", clean_user},
 							{"database_host", ip},
-							{"client_ip", cli_ip}
+							{"client_ip", cli_ip},
 							{"hostname", db_name},
 							{"databaseType", "postgres"},
 							{"databaseName", db_name},
