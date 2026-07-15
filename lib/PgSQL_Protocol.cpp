@@ -1099,10 +1099,12 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 						curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 						curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
-						curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L); 
+						curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
 						curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 						curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 15L);
 						curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 50L);
+						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 						
 						res = curl_easy_perform(curl);
 						if (res != CURLE_OK) {
