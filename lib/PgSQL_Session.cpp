@@ -5791,20 +5791,35 @@ void PgSQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 								std::vector<std::string>& databases = user_database_access2[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
 								auto it = std::find(databases.begin(), databases.end(), db_name);
 								if (it == databases.end()) {
+									syslog(LOG_ERR, "Access denied: user '%s' has no MFA-granted access to database '%s'", user.c_str(), db_name.c_str());
+									client_authenticated = false;
+									*wrong_pass = true;
 									client_myds->DSS=STATE_QUERY_SENT_NET;
 									char *err_msg = (char *)"Access denied: User does not have access to this database";
 									client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
 									RequestEnd(NULL);
-									l_free(pkt->size, pkt->ptr);
-									break; 
+									// pkt was already freed before this switch; freeing it
+									// again corrupts the heap. A `break` here would also
+									// fall through to the free_users<=0 check and emit a
+									// second, misleading "Too many connections" error.
+									return;
 								}
 								syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
 								unsigned long thread_session_id = client_myds->sess->thread_session_id;
 								syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
 								syslog(LOG_INFO, "Mapped username '%s' to session ID %d", user.c_str(), thread_session_id);
 							} catch (const std::exception &e) {
-								syslog(LOG_ERR, "Error: %s", e.what());
-								exit(1); 
+								// Deny this login instead of exit(1): an exception on one
+								// connection's access check is not a reason to take down
+								// the whole proxy for every other session.
+								syslog(LOG_ERR, "Error during database access check for user '%s': %s. Denying login.", user.c_str(), e.what());
+								client_authenticated = false;
+								*wrong_pass = true;
+								client_myds->DSS=STATE_QUERY_SENT_NET;
+								char *err_msg = (char *)"Access denied: authorization check could not be completed";
+								client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
+								RequestEnd(NULL);
+								return;
 							}
 						}
 					}
