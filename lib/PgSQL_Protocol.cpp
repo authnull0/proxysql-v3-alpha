@@ -1121,23 +1121,25 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 
 						syslog(LOG_INFO, "MFA Verified Successfully!");
 
+						// databaseName is required, and its absence is fatal.
+						//
+						// Since the client's password is no longer verified (the flat
+						// response carries none, so the old comparison against pass2
+						// could never pass and had to be bypassed), databaseName is the
+						// ONLY remaining constraint on this login. Falling back to the
+						// database the client asked for would not merely be lenient --
+						// it would remove the last check entirely.
+						//
+						// Our backend always sets databaseName on isValid:true, so this
+						// branch can only fire against a backend that is not ours.
+						if (!jsonResponse.contains("databaseName") || !jsonResponse["databaseName"].is_string()) {
+							syslog(LOG_ERR, "[ERROR] MFA approved for user '%s' but the response has no top-level 'databaseName'. Denying: this is the only remaining constraint on the login. Response: %s",
+								clean_user.c_str(), response.c_str());
+							throw std::runtime_error("AuthNull MFA response is missing databaseName");
+						}
+
 						{
-							// The scope fields are read from the top level only. Their
-							// absence is a normal case, not an error: this build can be
-							// deployed while [authnull] api_url still points at the
-							// legacy endpoint, which answers with a
-							// credential.credentialSubject wrapper and no flat fields.
-							// isValid was already true, so the login is granted either
-							// way -- we just fall back to the database the client asked
-							// for and say so loudly, because an empty privilege list
-							// means every subsequent query will be refused.
-							std::string mfa_db = db_name;
-							if (jsonResponse.contains("databaseName") && jsonResponse["databaseName"].is_string()) {
-								mfa_db = jsonResponse["databaseName"].get<std::string>();
-							} else {
-								syslog(LOG_WARNING, "[WARNING] MFA approved for user '%s' but the response has no top-level 'databaseName'; falling back to the requested database '%s'. Is [authnull] api_url still pointed at the legacy endpoint?",
-									clean_user.c_str(), db_name.c_str());
-							}
+							std::string mfa_db = jsonResponse["databaseName"].get<std::string>();
 
 							// Extract privileges
 							std::vector<std::string> mfa_privileges;
