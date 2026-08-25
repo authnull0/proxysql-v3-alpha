@@ -1992,6 +1992,13 @@ static void erase_session_mfa_state2(unsigned long long thread_session_id) {
 			it = ends_with_suffix(it->first) ? by_db.erase(it) : std::next(it);
 		}
 	}
+	// Only written when a grant carries fieldMasking, so these two leaked on
+	// approved logins specifically. Same composite key as the access map.
+	for (auto it = usertype_masking_policies2.begin(); it != usertype_masking_policies2.end(); ) {
+		it = ends_with_suffix(it->first) ? usertype_masking_policies2.erase(it) : std::next(it);
+	}
+	// Keyed by the bare session id, so this one is an exact match.
+	session_to_usertype2.erase(std::to_string(thread_session_id));
 }
 
 PgSQL_Session::~PgSQL_Session() {

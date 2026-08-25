@@ -2333,6 +2333,12 @@ static void erase_session_mfa_state(unsigned long long thread_session_id) {
 			it = ends_with_suffix(it->first) ? by_db.erase(it) : std::next(it);
 		}
 	}
+	// Only written when a grant carries fieldMasking, so these two leaked on
+	// approved logins specifically.
+	for (auto it = usertype_masking_policies.begin(); it != usertype_masking_policies.end(); ) {
+		it = ends_with_suffix(it->first) ? usertype_masking_policies.erase(it) : std::next(it);
+	}
+	session_to_usertype.erase(std::to_string(thread_session_id));
 }
 
 MySQL_Session::~MySQL_Session() {
