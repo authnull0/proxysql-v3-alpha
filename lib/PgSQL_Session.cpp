@@ -5786,7 +5786,7 @@ void PgSQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 						std::string key = user + "_" + session_idp;
 						std::string authtoken;
 						authtoken = session_extra_data_map[key];
-						if (true) { 
+						{
 							try {
 								std::vector<std::string>& databases = user_database_access2[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
 								auto it = std::find(databases.begin(), databases.end(), db_name);
@@ -5807,7 +5807,7 @@ void PgSQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 								syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
 								unsigned long thread_session_id = client_myds->sess->thread_session_id;
 								syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
-								syslog(LOG_INFO, "Mapped username '%s' to session ID %d", user.c_str(), thread_session_id);
+								syslog(LOG_INFO, "Mapped username '%s' to session ID %lu", user.c_str(), thread_session_id);
 							} catch (const std::exception &e) {
 								// Deny this login instead of exit(1): an exception on one
 								// connection's access check is not a reason to take down

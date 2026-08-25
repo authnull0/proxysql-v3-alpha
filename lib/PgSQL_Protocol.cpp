@@ -730,6 +730,7 @@ std::unordered_map<std::string, std::string> session_extra_data_map2;
 int authnull_org_id2;
 int authnull_tenant_id2;
 std::string authnull_api_url2;
+std::string authnull_ca_path2;
 
 /**
  * @brief Generate a unique session ID
@@ -814,6 +815,10 @@ void loadAuthNullConfig2() {
     authnull_org_id2 = GloVars.confFile->get_int("authnull", "org_id", 0);
     authnull_tenant_id2 = GloVars.confFile->get_int("authnull", "tenant_id", 0);
     authnull_api_url2 = GloVars.confFile->get_string("authnull", "api_url", "");
+    // Optional. TLS verification is on; leave this empty for a publicly-signed
+    // api_url and curl uses the system CA bundle. Set it to a PEM bundle only
+    // for an on-prem CA, which is the case that would otherwise fail to verify.
+    authnull_ca_path2 = GloVars.confFile->get_string("authnull", "ca_path", "");
 }
 
 /**
@@ -1082,6 +1087,9 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						// making the timeout above meaningless.
 						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
 						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+						if (!authnull_ca_path2.empty()) {
+							curl_easy_setopt(curl, CURLOPT_CAINFO, authnull_ca_path2.c_str());
+						}
 
 						res = curl_easy_perform(curl);
 						if (res != CURLE_OK) {

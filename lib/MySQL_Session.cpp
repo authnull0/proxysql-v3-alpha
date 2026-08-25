@@ -650,10 +650,14 @@ std::string authtoken;
 int authnull_org_id;
 int authnull_tenant_id;
 std::string authnull_api_url;
+std::string authnull_ca_path;
 void loadAuthNullConfig() {
     authnull_org_id = GloVars.confFile->get_int("authnull", "org_id", 0);
     authnull_tenant_id = GloVars.confFile->get_int("authnull", "tenant_id", 0);
     authnull_api_url = GloVars.confFile->get_string("authnull", "api_url", "");
+    // Optional. Empty means the system CA bundle, which is correct for a
+    // publicly-signed api_url; set it to a PEM bundle for an on-prem CA.
+    authnull_ca_path = GloVars.confFile->get_string("authnull", "ca_path", "");
 }
 size_t WriteCallback(void *contents, size_t size, size_t nmemb, std::string *output) {
     size_t totalSize = size * nmemb;
@@ -725,6 +729,14 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
     // could never arrive in time.
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L); // 120 seconds timeout
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L); // 10 seconds connect timeout
+
+    // This path never disabled verification, so curl's default (on) already
+    // applies -- set it explicitly so a future edit can't quietly drop it.
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    if (!authnull_ca_path.empty()) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, authnull_ca_path.c_str());
+    }
 
     res = curl_easy_perform(curl);
     
@@ -7153,7 +7165,7 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 										syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
 										unsigned long thread_session_id = client_myds->sess->thread_session_id;
 										syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
-										syslog(LOG_INFO, "Mapped username '%s' to session ID %d", user.c_str(), thread_session_id);
+										syslog(LOG_INFO, "Mapped username '%s' to session ID %lu", user.c_str(), thread_session_id);
 									} catch (const std::exception &e) {
 										// Deny this login instead of exit(1): an exception on
 										// one connection's MFA check is not a reason to take
