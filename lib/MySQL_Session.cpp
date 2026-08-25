@@ -2313,7 +2313,31 @@ void MySQL_Session::reset() {
 /**
  * @brief Destructor for the MySQL session.
  */
+// Drop this session's MFA grant state. See the PgSQL_Session counterpart: these
+// maps are keyed with a "+<thread_session_id>" suffix, were never erased, and
+// cannot be released when MFA completes because checkPermission() reads them on
+// every query.
+static void erase_session_mfa_state(unsigned long long thread_session_id) {
+	const std::string suffix = "+" + std::to_string(thread_session_id);
+	const auto ends_with_suffix = [&suffix](const std::string& k) {
+		return k.size() > suffix.size() &&
+			k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0;
+	};
+
+	for (auto it = user_database_access.begin(); it != user_database_access.end(); ) {
+		it = ends_with_suffix(it->first) ? user_database_access.erase(it) : std::next(it);
+	}
+	for (auto& per_user : user_database_privileges) {
+		auto& by_db = per_user.second;
+		for (auto it = by_db.begin(); it != by_db.end(); ) {
+			it = ends_with_suffix(it->first) ? by_db.erase(it) : std::next(it);
+		}
+	}
+}
+
 MySQL_Session::~MySQL_Session() {
+
+	erase_session_mfa_state(thread_session_id);
 
 	reset(); // we moved this out to allow CHANGE_USER
 
@@ -7124,6 +7148,11 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 								openlog("AuthSQL", LOG_PID, LOG_DAEMON);
 								std::string key = user + "_" + session_idp;
 								authtoken = session_extra_data_map[key];
+								// Consume it: this entry was never erased, so every
+								// login leaked a token string for the life of the
+								// process. Erasing also makes the token single-use at
+								// the proxy instead of relying on the backend TTL.
+								session_extra_data_map.erase(key);
 								if (mfa_status_map.find(rand_session_id) == mfa_status_map.end()) {
 									try {
 										if (!performMFA(user_ip, connection_ip, user, db_name, authtoken,thread_session_id)) {

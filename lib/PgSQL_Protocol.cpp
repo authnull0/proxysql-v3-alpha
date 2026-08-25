@@ -1042,6 +1042,14 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 					auto it = session_extra_data_map.find(key);
 					if (it != session_extra_data_map.end()) {
 						extra_data = it->second;
+						// Consume it. This entry was never erased before, so every
+						// login leaked a token string for the life of the process.
+						// Erasing here also makes the token single-use at the proxy
+						// rather than leaving the backend's TTL as the only thing
+						// enforcing that. Safe at this point: the re-entry recovery
+						// in process_handshake_response_packet runs before the auth
+						// method is dispatched, so nothing reads the entry after us.
+						session_extra_data_map.erase(it);
 						syslog(LOG_INFO, "Found extra data for key %s", key.c_str());
 					} else {
 						syslog(LOG_WARNING, "Key %s not found in session_extra_data_map", key.c_str());

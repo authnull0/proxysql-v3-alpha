@@ -1963,7 +1963,40 @@ void PgSQL_Session::reset() {
 	}
 }
 
+// Drop this session's MFA grant state.
+//
+// user_database_access2 and user_database_privileges2 are keyed with a
+// "+<thread_session_id>" suffix and were never erased, so each login left an
+// entry behind for the life of the process. They cannot be released when MFA
+// completes -- checkPermission2() reads them on every query -- so the session
+// teardown is the only correct place.
+//
+// thread_session_id comes from __sync_fetch_and_add on a global counter, so it
+// is monotonic and never reused; a stale entry could not have been matched by a
+// later connection. This is a leak, not a privilege carry-over.
+static void erase_session_mfa_state2(unsigned long long thread_session_id) {
+	const std::string suffix = "+" + std::to_string(thread_session_id);
+	const auto ends_with_suffix = [&suffix](const std::string& k) {
+		return k.size() > suffix.size() &&
+			k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0;
+	};
+
+	for (auto it = user_database_access2.begin(); it != user_database_access2.end(); ) {
+		it = ends_with_suffix(it->first) ? user_database_access2.erase(it) : std::next(it);
+	}
+	// Nested: outer key is the username and is shared across sessions, so only
+	// the inner "<db>+<session>" entries may be removed.
+	for (auto& per_user : user_database_privileges2) {
+		auto& by_db = per_user.second;
+		for (auto it = by_db.begin(); it != by_db.end(); ) {
+			it = ends_with_suffix(it->first) ? by_db.erase(it) : std::next(it);
+		}
+	}
+}
+
 PgSQL_Session::~PgSQL_Session() {
+
+	erase_session_mfa_state2(thread_session_id);
 
 	reset(); // we moved this out to allow CHANGE_USER
 
