@@ -879,20 +879,36 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 
     full_username = std::string(user);
     comma_pos = full_username.find(',');
+	thread_session_i = (*myds)->sess->thread_session_id;
 	if (comma_pos == std::string::npos || comma_pos == full_username.length() - 1) {
-		syslog(LOG_ERR, "[ERROR] Invalid username format for: %s", full_username.c_str());
-		std::cout << "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.\n";
-		ret = EXECUTION_STATE::FAILED;
-		goto __exit_process_pkt_handshake_response;
+		// No comma. Before rejecting, check whether we are the ones who removed
+		// it: this function is re-entered for the client's password packet, and
+		// the branch below rewrites PG_USER in place with the comma stripped.
+		// On that second pass the token is already stashed, so recover it
+		// instead of failing a username we truncated ourselves.
+		//
+		// Without this, every password-based login dies here on the second
+		// pass -- performMFA is never reached and no approval can ever
+		// succeed, which looks like a credential problem rather than a bug.
+		auto it = session_extra_data_map.find(full_username + "_" + std::to_string(thread_session_i));
+		if (it == session_extra_data_map.end()) {
+			syslog(LOG_ERR, "[ERROR] Invalid username format for: %s", full_username.c_str());
+			std::cout << "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.\n";
+			ret = EXECUTION_STATE::FAILED;
+			goto __exit_process_pkt_handshake_response;
+		}
+		clean_user = full_username;
+		extra_data = it->second;
+		username = clean_user;
+	} else {
+		clean_user = full_username.substr(0, comma_pos);
+		extra_data = full_username.substr(comma_pos + 1);
+
+		username = clean_user;
+		session_extra_data_map[clean_user + "_" + std::to_string(thread_session_i)] = extra_data;
+		strncpy(user, clean_user.c_str(), clean_user.length());
+		user[clean_user.length()] = '\0';
 	}
-    clean_user = full_username.substr(0, comma_pos);
-    extra_data = full_username.substr(comma_pos + 1);
-    
-    username = clean_user;
-    thread_session_i = (*myds)->sess->thread_session_id;
-	session_extra_data_map[clean_user + "_" + std::to_string(thread_session_i)] = extra_data;
-	strncpy(user, clean_user.c_str(), clean_user.length());
-	user[clean_user.length()] = '\0'; 
 	password = GloPgAuth->lookup((char*)user, USERNAME_FRONTEND, &_ret_use_ssl, &default_hostgroup, &transaction_persistent, &fast_forward, &max_connections, &sha1_pass, &attributes);
 
 	if (password) {
