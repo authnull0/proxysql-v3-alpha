@@ -726,10 +726,6 @@ std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>>
 std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges2;
 std::unordered_map<std::string, std::string> session_extra_data_map2;
 
-// Fixed key for AES-256 - MUST match the Go key exactly
-const std::string KEY_STRING2 = "84sF#v7Fpt!L#PesYb^AezXrUn2kE%5v";
-const int KEY_SIZE_BYTES2 = 32; // AES-256 key size
-const int BLOCK_SIZE_BYTES2 = 16; // AES block size
 
 // AuthNull configuration variables
 int authnull_org_id2;
@@ -783,60 +779,6 @@ std::string bytes_to_hex2(const unsigned char* bytes, int len) {
     return ss.str();
 }
 
-/**
- * @brief Helper function to convert hex string to byte vector
- */
-std::vector<unsigned char> hex_to_bytes2(const std::string& hex) {
-    std::vector<unsigned char> bytes;
-    for (size_t i = 0; i < hex.length(); i += 2) {
-        std::string byteString = hex.substr(i, 2);
-        unsigned char byte = (unsigned char)stoi(byteString, nullptr, 16);
-        bytes.push_back(byte);
-    }
-    return bytes;
-}
-
-/**
- * @brief Decrypt data from Go OpenSSL
- */
-std::string DecryptFromGoOpenSSL2(const std::string &encryptedHex) {
-    std::vector<unsigned char> ciphertext_with_iv = hex_to_bytes2(encryptedHex);
-    if (ciphertext_with_iv.size() < BLOCK_SIZE_BYTES2) {
-        std::cerr << "Error: Ciphertext too short!" << std::endl;
-        return "";
-    }
-
-    std::vector<unsigned char> iv(ciphertext_with_iv.begin(), ciphertext_with_iv.begin() + BLOCK_SIZE_BYTES2);
-    std::vector<unsigned char> ciphertext(ciphertext_with_iv.begin() + BLOCK_SIZE_BYTES2, ciphertext_with_iv.end());
-    std::vector<unsigned char> decrypted_text(ciphertext.size());
-
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        throw std::runtime_error("EVP_CIPHER_CTX_new failed");
-    }
-
-    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cfb(), nullptr, (const unsigned char*)KEY_STRING2.data(), iv.data())) {
-        EVP_CIPHER_CTX_free(ctx);
-        throw std::runtime_error("EVP_DecryptInit_ex failed");
-    }
-
-    int len;
-    if (1 != EVP_DecryptUpdate(ctx, decrypted_text.data(), &len, ciphertext.data(), ciphertext.size())) {
-        EVP_CIPHER_CTX_free(ctx);
-        throw std::runtime_error("EVP_DecryptUpdate failed");
-    }
-    int decrypted_len = len;
-
-    if (1 != EVP_DecryptFinal_ex(ctx, decrypted_text.data() + len, &len)) {
-        EVP_CIPHER_CTX_free(ctx);
-        throw std::runtime_error("EVP_DecryptFinal_ex failed");
-    }
-    decrypted_len += len;
-
-    EVP_CIPHER_CTX_free(ctx);
-
-    return std::string(decrypted_text.begin(), decrypted_text.begin() + decrypted_len);
-}
 
 /**
  * @brief Load AuthNull configuration from config file
@@ -1255,26 +1197,35 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 								throw std::runtime_error("MFA approved but no fieldMasking policy returned");
 							}
 
-							// The Postgres path cannot authenticate to the backend without the credential
-							// password: pass2 replaces the client's password further down. No password here
-							// means no session, so fail explicitly rather than falling through to a silent
-							// empty-password comparison.
-							if (!credential.contains("password") || !credential["password"].is_string()) {
-								syslog(LOG_ERR, "[ERROR] MFA approved but credentialSubject has no password for user '%s' db '%s'; refusing session", clean_user.c_str(), mfa_db.c_str());
-								throw std::runtime_error("MFA approved but no backend password returned");
+							// THE BACKEND PASSWORD COMES FROM pgsql_users, NOT FROM THE MFA RESPONSE.
+							//
+							// This used to require credentialSubject.password, decrypt it with a
+							// compiled-in AES key, and assign it to pass2. But look at what pass2 is
+							// actually compared against, further down:
+							//
+							//	strcmp(password, pass)   where password = GloPgAuth->lookup(user, ...)
+							//
+							// GloPgAuth->lookup reads pgsql_users. So the credential password was never
+							// delivering a secret -- it had to EQUAL the one already on file, and it
+							// always did, because database-agent generates one value and writes it to
+							// both places at provisioning time:
+							//
+							//	CREATE ROLE <user> WITH LOGIN PASSWORD '<pw>'            -- Postgres
+							//	INSERT INTO pgsql_users (username, password, ...)        -- here
+							//
+							// It was an echo dressed as a credential. Removing it costs nothing and
+							// removes a great deal: the secret no longer crosses the network on every
+							// login, no longer lands in the "MFA API Response" syslog line below, and
+							// the AES key that decrypted it -- committed in plaintext to two
+							// repositories in two languages -- stops being load-bearing.
+							//
+							// What remains is the correct gate: the MFA response says APPROVED, and the
+							// session then authenticates with the credential ProxySQL already holds.
+							if (password == nullptr || *password == '\0') {
+								syslog(LOG_ERR, "[ERROR] MFA approved for user '%s' db '%s' but no pgsql_users entry holds a backend password; refusing session. Has database-agent provisioned this role?", clean_user.c_str(), mfa_db.c_str());
+								throw std::runtime_error("MFA approved but no backend credential on file");
 							}
-
-							std::string decrypted_pass;
-							try {
-								decrypted_pass = DecryptFromGoOpenSSL2(credential["password"].get<std::string>());
-							} catch (const std::exception& e) {
-								syslog(LOG_ERR, "[ERROR] Failed to decrypt credential: %s", e.what());
-								throw std::runtime_error("Failed to decrypt backend credential");
-							}
-							if (decrypted_pass.empty()) {
-								syslog(LOG_ERR, "[ERROR] Decrypted backend credential is empty for user '%s'; refusing session", clean_user.c_str());
-								throw std::runtime_error("Decrypted backend credential is empty");
-							}
+							std::string backend_pass(password);
 
 							std::string key = username + "+" + db_name + "+" + std::to_string(thread_session_i);
 							std::map<std::string, std::vector<std::string>> masking_policy;
@@ -1297,7 +1248,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 								username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
 
 							// Only now hand the backend password to the auth comparison below.
-							pass2 = decrypted_pass;
+							pass2 = backend_pass;
 						} catch (const json::parse_error& e) {
 							syslog(LOG_ERR, "[ERROR] Failed to parse API response as JSON: %s", e.what());
 							throw;
