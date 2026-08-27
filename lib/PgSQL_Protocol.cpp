@@ -852,10 +852,58 @@ const char* get_auth_method_string(AUTHENTICATION_METHOD method) {
     }
 }
 
+#include <cstdlib>
+#include <climits>
+#include <cerrno>
+// authnullEnvOrConf reads a setting from the environment first, falling back to proxysql.cnf.
+//
+// WHY THE ENVIRONMENT WINS
+//
+// api_url, org_id and tenant_id are per-DEPLOYMENT values. Baking them into proxysql.cnf means the
+// same file cannot be shipped to two environments, and it has already gone wrong: the live config on
+// the on-prem box pointed at https://onprem.prod.authnull.com -- a hostname with no vhost, so every
+// MFA call 404'd -- with org_id = 1 on a deployment whose only organisation is 2. Two independent
+// misconfigurations in three lines, both invisible until a login failed.
+//
+// An environment variable can be set by whatever orchestrates the proxy, alongside the rest of the
+// deployment's settings, instead of being edited by hand on each VM.
+//
+// The config file remains the fallback so existing installations keep working untouched.
+static std::string authnullEnvOrConf(const char *env, const char *section, const char *key,
+                                    const std::string &fallback) {
+    const char *v = getenv(env);
+    if (v != nullptr && *v != '\0') {
+        return std::string(v);
+    }
+    return GloVars.confFile->get_string(section, key, fallback);
+}
+
+static int authnullEnvOrConfInt(const char *env, const char *section, const char *key, int fallback) {
+    const char *v = getenv(env);
+    if (v != nullptr && *v != '\0') {
+        errno = 0;
+        char *end = nullptr;
+        long parsed = strtol(v, &end, 10);
+        // A non-numeric value is a configuration error, not a reason to silently use the file: an
+        // operator who set AUTHNULL_ORG_ID=two needs to be told, not quietly given org 0.
+        if (errno == 0 && end != nullptr && *end == '\0' && parsed > 0 && parsed <= INT_MAX) {
+            return (int)parsed;
+        }
+        syslog(LOG_ERR, "[authnull] %s='%s' is not a positive integer; falling back to proxysql.cnf", env, v);
+    }
+    return GloVars.confFile->get_int(section, key, fallback);
+}
+
 void loadAuthNullConfig2() {
-    authnull_org_id2 = GloVars.confFile->get_int("authnull", "org_id", 0);
-    authnull_tenant_id2 = GloVars.confFile->get_int("authnull", "tenant_id", 0);
-    authnull_api_url2 = GloVars.confFile->get_string("authnull", "api_url", "");
+    authnull_org_id2 = authnullEnvOrConfInt("AUTHNULL_ORG_ID", "authnull", "org_id", 0);
+    authnull_tenant_id2 = authnullEnvOrConfInt("AUTHNULL_TENANT_ID", "authnull", "tenant_id", 0);
+    authnull_api_url2 = authnullEnvOrConf("AUTHNULL_API_URL", "authnull", "api_url", "");
+    // get_int/get_string swallow a missing [authnull] section and hand back the default,
+    // so an unconfigured proxy would otherwise fail every login with only a curl error.
+    if (authnull_api_url2.empty() || authnull_org_id2 == 0 || authnull_tenant_id2 == 0) {
+        syslog(LOG_ERR, "[authnull] configuration incomplete -- set AUTHNULL_API_URL / AUTHNULL_ORG_ID / AUTHNULL_TENANT_ID in the environment, or an [authnull] section in proxysql.cnf (org_id=%d tenant_id=%d api_url='%s'); all MFA-gated logins will be denied",
+            authnull_org_id2, authnull_tenant_id2, authnull_api_url2.c_str());
+    }
 }
 
 /**
@@ -1036,7 +1084,13 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 			}
 			if (user) {
 				if (clean_user == "admin") {
-					// Admin user follows normal authentication flow
+					// Admin user follows normal authentication flow: keep the password the
+					// client supplied rather than substituting an MFA-sourced one. Without
+					// this, pass2 stays empty and the comparison below is against "".
+					// std::string(pass) not (pass, pass_len): CLEAR_TEXT_PASSWORD does not trim
+					// the trailing NUL the way the MD5 branch above does, and pass is
+					// NUL-terminated (the MD5 branch strcmp()s it).
+					pass2 = std::string(pass);
 				} else {
 					loadAuthNullConfig2();
 					std::string db_name = "default_db";
@@ -1099,10 +1153,15 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 						curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 						curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
-						curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+						// do-authenticationV4 BLOCKS while the user approves the push (Okta/Duo).
+						// Challenge TTL is 60s, so anything below that aborts before the user
+						// can respond. 90s = 60s TTL + headroom. Connect timeout stays at 10s.
+						curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L); // push-MFA challenge TTL (60s) + headroom
 						curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-						curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 15L);
-						curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 50L);
+						// NOTE: CURLOPT_LOW_SPEED_TIME/LIMIT deliberately removed. While the user is
+						// deciding on the push, zero bytes flow for up to 60s, so a 15s/50B-per-sec
+						// floor aborted the request roughly 15s in - even earlier than the old 30s
+						// CURLOPT_TIMEOUT. Do not reintroduce them on a blocking endpoint.
 						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
 						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 						
@@ -1113,7 +1172,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						}
 						
 						curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-						syslog(LOG_INFO, "HTTP Status Code: %d", http_code);
+						syslog(LOG_INFO, "HTTP Status Code: %ld", http_code);
 						
 						if (http_code != 200) {
 							syslog(LOG_ERR, "[ERROR] AuthNull API returned non-200 status: %ld", http_code);
@@ -1127,93 +1186,118 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							syslog(LOG_INFO, "[INFO] Successfully parsed API response");
 							syslog(LOG_DEBUG, "[DEBUG] Full API response: %s", response.c_str());
 							
-							if (jsonResponse.contains("isValid")) {
-								bool isValid = jsonResponse["isValid"].get<bool>();
-								if (!isValid) {
-									syslog(LOG_WARNING, "[WARNING] Authentication rejected by API (isValid=false)");
-									throw std::runtime_error("Authentication rejected by API");
-								}
+							// Invariant: HTTP 200 carrying isValid:false is a REFUSAL, not a transport
+							// error. Anything that is not an explicit approval must deny.
+							if (!jsonResponse.contains("isValid") || !jsonResponse["isValid"].is_boolean()
+								|| jsonResponse["isValid"].get<bool>() != true) {
+								syslog(LOG_WARNING, "[WARNING] MFA refused by authn-service for user '%s' db '%s': %s",
+									clean_user.c_str(), db_name.c_str(), jsonResponse.dump().c_str());
+								throw std::runtime_error("Authentication refused by authn-service (isValid=false)");
 							}
-							
+
 							syslog(LOG_INFO, "MFA API Response: %s", response.c_str());
 							syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());
+							syslog(LOG_INFO, "MFA Verified Successfully!");
 
-							if (http_code >= 200 && http_code < 300) {
-								try {
-									if (jsonResponse.contains("isValid") && jsonResponse["isValid"].get<bool>() == true) {
-										syslog(LOG_INFO, "MFA Verified Successfully!");
-										
-										// Parse and map response data
-										if (jsonResponse.contains("credential") && 
-											jsonResponse["credential"].contains("credentialSubject")) {
-											
-											auto& credential = jsonResponse["credential"]["credentialSubject"];
-
-											std::string mfa_db = credential["databaseName"].get<std::string>();
-											
-											// Extract privileges
-											std::vector<std::string> mfa_privileges;
-											if (credential.contains("privilege") && credential["privilege"].is_array()) {
-												mfa_privileges = credential["privilege"].get<std::vector<std::string>>();
-											}
-											
-											// Extract tables
-											std::vector<std::string> mfa_tables;
-											if (credential.contains("tables") && credential["tables"].is_array()) {
-												mfa_tables = credential["tables"].get<std::vector<std::string>>();
-											}
-											
-											// Update data structures
-											user_database_access2[username + "+" + db_name + "+" +std::to_string(thread_session_i)] = {mfa_db};
-											user_database_privileges2[username][mfa_db+"+"+std::to_string(thread_session_i)] = mfa_privileges;
-											
-											// Update masking policies
-											std::string key = username + "+" + db_name + "+" +std::to_string(thread_session_i);
-											std::map<std::string, std::vector<std::string>> masking_policy;
-											
-											if (credential.contains("fieldMasking") && credential["fieldMasking"].is_object()) {
-												auto& fieldMasking = credential["fieldMasking"];
-												
-												for (auto& table : mfa_tables) {
-													if (fieldMasking.contains(table)) {
-														masking_policy[table] = fieldMasking[table].get<std::vector<std::string>>();
-													} else {
-														masking_policy[table] = {};
-													}
-												}
-												
-												usertype_masking_policies2[key] = masking_policy;
-												session_to_usertype2[std::to_string(thread_session_i)] = key;
-											}
-											
-											syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s", 
-												username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
-											
-											// Get password from credential
-											if (credential.contains("password")) {
-												std::string password2 = credential["password"].get<std::string>();
-												syslog(LOG_INFO, "[INFO] Extracted password from API response");
-												
-												// Decrypt the credential
-												try {
-													std::string decrypted_pass = DecryptFromGoOpenSSL2(password2);
-													pass2 = decrypted_pass;
-												} catch (const std::exception& e) {
-													syslog(LOG_ERR, "[ERROR] Failed to decrypt credential: %s", e.what());
-												}
-											} else {
-												syslog(LOG_WARNING, "[WARNING] No password field in credential");
-											}
-										}
-									} else {
-										syslog(LOG_ERR, "MFA Failed! Response: %s", jsonResponse.dump(4).c_str());
-									}
-								} catch (json::exception &e) {
-									syslog(LOG_ERR, "JSON Parsing Error: %s | Response: %s", e.what(), response.c_str());
-								}
-							} else {
-								syslog(LOG_ERR, "HTTP Error: Status Code %ld, Response: %s", http_code, response.c_str());
+							// Privilege/masking payload. Historically this arrived as the DID/VC verifiable
+							// credential under ["credential"]["credentialSubject"]; the push-MFA endpoint is
+							// expected to return the same shape built from the matched DATABASE policy.
+							// Accept it at either location.
+							const json* credential_ptr = nullptr;
+							if (jsonResponse.contains("credential") && jsonResponse["credential"].is_object()
+								&& jsonResponse["credential"].contains("credentialSubject")
+								&& jsonResponse["credential"]["credentialSubject"].is_object()) {
+								credential_ptr = &jsonResponse["credential"]["credentialSubject"];
+							} else if (jsonResponse.contains("credentialSubject")
+								&& jsonResponse["credentialSubject"].is_object()) {
+								credential_ptr = &jsonResponse["credentialSubject"];
 							}
+
+							// An approval alone is not enough to open a session. Without the privilege and
+							// field-masking mapping the session would run unrestricted and unmasked, so a
+							// missing credentialSubject must DENY.
+							if (credential_ptr == nullptr) {
+								syslog(LOG_ERR, "[ERROR] MFA approved but response carries no credentialSubject; refusing session for user '%s' db '%s' (no privilege/masking mapping available)",
+									clean_user.c_str(), db_name.c_str());
+								throw std::runtime_error("MFA approved but no credentialSubject returned");
+							}
+
+							const json& credential = *credential_ptr;
+
+							if (!credential.contains("databaseName") || !credential["databaseName"].is_string()) {
+								syslog(LOG_ERR, "[ERROR] MFA approved but credentialSubject has no databaseName; refusing session for user '%s'", clean_user.c_str());
+								throw std::runtime_error("MFA approved but credentialSubject has no databaseName");
+							}
+
+							std::string mfa_db = credential["databaseName"].get<std::string>();
+
+							// Extract privileges
+							std::vector<std::string> mfa_privileges;
+							if (credential.contains("privilege") && credential["privilege"].is_array()) {
+								mfa_privileges = credential["privilege"].get<std::vector<std::string>>();
+							}
+							if (mfa_privileges.empty()) {
+								syslog(LOG_ERR, "[ERROR] MFA approved but no privileges returned for user '%s' db '%s'; refusing session", clean_user.c_str(), mfa_db.c_str());
+								throw std::runtime_error("MFA approved but no privileges returned");
+							}
+
+							// Extract tables
+							std::vector<std::string> mfa_tables;
+							if (credential.contains("tables") && credential["tables"].is_array()) {
+								mfa_tables = credential["tables"].get<std::vector<std::string>>();
+							}
+
+							// The masking policy has to be resolvable before the session is allowed.
+							// Previously an absent fieldMasking object left usertype_masking_policies2 unset,
+							// which silently served unmasked data for the whole session.
+							if (!credential.contains("fieldMasking") || !credential["fieldMasking"].is_object()) {
+								syslog(LOG_ERR, "[ERROR] MFA approved but credentialSubject has no fieldMasking object for user '%s' db '%s'; refusing session rather than serving unmasked data", clean_user.c_str(), mfa_db.c_str());
+								throw std::runtime_error("MFA approved but no fieldMasking policy returned");
+							}
+
+							// The Postgres path cannot authenticate to the backend without the credential
+							// password: pass2 replaces the client's password further down. No password here
+							// means no session, so fail explicitly rather than falling through to a silent
+							// empty-password comparison.
+							if (!credential.contains("password") || !credential["password"].is_string()) {
+								syslog(LOG_ERR, "[ERROR] MFA approved but credentialSubject has no password for user '%s' db '%s'; refusing session", clean_user.c_str(), mfa_db.c_str());
+								throw std::runtime_error("MFA approved but no backend password returned");
+							}
+
+							std::string decrypted_pass;
+							try {
+								decrypted_pass = DecryptFromGoOpenSSL2(credential["password"].get<std::string>());
+							} catch (const std::exception& e) {
+								syslog(LOG_ERR, "[ERROR] Failed to decrypt credential: %s", e.what());
+								throw std::runtime_error("Failed to decrypt backend credential");
+							}
+							if (decrypted_pass.empty()) {
+								syslog(LOG_ERR, "[ERROR] Decrypted backend credential is empty for user '%s'; refusing session", clean_user.c_str());
+								throw std::runtime_error("Decrypted backend credential is empty");
+							}
+
+							std::string key = username + "+" + db_name + "+" + std::to_string(thread_session_i);
+							std::map<std::string, std::vector<std::string>> masking_policy;
+							const json& fieldMasking = credential["fieldMasking"];
+							for (auto& table : mfa_tables) {
+								if (fieldMasking.contains(table) && fieldMasking[table].is_array()) {
+									masking_policy[table] = fieldMasking[table].get<std::vector<std::string>>();
+								} else {
+									masking_policy[table] = {};
+								}
+							}
+
+							// Publish the session mapping only once it is complete.
+							user_database_access2[key] = {mfa_db};
+							user_database_privileges2[username][mfa_db + "+" + std::to_string(thread_session_i)] = mfa_privileges;
+							usertype_masking_policies2[key] = masking_policy;
+							session_to_usertype2[std::to_string(thread_session_i)] = key;
+
+							syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s",
+								username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
+
+							// Only now hand the backend password to the auth comparison below.
+							pass2 = decrypted_pass;
 						} catch (const json::parse_error& e) {
 							syslog(LOG_ERR, "[ERROR] Failed to parse API response as JSON: %s", e.what());
 							throw;
@@ -1234,7 +1318,13 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 			pass = strdup(pass2.c_str());  // Replace client's password with yours
 			pass_len = pass2.length();
 
-			if (strlen(password) == pass_len && strcmp(password, pass) == 0) {
+			// pass2 is only ever populated by an explicitly approved MFA response. If MFA
+			// was refused, timed out, or returned no usable credential it is still empty,
+			// and an empty pass_len must never authenticate - a backend user with an empty
+			// stored password would otherwise compare equal and be let straight through.
+			if (pass_len == 0) {
+				syslog(LOG_WARNING, "[WARNING] No approved MFA credential for user '%s'; denying session", clean_user.c_str());
+			} else if (strlen(password) == pass_len && strcmp(password, pass) == 0) {
 				syslog(LOG_DEBUG, "Row Data: Processing 2");
 				ret = EXECUTION_STATE::SUCCESSFUL;
 			}

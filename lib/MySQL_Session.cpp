@@ -650,10 +650,58 @@ std::string authtoken;
 int authnull_org_id;
 int authnull_tenant_id;
 std::string authnull_api_url;
+#include <cstdlib>
+#include <climits>
+#include <cerrno>
+// authnullEnvOrConf reads a setting from the environment first, falling back to proxysql.cnf.
+//
+// WHY THE ENVIRONMENT WINS
+//
+// api_url, org_id and tenant_id are per-DEPLOYMENT values. Baking them into proxysql.cnf means the
+// same file cannot be shipped to two environments, and it has already gone wrong: the live config on
+// the on-prem box pointed at https://onprem.prod.authnull.com -- a hostname with no vhost, so every
+// MFA call 404'd -- with org_id = 1 on a deployment whose only organisation is 2. Two independent
+// misconfigurations in three lines, both invisible until a login failed.
+//
+// An environment variable can be set by whatever orchestrates the proxy, alongside the rest of the
+// deployment's settings, instead of being edited by hand on each VM.
+//
+// The config file remains the fallback so existing installations keep working untouched.
+static std::string authnullEnvOrConf(const char *env, const char *section, const char *key,
+                                    const std::string &fallback) {
+    const char *v = getenv(env);
+    if (v != nullptr && *v != '\0') {
+        return std::string(v);
+    }
+    return GloVars.confFile->get_string(section, key, fallback);
+}
+
+static int authnullEnvOrConfInt(const char *env, const char *section, const char *key, int fallback) {
+    const char *v = getenv(env);
+    if (v != nullptr && *v != '\0') {
+        errno = 0;
+        char *end = nullptr;
+        long parsed = strtol(v, &end, 10);
+        // A non-numeric value is a configuration error, not a reason to silently use the file: an
+        // operator who set AUTHNULL_ORG_ID=two needs to be told, not quietly given org 0.
+        if (errno == 0 && end != nullptr && *end == '\0' && parsed > 0 && parsed <= INT_MAX) {
+            return (int)parsed;
+        }
+        syslog(LOG_ERR, "[authnull] %s='%s' is not a positive integer; falling back to proxysql.cnf", env, v);
+    }
+    return GloVars.confFile->get_int(section, key, fallback);
+}
+
 void loadAuthNullConfig() {
-    authnull_org_id = GloVars.confFile->get_int("authnull", "org_id", 0);
-    authnull_tenant_id = GloVars.confFile->get_int("authnull", "tenant_id", 0);
-    authnull_api_url = GloVars.confFile->get_string("authnull", "api_url", "");
+    authnull_org_id = authnullEnvOrConfInt("AUTHNULL_ORG_ID", "authnull", "org_id", 0);
+    authnull_tenant_id = authnullEnvOrConfInt("AUTHNULL_TENANT_ID", "authnull", "tenant_id", 0);
+    authnull_api_url = authnullEnvOrConf("AUTHNULL_API_URL", "authnull", "api_url", "");
+    // get_int/get_string swallow a missing [authnull] section and hand back the default,
+    // so an unconfigured proxy would otherwise fail every login with only a curl error.
+    if (authnull_api_url.empty() || authnull_org_id == 0 || authnull_tenant_id == 0) {
+        syslog(LOG_ERR, "[authnull] configuration incomplete -- set AUTHNULL_API_URL / AUTHNULL_ORG_ID / AUTHNULL_TENANT_ID in the environment, or an [authnull] section in proxysql.cnf (org_id=%d tenant_id=%d api_url='%s'); all MFA-gated logins will be denied",
+            authnull_org_id, authnull_tenant_id, authnull_api_url.c_str());
+    }
 }
 size_t WriteCallback(void *contents, size_t size, size_t nmemb, std::string *output) {
     size_t totalSize = size * nmemb;
@@ -720,14 +768,17 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
     
     // Set timeout to prevent hanging
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L); // 30 seconds timeout
+    // do-authenticationV4 BLOCKS while the user approves the push (Okta/Duo).
+    // Challenge TTL is 60s, so anything below that aborts the request before the user
+    // can possibly respond. 90s = 60s TTL + headroom. Connect timeout stays at 10s.
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L); // 90 seconds: push-MFA challenge TTL (60s) + headroom
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L); // 10 seconds connect timeout
 
     res = curl_easy_perform(curl);
     
     // Get HTTP status code
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    syslog(LOG_INFO, "HTTP Status Code: %d", http_code);
+    syslog(LOG_INFO, "HTTP Status Code: %ld", http_code);
     curl_easy_cleanup(curl);
     curl_slist_free_all(headers);
 
@@ -738,70 +789,106 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
         if (http_code >= 200 && http_code < 300) {
             try {
                 json jsonResponse = json::parse(response);
-                if (jsonResponse.contains("isValid") && jsonResponse["isValid"].get<bool>() == true) {
-                    syslog(LOG_INFO, "MFA Verified Successfully!");
-                    
-                    // Parse and map response data
-                    if (jsonResponse.contains("credential") && 
-                        jsonResponse["credential"].contains("credentialSubject")) {
-                        
-                        auto& credential = jsonResponse["credential"]["credentialSubject"];
-                        
-                        // Extract username and database name
-                        std::string username = user; // Using the passed user parameter
-                        std::string mfa_db = credential["databaseName"].get<std::string>();
-                        
-                        // Extract privileges
-                        std::vector<std::string> mfa_privileges;
-                        if (credential.contains("privilege") && credential["privilege"].is_array()) {
-                            mfa_privileges = credential["privilege"].get<std::vector<std::string>>();
-                        }
-                        
-                        // Extract tables
-                        std::vector<std::string> mfa_tables;
-                        if (credential.contains("tables") && credential["tables"].is_array()) {
-                            mfa_tables = credential["tables"].get<std::vector<std::string>>();
-                        }
-                        
-                        // Update data structures
-                        user_database_access[username + "+" + db_name + "+" +std::to_string(thread_session_i)] = {mfa_db};
-                        user_database_privileges[username][mfa_db+"+"+std::to_string(thread_session_i)] = mfa_privileges;
-                        
-                        // Update masking policies
-                        std::string key = username + "+" + db_name + "+" +std::to_string(thread_session_i);
-                        std::map<std::string, std::vector<std::string>> masking_policy;
-                        
-                        if (credential.contains("fieldMasking") && credential["fieldMasking"].is_object()) {
-                            auto& fieldMasking = credential["fieldMasking"];
-                            
-                            for (auto& table : mfa_tables) {
-                                if (fieldMasking.contains(table)) {
-                                    masking_policy[table] = fieldMasking[table].get<std::vector<std::string>>();
-                                } else {
-                                    masking_policy[table] = {};
-                                }
-                            }
-                            
-                            usertype_masking_policies[key] = masking_policy;
-							session_to_usertype[std::to_string(thread_session_i)] = key;
 
-                        }
-                        
-                        syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s", username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
-                    }
-                    
-                    return true;
-                } else {
-                    std::cerr << "MFA Failed! Response: " << jsonResponse.dump(4) << std::endl;
+                // Invariant: HTTP 200 carrying isValid:false is a REFUSAL, not a transport
+                // error. Anything that is not an explicit approval must deny.
+                if (!jsonResponse.contains("isValid") || !jsonResponse["isValid"].is_boolean()
+                    || jsonResponse["isValid"].get<bool>() != true) {
+                    syslog(LOG_WARNING, "MFA refused by authn-service for user '%s' db '%s': %s",
+                        user.c_str(), db_name.c_str(), jsonResponse.dump().c_str());
+                    return false;
                 }
+
+                syslog(LOG_INFO, "MFA Verified Successfully!");
+
+                // Privilege/masking payload. Historically this arrived as the DID/VC
+                // verifiable credential under ["credential"]["credentialSubject"]; the
+                // push-MFA endpoint is expected to return the same shape built from the
+                // matched DATABASE policy. Accept it at either location.
+                const json* credential_ptr = nullptr;
+                if (jsonResponse.contains("credential") && jsonResponse["credential"].is_object()
+                    && jsonResponse["credential"].contains("credentialSubject")
+                    && jsonResponse["credential"]["credentialSubject"].is_object()) {
+                    credential_ptr = &jsonResponse["credential"]["credentialSubject"];
+                } else if (jsonResponse.contains("credentialSubject")
+                    && jsonResponse["credentialSubject"].is_object()) {
+                    credential_ptr = &jsonResponse["credentialSubject"];
+                }
+
+                // An approval alone is not enough to open a session. Without the privilege
+                // and field-masking mapping the session would run unrestricted and unmasked,
+                // so a missing credentialSubject must DENY, not fall through to success.
+                if (credential_ptr == nullptr) {
+                    syslog(LOG_ERR, "MFA approved but response carries no credentialSubject; refusing session for user '%s' db '%s' (no privilege/masking mapping available)",
+                        user.c_str(), db_name.c_str());
+                    return false;
+                }
+
+                const json& credential = *credential_ptr;
+
+                if (!credential.contains("databaseName") || !credential["databaseName"].is_string()) {
+                    syslog(LOG_ERR, "MFA approved but credentialSubject has no databaseName; refusing session for user '%s'", user.c_str());
+                    return false;
+                }
+
+                std::string username = user; // Using the passed user parameter
+                std::string mfa_db = credential["databaseName"].get<std::string>();
+
+                // Extract privileges
+                std::vector<std::string> mfa_privileges;
+                if (credential.contains("privilege") && credential["privilege"].is_array()) {
+                    mfa_privileges = credential["privilege"].get<std::vector<std::string>>();
+                }
+                if (mfa_privileges.empty()) {
+                    syslog(LOG_ERR, "MFA approved but no privileges returned for user '%s' db '%s'; refusing session", username.c_str(), mfa_db.c_str());
+                    return false;
+                }
+
+                // Extract tables
+                std::vector<std::string> mfa_tables;
+                if (credential.contains("tables") && credential["tables"].is_array()) {
+                    mfa_tables = credential["tables"].get<std::vector<std::string>>();
+                }
+
+                // The masking policy has to be resolvable before the session is allowed.
+                // Previously an absent fieldMasking object left usertype_masking_policies
+                // unset, which silently served unmasked data for the whole session.
+                if (!credential.contains("fieldMasking") || !credential["fieldMasking"].is_object()) {
+                    syslog(LOG_ERR, "MFA approved but credentialSubject has no fieldMasking object for user '%s' db '%s'; refusing session rather than serving unmasked data", username.c_str(), mfa_db.c_str());
+                    return false;
+                }
+
+                std::string key = username + "+" + db_name + "+" + std::to_string(thread_session_i);
+                std::map<std::string, std::vector<std::string>> masking_policy;
+                const json& fieldMasking = credential["fieldMasking"];
+                for (auto& table : mfa_tables) {
+                    if (fieldMasking.contains(table) && fieldMasking[table].is_array()) {
+                        masking_policy[table] = fieldMasking[table].get<std::vector<std::string>>();
+                    } else {
+                        masking_policy[table] = {};
+                    }
+                }
+
+                // Publish the session mapping only once it is complete.
+                user_database_access[key] = {mfa_db};
+                user_database_privileges[username][mfa_db + "+" + std::to_string(thread_session_i)] = mfa_privileges;
+                usertype_masking_policies[key] = masking_policy;
+                session_to_usertype[std::to_string(thread_session_i)] = key;
+
+                syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s", username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
+
+                return true;
             } catch (json::exception &e) {
-                std::cerr << "JSON Parsing Error: " << e.what() << " | Response: " << response << std::endl;
+                // Unparseable/unexpected response: deny.
+                syslog(LOG_ERR, "MFA JSON parsing error: %s | Response: %s", e.what(), response.c_str());
+                return false;
             }
         } else {
-            std::cerr << "HTTP Error: Status Code " << http_code << ", Response: " << response << std::endl;
+            syslog(LOG_ERR, "MFA HTTP error: status code %ld, response: %s", http_code, response.c_str());
         }
     } else {
-        std::cerr << "CURL Error: " << curl_easy_strerror(res) << std::endl;
+        // Timeout or transport failure must DENY, never allow.
+        syslog(LOG_ERR, "MFA CURL error: %s (denying session)", curl_easy_strerror(res));
     }
 
     return false;
@@ -7035,6 +7122,10 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 			}
 			int free_users=0;
 			int used_users=0;
+			// Set when the AuthNull MFA gate denies the session. Denial leaves free_users
+			// at 0 and is reported by the shared error path below, so exactly one ERR
+			// packet is sent and it carries the real reason.
+			const char *mfa_deny_msg = NULL;
 			if (
 				( max_connections_reached == false )
 				&&
@@ -7059,18 +7150,23 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 								authtoken = session_extra_data_map[key];
 								if (mfa_status_map.find(rand_session_id) == mfa_status_map.end()) { 
 									try {
+										// Refusal, timeout and transport failure all land here; every
+										// one of them must deny.
 										if (!performMFA(user_ip, connection_ip, user, db_name, authtoken,thread_session_id)) {
-											syslog(LOG_ERR, "MFA Failed");
+											syslog(LOG_ERR, "MFA Failed - denying session for user '%s' db '%s'", user.c_str(), db_name.c_str());
+											mfa_deny_msg = "Access denied: multi-factor authentication was not approved";
 											break;
 										}
 										std::vector<std::string>& databases = user_database_access[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
 										auto it = std::find(databases.begin(), databases.end(), db_name);
 										if (it == databases.end()) {
-											client_myds->DSS=STATE_QUERY_SENT_NET;
-											char *err_msg = (char *)"Access denied: User does not have access to this database";
-											client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
-											RequestEnd(NULL);
-											l_free(pkt->size, pkt->ptr);
+											// NOTE: this branch used to generate its own ERR packet and
+											// l_free(pkt) a second time (pkt is already freed before this
+											// switch), then fall through to the free_users<=0 path which
+											// generated a second ERR packet. Both are fixed by deferring
+											// to the shared denial path below.
+											syslog(LOG_ERR, "MFA approved but no access to db '%s' for user '%s' - denying session", db_name.c_str(), user.c_str());
+											mfa_deny_msg = "Access denied: User does not have access to this database";
 											break; 
 										}
 										syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
@@ -7078,8 +7174,12 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 										syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
 										syslog(LOG_INFO, "Mapped username '%s' to session ID %d", user.c_str(), thread_session_id);
 									} catch (const std::exception &e) {
-										syslog(LOG_ERR, "Error: %s", e.what());
-										exit(1); 
+										// Deny this session. This used to exit(1), which killed the
+										// whole proxy - and every other client's session with it -
+										// on any exception raised while authenticating one login.
+										syslog(LOG_ERR, "Error during MFA for user '%s': %s - denying session", user.c_str(), e.what());
+										mfa_deny_msg = "Access denied: multi-factor authentication could not be completed";
+										break;
 									}
 								}
 							}
@@ -7114,7 +7214,12 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 				//uint8_t _pid = 2;
 				//if (client_myds->switching_auth_stage) _pid+=2;
 				uint8_t _pid = client_myds->pkt_sid; _pid++;
-				if (max_connections_reached==true) {
+				if (mfa_deny_msg != NULL) {
+					proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session=%p , DS=%p , MFA denied: %s\n", this, client_myds, mfa_deny_msg);
+					client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,_pid,1045,(char *)"28000", (char *)mfa_deny_msg, true);
+					GloMyLogger->log_audit_entry(PROXYSQL_MYSQL_AUTH_ERR, this, NULL, (char *)mfa_deny_msg);
+					__sync_fetch_and_add(&MyHGM->status.access_denied_wrong_password, 1);
+				} else if (max_connections_reached==true) {
 					proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session=%p , DS=%p , Too many connections\n", this, client_myds);
 					client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,_pid,1040,(char *)"08004", (char *)"Too many connections", true);
 					proxy_warning("mysql-max_connections reached. Returning 'Too many connections'\n");

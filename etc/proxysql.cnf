@@ -34,6 +34,27 @@
 datadir="/var/lib/proxysql"
 errorlog="/var/lib/proxysql/proxysql.log"
 
+########################################################################################
+# AuthNull MFA gate                                                                    
+########################################################################################
+# Read at runtime by loadAuthNullConfig() (lib/MySQL_Session.cpp) and
+# loadAuthNullConfig2() (lib/PgSQL_Protocol.cpp). Unlike the sections below, these
+# values are NOT imported into the on-disk database - they are read straight from this
+# parsed file, so a plain restart picks up a change (no proxysql-initial needed).
+#
+# api_url is the single front door on authn-service. It BLOCKS while the user approves
+# the push (Okta/Duo) and returns the verdict, so it is paired with a 90s
+# CURLOPT_TIMEOUT in both the MySQL and PgSQL paths. HTTP 200 with isValid:false is a
+# refusal; anything that is not an explicit approval denies the session.
+#
+# Missing or empty values here mean every login is denied, not allowed.
+authnull=
+{
+	org_id=2
+	tenant_id=1
+	api_url="https://onprem.dev.authnull.com/authnull0/api/v1/authn/v3/do-authenticationV4"
+}
+
 admin_variables=
 {
 	admin_credentials="admin:admin"

@@ -653,10 +653,52 @@ std::string authtoken;
 int authnull_org_id;
 int authnull_tenant_id;
 std::string authnull_api_url;
+#include <cstdlib>
+#include <climits>
+#include <cerrno>
+// authnullEnvOrConf reads a setting from the environment first, falling back to proxysql.cnf.
+//
+// WHY THE ENVIRONMENT WINS
+//
+// api_url, org_id and tenant_id are per-DEPLOYMENT values. Baking them into proxysql.cnf means the
+// same file cannot be shipped to two environments, and it has already gone wrong: the live config on
+// the on-prem box pointed at https://onprem.prod.authnull.com -- a hostname with no vhost, so every
+// MFA call 404'd -- with org_id = 1 on a deployment whose only organisation is 2. Two independent
+// misconfigurations in three lines, both invisible until a login failed.
+//
+// An environment variable can be set by whatever orchestrates the proxy, alongside the rest of the
+// deployment's settings, instead of being edited by hand on each VM.
+//
+// The config file remains the fallback so existing installations keep working untouched.
+static std::string authnullEnvOrConf(const char *env, const char *section, const char *key,
+                                    const std::string &fallback) {
+    const char *v = getenv(env);
+    if (v != nullptr && *v != '\0') {
+        return std::string(v);
+    }
+    return GloVars.confFile->get_string(section, key, fallback);
+}
+
+static int authnullEnvOrConfInt(const char *env, const char *section, const char *key, int fallback) {
+    const char *v = getenv(env);
+    if (v != nullptr && *v != '\0') {
+        errno = 0;
+        char *end = nullptr;
+        long parsed = strtol(v, &end, 10);
+        // A non-numeric value is a configuration error, not a reason to silently use the file: an
+        // operator who set AUTHNULL_ORG_ID=two needs to be told, not quietly given org 0.
+        if (errno == 0 && end != nullptr && *end == '\0' && parsed > 0 && parsed <= INT_MAX) {
+            return (int)parsed;
+        }
+        syslog(LOG_ERR, "[authnull] %s='%s' is not a positive integer; falling back to proxysql.cnf", env, v);
+    }
+    return GloVars.confFile->get_int(section, key, fallback);
+}
+
 void loadAuthNullConfig() {
-    authnull_org_id = GloVars.confFile->get_int("authnull", "org_id", 0);
-    authnull_tenant_id = GloVars.confFile->get_int("authnull", "tenant_id", 0);
-    authnull_api_url = GloVars.confFile->get_string("authnull", "api_url", "");
+    authnull_org_id = authnullEnvOrConfInt("AUTHNULL_ORG_ID", "authnull", "org_id", 0);
+    authnull_tenant_id = authnullEnvOrConfInt("AUTHNULL_TENANT_ID", "authnull", "tenant_id", 0);
+    authnull_api_url = authnullEnvOrConf("AUTHNULL_API_URL", "authnull", "api_url", "");
 }
 size_t WriteCallback(void *contents, size_t size, size_t nmemb, std::string *output) {
     size_t totalSize = size * nmemb;
