@@ -783,8 +783,15 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
     curl_slist_free_all(headers);
 
     if (res == CURLE_OK) {
-        syslog(LOG_INFO, "MFA API Response: %s", response.c_str());
-	syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());
+        // DO NOT LOG THE REQUEST OR THE RESPONSE BODY AT INFO. requestData carries
+        // {"token", authtoken}, which is a BEARER CREDENTIAL -- authn-service resolves it to a user
+        // identity in Redis, so whoever holds it can authenticate as that person through this proxy
+        // until it expires. It was written in full, pretty-printed, on every database login. The
+        // Postgres path in lib/PgSQL_Protocol.cpp carries the same note and the same fix.
+        //
+        // Full bodies stay available at LOG_DEBUG for debugging.
+        syslog(LOG_DEBUG, "[DEBUG] Full API response: %s", response.c_str());
+        syslog(LOG_INFO, "MFA API call completed for db '%s' (http %ld)", db_name.c_str(), http_code);
 
         if (http_code >= 200 && http_code < 300) {
             try {

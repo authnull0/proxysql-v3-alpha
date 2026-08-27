@@ -1132,14 +1132,42 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							// error. Anything that is not an explicit approval must deny.
 							if (!jsonResponse.contains("isValid") || !jsonResponse["isValid"].is_boolean()
 								|| jsonResponse["isValid"].get<bool>() != true) {
-								syslog(LOG_WARNING, "[WARNING] MFA refused by authn-service for user '%s' db '%s': %s",
-									clean_user.c_str(), db_name.c_str(), jsonResponse.dump().c_str());
+								// The message names the reason ("access to this database is blocked by
+								// policy", "no policy describes access to this database", ...). Dumping the
+								// whole response instead buried it in several hundred characters of empty
+								// dit scaffolding, which is how a clear refusal came to look like noise.
+								syslog(LOG_WARNING, "[WARNING] MFA refused by authn-service for user '%s' db '%s': %s (requestId=%s)",
+									clean_user.c_str(), db_name.c_str(),
+									jsonResponse.value("message", std::string("no message")).c_str(),
+									jsonResponse.value("requestId", std::string("-")).c_str());
 								throw std::runtime_error("Authentication refused by authn-service (isValid=false)");
 							}
 
-							syslog(LOG_INFO, "MFA API Response: %s", response.c_str());
-							syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());
-							syslog(LOG_INFO, "MFA Verified Successfully!");
+							// DO NOT LOG THE REQUEST OR THE RESPONSE BODY AT INFO.
+							//
+							// This used to be:
+							//
+							//	syslog(LOG_INFO, "MFA API Response: %s", response.c_str());
+							//	syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());
+							//
+							// The second one is the problem. requestData carries {"token", extra_data} --
+							// the session token the client supplied inside its username -- and that token
+							// is a BEARER CREDENTIAL: it is what authn-service resolves to a user identity
+							// in Redis, so anyone holding it can authenticate as that person through this
+							// proxy until it expires. It was being written in full, pretty-printed, at
+							// LOG_INFO, on every single database login.
+							//
+							// The response body was the historical reason to worry too, because it once
+							// carried the AES-encrypted backend password. That is gone now, but logging
+							// whole bodies at INFO is how the next secret added to either side ends up in
+							// syslog without anyone deciding to put it there.
+							//
+							// What remains is what an operator actually needs to correlate a login with an
+							// authn-service log line: who, which database, and the request id. The full
+							// body is still available at LOG_DEBUG above for anyone debugging.
+							syslog(LOG_INFO, "MFA approved for user '%s' db '%s' (requestId=%s)",
+								clean_user.c_str(), db_name.c_str(),
+								jsonResponse.value("requestId", std::string("-")).c_str());
 
 							// Privilege/masking payload. Historically this arrived as the DID/VC verifiable
 							// credential under ["credential"]["credentialSubject"]; the push-MFA endpoint is
