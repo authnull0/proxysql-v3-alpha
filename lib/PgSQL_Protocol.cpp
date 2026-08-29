@@ -8,6 +8,7 @@
 #include <syslog.h>
 extern "C" {
 #include "usual/time.h"
+#include <arpa/inet.h>
 }
 //#include "usual/time.c"
 
@@ -1048,6 +1049,16 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 					std::string ip = std::string(reinterpret_cast<char*>((*myds)->addr.addr));
 					std::string user_ip = getPublicIP3();
 					std::string key = clean_user + "_" + std::to_string(thread_session_i);
+
+					//Retrieve client ip address from which machine the connection is beign established
+					//(useful in pgAdmin)
+					char ipstr[INET6_ADDRSTRLEN];
+
+					sockaddr_in *s = (sockaddr_in *)&(*myds)->addr;
+
+					inet_ntop(AF_INET, &(s->sin_addr), ipstr, sizeof(ipstr));
+
+					std::string cli_ip = std::string(ipstr);
 					
 					// Retrieve the stored extra data
 					std::string extra_data;
@@ -1081,6 +1092,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							{"tenantId", authnull_tenant_id2},
 							{"dbUser", clean_user},
 							{"database_host", ip},
+							{"client_ip", cli_ip},
 							{"hostname", db_name},
 							{"databaseType", "postgres"},
 							{"databaseName", db_name},
@@ -1142,6 +1154,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 								try {
 									if (jsonResponse.contains("isValid") && jsonResponse["isValid"].get<bool>() == true) {
 										syslog(LOG_INFO, "MFA Verified Successfully!");
+										
 										
 										// Parse and map response data
 										if (jsonResponse.contains("credential") && 
