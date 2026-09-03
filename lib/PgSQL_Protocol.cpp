@@ -719,22 +719,20 @@ char* extract_password(const pgsql_hdr* hdr, uint32_t* len) {
 
 using json = nlohmann::json;
 
-// Global data structures for user access control and session management
+// Global data structures for user access control and session management.
+// Guarded by mfa_state_mutex2 -- see PgSQL_Protocol.h.
+std::mutex mfa_state_mutex2;
 std::unordered_map<std::string, std::vector<std::string>> user_database_access2;
 std::unordered_map<std::string, std::string> session_to_usertype2;
 std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies2;
 std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges2;
 std::unordered_map<std::string, std::string> session_extra_data_map2;
 
-// Fixed key for AES-256 - MUST match the Go key exactly
-const std::string KEY_STRING2 = "84sF#v7Fpt!L#PesYb^AezXrUn2kE%5v";
-const int KEY_SIZE_BYTES2 = 32; // AES-256 key size
-const int BLOCK_SIZE_BYTES2 = 16; // AES block size
-
 // AuthNull configuration variables
 int authnull_org_id2;
 int authnull_tenant_id2;
 std::string authnull_api_url2;
+std::string authnull_ca_path2;
 
 /**
  * @brief Generate a unique session ID
@@ -748,94 +746,57 @@ std::string generateSessionID2() {
 }
 
 /**
- * @brief Get public IP address of the server
- * @return IP address as string
+ * @brief Get the public IP address of this proxy.
+ *
+ * Resolved at most once per process and cached: this used to hit
+ * https://api.ipify.org on the login path of every single connection, which
+ * added a round trip to an unrelated third party to every authentication and
+ * turned an ipify outage into a login outage.
+ *
+ * The address can be pinned in proxysql.cnf as authnull.public_ip to avoid the
+ * outbound lookup entirely.
+ *
+ * @return IP address as string (empty if it could not be determined)
  */
 std::string getPublicIP3() {
-    CURL *curl;
-    CURLcode res;
-    std::string readBuffer;
+    static std::string cached_ip;
+    static std::once_flag resolve_once;
 
-    curl = curl_easy_init();
-    if (curl) {
+    std::call_once(resolve_once, []() {
+        cached_ip = GloVars.confFile->get_string("authnull", "public_ip", "");
+        if (!cached_ip.empty()) {
+            syslog(LOG_INFO, "[INFO] Using configured authnull.public_ip=%s", cached_ip.c_str());
+            return;
+        }
+
+        CURL *curl = curl_easy_init();
+        if (!curl) {
+            syslog(LOG_WARNING, "[WARNING] CURL init failed while resolving public IP");
+            return;
+        }
+
+        std::string readBuffer;
         curl_easy_setopt(curl, CURLOPT_URL, "https://api.ipify.org");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, 
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
             +[](void *ptr, size_t size, size_t nmemb, std::string *data) -> size_t {
                 data->append((char *)ptr, size * nmemb);
                 return size * nmemb;
             });
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        res = curl_easy_perform(curl);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
+        CURLcode res = curl_easy_perform(curl);
         curl_easy_cleanup(curl);
-    }
-    return readBuffer;
-}
 
-/**
- * @brief Helper function to convert byte array to hex string
- */
-std::string bytes_to_hex2(const unsigned char* bytes, int len) {
-    std::stringstream ss;
-    ss << std::hex << std::setfill('0');
-    for (int i = 0; i < len; ++i) {
-        ss << std::setw(2) << static_cast<int>(bytes[i]);
-    }
-    return ss.str();
-}
+        if (res != CURLE_OK) {
+            syslog(LOG_WARNING, "[WARNING] Public IP lookup failed: %s", curl_easy_strerror(res));
+            return;
+        }
+        cached_ip = readBuffer;
+        syslog(LOG_INFO, "[INFO] Resolved public IP once for this process: %s", cached_ip.c_str());
+    });
 
-/**
- * @brief Helper function to convert hex string to byte vector
- */
-std::vector<unsigned char> hex_to_bytes2(const std::string& hex) {
-    std::vector<unsigned char> bytes;
-    for (size_t i = 0; i < hex.length(); i += 2) {
-        std::string byteString = hex.substr(i, 2);
-        unsigned char byte = (unsigned char)stoi(byteString, nullptr, 16);
-        bytes.push_back(byte);
-    }
-    return bytes;
-}
-
-/**
- * @brief Decrypt data from Go OpenSSL
- */
-std::string DecryptFromGoOpenSSL2(const std::string &encryptedHex) {
-    std::vector<unsigned char> ciphertext_with_iv = hex_to_bytes2(encryptedHex);
-    if (ciphertext_with_iv.size() < BLOCK_SIZE_BYTES2) {
-        std::cerr << "Error: Ciphertext too short!" << std::endl;
-        return "";
-    }
-
-    std::vector<unsigned char> iv(ciphertext_with_iv.begin(), ciphertext_with_iv.begin() + BLOCK_SIZE_BYTES2);
-    std::vector<unsigned char> ciphertext(ciphertext_with_iv.begin() + BLOCK_SIZE_BYTES2, ciphertext_with_iv.end());
-    std::vector<unsigned char> decrypted_text(ciphertext.size());
-
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        throw std::runtime_error("EVP_CIPHER_CTX_new failed");
-    }
-
-    if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cfb(), nullptr, (const unsigned char*)KEY_STRING2.data(), iv.data())) {
-        EVP_CIPHER_CTX_free(ctx);
-        throw std::runtime_error("EVP_DecryptInit_ex failed");
-    }
-
-    int len;
-    if (1 != EVP_DecryptUpdate(ctx, decrypted_text.data(), &len, ciphertext.data(), ciphertext.size())) {
-        EVP_CIPHER_CTX_free(ctx);
-        throw std::runtime_error("EVP_DecryptUpdate failed");
-    }
-    int decrypted_len = len;
-
-    if (1 != EVP_DecryptFinal_ex(ctx, decrypted_text.data() + len, &len)) {
-        EVP_CIPHER_CTX_free(ctx);
-        throw std::runtime_error("EVP_DecryptFinal_ex failed");
-    }
-    decrypted_len += len;
-
-    EVP_CIPHER_CTX_free(ctx);
-
-    return std::string(decrypted_text.begin(), decrypted_text.begin() + decrypted_len);
+    return cached_ip;
 }
 
 /**
@@ -856,6 +817,37 @@ void loadAuthNullConfig2() {
     authnull_org_id2 = GloVars.confFile->get_int("authnull", "org_id", 0);
     authnull_tenant_id2 = GloVars.confFile->get_int("authnull", "tenant_id", 0);
     authnull_api_url2 = GloVars.confFile->get_string("authnull", "api_url", "");
+    // Optional. TLS verification is on; leave this empty for a publicly-signed
+    // api_url and curl uses the system CA bundle. Set it to a PEM bundle only
+    // for an on-prem CA, which is the case that would otherwise fail to verify.
+    authnull_ca_path2 = GloVars.confFile->get_string("authnull", "ca_path", "");
+
+    // Database MFA cannot work under SCRAM, and the failure mode is misleading.
+    //
+    // The design hands the user a one-time token and never gives them the
+    // database password -- the agent generates it and writes it into
+    // pgsql_users. SCRAM is mutual proof: the client computes its proof over
+    // whatever it thinks the password is, and the server cannot elect to skip
+    // that. The client proves the token while ProxySQL holds the generated
+    // password, so the proofs can never match and no amount of parsing helps.
+    //
+    // Left unsaid, this surfaces as "SASL authentication failed", which sends
+    // whoever hits it to check credentials -- where they will find nothing
+    // wrong. Say it once, loudly, naming the variable to change.
+    if (!authnull_api_url2.empty() &&
+        (AUTHENTICATION_METHOD)pgsql_thread___authentication_method != AUTHENTICATION_METHOD::CLEAR_TEXT_PASSWORD) {
+        static std::once_flag warned;
+        std::call_once(warned, [](){
+            openlog("AuthSQL", LOG_PID, LOG_DAEMON);
+            syslog(LOG_ERR,
+                "[ERROR] [authnull] api_url is configured but pgsql_variables authentication_method is '%s'. "
+                "Database MFA requires CLEAR_TEXT_PASSWORD (authentication_method=1): the client is issued a "
+                "one-time token and never holds the database password, so a SCRAM proof can never match. "
+                "Every login will fail as 'SASL authentication failed' until this is changed. "
+                "Because the token then crosses the wire in cleartext, terminate TLS in front of the proxy.",
+                AUTHENTICATION_METHOD_STR[pgsql_thread___authentication_method]);
+        });
+    }
 }
 
 /**
@@ -903,7 +895,6 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
     std::string full_username;
     size_t comma_pos;
     std::string clean_user;
-	std::string pass2;
     std::string extra_data;
     std::string session_idp;
 	std::string username;
@@ -917,20 +908,46 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 
     full_username = std::string(user);
     comma_pos = full_username.find(',');
+	thread_session_i = (*myds)->sess->thread_session_id;
 	if (comma_pos == std::string::npos || comma_pos == full_username.length() - 1) {
-		syslog(LOG_ERR, "[ERROR] Invalid username format for: %s", full_username.c_str());
-		std::cout << "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.\n";
-		ret = EXECUTION_STATE::FAILED;
-		goto __exit_process_pkt_handshake_response;
+		// No comma. Before rejecting, check whether we are the ones who removed
+		// it: this function is re-entered for the client's password packet, and
+		// the branch below rewrites PG_USER in place with the comma stripped.
+		// On that second pass the token is already stashed, so recover it
+		// instead of failing a username we truncated ourselves.
+		//
+		// Without this, every password-based login dies here on the second
+		// pass -- performMFA is never reached and no approval can ever
+		// succeed, which looks like a credential problem rather than a bug.
+		bool stashed = false;
+		{
+			std::lock_guard<std::mutex> tok_lock(session_extra_data_mutex);
+			auto it = session_extra_data_map.find(full_username + "_" + std::to_string(thread_session_i));
+			if (it != session_extra_data_map.end()) {
+				extra_data = it->second;
+				stashed = true;
+			}
+		}
+		if (!stashed) {
+			syslog(LOG_ERR, "[ERROR] Invalid username format for: %s", full_username.c_str());
+			std::cout << "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.\n";
+			ret = EXECUTION_STATE::FAILED;
+			goto __exit_process_pkt_handshake_response;
+		}
+		clean_user = full_username;
+		username = clean_user;
+	} else {
+		clean_user = full_username.substr(0, comma_pos);
+		extra_data = full_username.substr(comma_pos + 1);
+
+		username = clean_user;
+		{
+			std::lock_guard<std::mutex> tok_lock(session_extra_data_mutex);
+			session_extra_data_map[clean_user + "_" + std::to_string(thread_session_i)] = extra_data;
+		}
+		strncpy(user, clean_user.c_str(), clean_user.length());
+		user[clean_user.length()] = '\0';
 	}
-    clean_user = full_username.substr(0, comma_pos);
-    extra_data = full_username.substr(comma_pos + 1);
-    
-    username = clean_user;
-    thread_session_i = (*myds)->sess->thread_session_id;
-	session_extra_data_map[clean_user + "_" + std::to_string(thread_session_i)] = extra_data;
-	strncpy(user, clean_user.c_str(), clean_user.length());
-	user[clean_user.length()] = '\0'; 
 	password = GloPgAuth->lookup((char*)user, USERNAME_FRONTEND, &_ret_use_ssl, &default_hostgroup, &transaction_persistent, &fast_forward, &max_connections, &sha1_pass, &attributes);
 
 	if (password) {
@@ -1036,7 +1053,17 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 			}
 			if (user) {
 				if (clean_user == "admin") {
-					// Admin user follows normal authentication flow
+					// Admin user follows normal authentication flow: the password
+					// presented by the client is checked against the locally
+					// configured one. No AuthNull MFA for the admin interface.
+					if (strlen(password) == pass_len && strcmp(password, pass) == 0) {
+						ret = EXECUTION_STATE::SUCCESSFUL;
+					} else {
+						proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. Admin password mismatch.\n", (*myds), (*myds)->sess, user);
+						generate_error_packet(true, false, "password authentication failed",
+							PGSQL_ERROR_CODES::ERRCODE_INVALID_PASSWORD, true);
+					}
+					break;
 				} else {
 					loadAuthNullConfig2();
 					std::string db_name = "default_db";
@@ -1051,19 +1078,39 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 					
 					// Retrieve the stored extra data
 					std::string extra_data;
+						// Scoped tightly on purpose: the CURL call below blocks for up
+						// to 120s waiting on a human, and holding this mutex across it
+						// would serialise every concurrent login behind one approval.
+						{
+					std::lock_guard<std::mutex> tok_lock(session_extra_data_mutex);
 					auto it = session_extra_data_map.find(key);
 					if (it != session_extra_data_map.end()) {
 						extra_data = it->second;
+						// Consume it. This entry was never erased before, so every
+						// login leaked a token string for the life of the process.
+						// Erasing here also makes the token single-use at the proxy
+						// rather than leaving the backend's TTL as the only thing
+						// enforcing that. Safe at this point: the re-entry recovery
+						// in process_handshake_response_packet runs before the auth
+						// method is dispatched, so nothing reads the entry after us.
+						session_extra_data_map.erase(it);
 						syslog(LOG_INFO, "Found extra data for key %s", key.c_str());
 					} else {
 						syslog(LOG_WARNING, "Key %s not found in session_extra_data_map", key.c_str());
 					}
+						}
 					
 					CURL* curl = nullptr;
 					CURLcode res;
 					long http_code = 0;
 					std::string response = "";
 					struct curl_slist* headers = nullptr;
+
+					// Authoritative result of the AuthNull push. Stays false unless
+					// the service explicitly answers isValid:true, so every failure
+					// mode below (transport error, non-200, unparseable body,
+					// isValid:false, missing scope) denies the login.
+					bool mfa_approved = false;
 
 					try {
 						curl = curl_easy_init();
@@ -1099,13 +1146,20 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 						curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 						curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
-						curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+						// The push notification is answered by a human on a phone, so
+						// the request has to outlive the 60s approval window.
+						curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
 						curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-						curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 15L);
-						curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 50L);
-						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-						
+						// No LOW_SPEED_TIME/LOW_SPEED_LIMIT here: a request that is
+						// idle while waiting for the user to tap approve looks exactly
+						// like a stalled transfer, and would be aborted after 15s,
+						// making the timeout above meaningless.
+						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+						if (!authnull_ca_path2.empty()) {
+							curl_easy_setopt(curl, CURLOPT_CAINFO, authnull_ca_path2.c_str());
+						}
+
 						res = curl_easy_perform(curl);
 						if (res != CURLE_OK) {
 							syslog(LOG_ERR, "[ERROR] CURL request failed: %s", curl_easy_strerror(res));
@@ -1113,130 +1167,126 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						}
 						
 						curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-						syslog(LOG_INFO, "HTTP Status Code: %d", http_code);
+						syslog(LOG_INFO, "HTTP Status Code: %ld", http_code);
 						
 						if (http_code != 200) {
 							syslog(LOG_ERR, "[ERROR] AuthNull API returned non-200 status: %ld", http_code);
 							throw std::runtime_error("API returned non-200 status code");
 						}
 
-						// Parse JSON response
-						json jsonResponse;
-						try {
-							jsonResponse = json::parse(response);
-							syslog(LOG_INFO, "[INFO] Successfully parsed API response");
-							syslog(LOG_DEBUG, "[DEBUG] Full API response: %s", response.c_str());
-							
-							if (jsonResponse.contains("isValid")) {
-								bool isValid = jsonResponse["isValid"].get<bool>();
-								if (!isValid) {
-									syslog(LOG_WARNING, "[WARNING] Authentication rejected by API (isValid=false)");
-									throw std::runtime_error("Authentication rejected by API");
-								}
-							}
-							
-							syslog(LOG_INFO, "MFA API Response: %s", response.c_str());
-							syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());
+						// Parse JSON response.
+						//
+						// Response shape (all scope fields are top level, siblings of
+						// isValid -- there is no credential.credentialSubject wrapper
+						// and no encrypted password any more):
+						//   {"isValid": true,
+						//    "databaseName": "...",
+						//    "privilege": ["READ", ...],
+						//    "tables": ["...", ...],
+						//    "fieldMasking": {"<table>": ["<col>", ...]}}
+						json jsonResponse = json::parse(response);  // throws -> denied by the outer catch
+						syslog(LOG_INFO, "[INFO] Successfully parsed API response");
+						syslog(LOG_DEBUG, "[DEBUG] Full API response: %s", response.c_str());
+						syslog(LOG_INFO, "Request Sent: %s", requestData.dump(4).c_str());
 
-							if (http_code >= 200 && http_code < 300) {
-								try {
-									if (jsonResponse.contains("isValid") && jsonResponse["isValid"].get<bool>() == true) {
-										syslog(LOG_INFO, "MFA Verified Successfully!");
-										
-										// Parse and map response data
-										if (jsonResponse.contains("credential") && 
-											jsonResponse["credential"].contains("credentialSubject")) {
-											
-											auto& credential = jsonResponse["credential"]["credentialSubject"];
-
-											std::string mfa_db = credential["databaseName"].get<std::string>();
-											
-											// Extract privileges
-											std::vector<std::string> mfa_privileges;
-											if (credential.contains("privilege") && credential["privilege"].is_array()) {
-												mfa_privileges = credential["privilege"].get<std::vector<std::string>>();
-											}
-											
-											// Extract tables
-											std::vector<std::string> mfa_tables;
-											if (credential.contains("tables") && credential["tables"].is_array()) {
-												mfa_tables = credential["tables"].get<std::vector<std::string>>();
-											}
-											
-											// Update data structures
-											user_database_access2[username + "+" + db_name + "+" +std::to_string(thread_session_i)] = {mfa_db};
-											user_database_privileges2[username][mfa_db+"+"+std::to_string(thread_session_i)] = mfa_privileges;
-											
-											// Update masking policies
-											std::string key = username + "+" + db_name + "+" +std::to_string(thread_session_i);
-											std::map<std::string, std::vector<std::string>> masking_policy;
-											
-											if (credential.contains("fieldMasking") && credential["fieldMasking"].is_object()) {
-												auto& fieldMasking = credential["fieldMasking"];
-												
-												for (auto& table : mfa_tables) {
-													if (fieldMasking.contains(table)) {
-														masking_policy[table] = fieldMasking[table].get<std::vector<std::string>>();
-													} else {
-														masking_policy[table] = {};
-													}
-												}
-												
-												usertype_masking_policies2[key] = masking_policy;
-												session_to_usertype2[std::to_string(thread_session_i)] = key;
-											}
-											
-											syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s", 
-												username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
-											
-											// Get password from credential
-											if (credential.contains("password")) {
-												std::string password2 = credential["password"].get<std::string>();
-												syslog(LOG_INFO, "[INFO] Extracted password from API response");
-												
-												// Decrypt the credential
-												try {
-													std::string decrypted_pass = DecryptFromGoOpenSSL2(password2);
-													pass2 = decrypted_pass;
-												} catch (const std::exception& e) {
-													syslog(LOG_ERR, "[ERROR] Failed to decrypt credential: %s", e.what());
-												}
-											} else {
-												syslog(LOG_WARNING, "[WARNING] No password field in credential");
-											}
-										}
-									} else {
-										syslog(LOG_ERR, "MFA Failed! Response: %s", jsonResponse.dump(4).c_str());
-									}
-								} catch (json::exception &e) {
-									syslog(LOG_ERR, "JSON Parsing Error: %s | Response: %s", e.what(), response.c_str());
-								}
-							} else {
-								syslog(LOG_ERR, "HTTP Error: Status Code %ld, Response: %s", http_code, response.c_str());
-							}
-						} catch (const json::parse_error& e) {
-							syslog(LOG_ERR, "[ERROR] Failed to parse API response as JSON: %s", e.what());
-							throw;
+						if (!jsonResponse.contains("isValid") || !jsonResponse["isValid"].is_boolean()
+							|| jsonResponse["isValid"].get<bool>() != true) {
+							syslog(LOG_WARNING, "[WARNING] MFA not approved for user '%s' on database '%s' (isValid not true). Response: %s",
+								clean_user.c_str(), db_name.c_str(), response.c_str());
+							throw std::runtime_error("AuthNull MFA not approved (isValid is not true)");
 						}
+
+						syslog(LOG_INFO, "MFA Verified Successfully!");
+
+						// databaseName is required, and its absence is fatal.
+						//
+						// Since the client's password is no longer verified (the flat
+						// response carries none, so the old comparison against pass2
+						// could never pass and had to be bypassed), databaseName is the
+						// ONLY remaining constraint on this login. Falling back to the
+						// database the client asked for would not merely be lenient --
+						// it would remove the last check entirely.
+						//
+						// Our backend always sets databaseName on isValid:true, so this
+						// branch can only fire against a backend that is not ours.
+						if (!jsonResponse.contains("databaseName") || !jsonResponse["databaseName"].is_string()) {
+							syslog(LOG_ERR, "[ERROR] MFA approved for user '%s' but the response has no top-level 'databaseName'. Denying: this is the only remaining constraint on the login. Response: %s",
+								clean_user.c_str(), response.c_str());
+							throw std::runtime_error("AuthNull MFA response is missing databaseName");
+						}
+
+						{
+							std::string mfa_db = jsonResponse["databaseName"].get<std::string>();
+
+							// Extract privileges
+							std::vector<std::string> mfa_privileges;
+							if (jsonResponse.contains("privilege") && jsonResponse["privilege"].is_array()) {
+								mfa_privileges = jsonResponse["privilege"].get<std::vector<std::string>>();
+							}
+
+							// Extract tables
+							std::vector<std::string> mfa_tables;
+							if (jsonResponse.contains("tables") && jsonResponse["tables"].is_array()) {
+								mfa_tables = jsonResponse["tables"].get<std::vector<std::string>>();
+							}
+
+							// Update data structures
+							std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex2);
+							user_database_access2[username + "+" + db_name + "+" +std::to_string(thread_session_i)] = {mfa_db};
+							user_database_privileges2[username][mfa_db+"+"+std::to_string(thread_session_i)] = mfa_privileges;
+
+							// Update masking policies
+							std::string key = username + "+" + db_name + "+" +std::to_string(thread_session_i);
+							std::map<std::string, std::vector<std::string>> masking_policy;
+
+							if (jsonResponse.contains("fieldMasking") && jsonResponse["fieldMasking"].is_object()) {
+								auto& fieldMasking = jsonResponse["fieldMasking"];
+
+								for (auto& table : mfa_tables) {
+									if (fieldMasking.contains(table)) {
+										masking_policy[table] = fieldMasking[table].get<std::vector<std::string>>();
+									} else {
+										masking_policy[table] = {};
+									}
+								}
+
+								usertype_masking_policies2[key] = masking_policy;
+								session_to_usertype2[std::to_string(thread_session_i)] = key;
+							}
+
+							syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s",
+								username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
+						}
+
+						// Only reached when the service answered isValid:true and the
+						// response parsed cleanly. Any throw above skips this line and
+						// the gate below denies.
+						mfa_approved = true;
 					} catch (const std::exception& e) {
 						syslog(LOG_ERR, "[ERROR] Exception during authentication process: %s", e.what());
 					}
-					
+
 					if (curl) curl_easy_cleanup(curl);
 					if (headers) curl_slist_free_all(headers);
+
+					// The gate. AuthNull owns this decision: the push notification is
+					// what proves the user's identity, and the client-supplied
+					// password is deliberately NOT re-checked here -- the new response
+					// carries no database password, so there is nothing to compare it
+					// against. Anything other than an explicit isValid:true is a deny.
+					if (mfa_approved) {
+						syslog(LOG_INFO, "[INFO] AuthNull MFA approved login for user '%s' on database '%s'",
+							clean_user.c_str(), db_name.c_str());
+						ret = EXECUTION_STATE::SUCCESSFUL;
+					} else {
+						syslog(LOG_WARNING, "[WARNING] Denying login for user '%s' on database '%s': AuthNull MFA was not approved",
+							clean_user.c_str(), db_name.c_str());
+						proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. AuthNull MFA denied.\n", (*myds), (*myds)->sess, user);
+						generate_error_packet(true, false, "authentication failed: multi-factor approval was not granted",
+							PGSQL_ERROR_CODES::ERRCODE_INVALID_PASSWORD, true);
+						ret = EXECUTION_STATE::FAILED;
+					}
 				}
-			}
-			if (pass) {
-				free(pass);
-			}
-
-
-			pass = strdup(pass2.c_str());  // Replace client's password with yours
-			pass_len = pass2.length();
-
-			if (strlen(password) == pass_len && strcmp(password, pass) == 0) {
-				syslog(LOG_DEBUG, "Row Data: Processing 2");
-				ret = EXECUTION_STATE::SUCCESSFUL;
 			}
 		}
 		break;

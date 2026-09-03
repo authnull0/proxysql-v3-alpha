@@ -2348,6 +2348,9 @@ std::string generateSessionIDnew() {
     std::uniform_int_distribution<int> dist(100000, 999999);
     return std::to_string(dist(gen));
 }
+// Guards session_extra_data_map. Written by the protocol layer, read and
+// erased by the session layer, on different threads.
+std::mutex session_extra_data_mutex;
 std::unordered_map<std::string, std::string> session_extra_data_map;
 std::string session_idp;
 
@@ -2401,7 +2404,10 @@ bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned
         // Generate a session ID
         session_idp = generateSessionIDnew();
         {
-            session_extra_data_map[clean_user + "_" + session_idp] = extra_data;
+            {
+                std::lock_guard<std::mutex> tok_lock(session_extra_data_mutex);
+                session_extra_data_map[clean_user + "_" + session_idp] = extra_data;
+            }
         }
 
         // Modify the original packet (pkt) directly

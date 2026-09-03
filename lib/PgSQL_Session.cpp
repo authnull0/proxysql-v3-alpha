@@ -527,6 +527,10 @@ bool checkPermission2(const std::string& username, const std::string& query, con
     // Step 1: Determine the required privilege for the query
     std::string required_privilege = getQueryType2(query); // e.g., "READ", "WRITE", "EXECUTE"
     std::string key = username + "+" + databaseName + "+" +sessionId;
+    // This runs per query while other threads insert at login and erase at
+    // teardown. Held for the whole lookup because the privilege check below
+    // dereferences iterators into both maps.
+    std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex2);
     // Step 2: Check if the username has access to the specified database
     auto dbAccessIt = user_database_access2.find(key);
     if (dbAccessIt == user_database_access2.end() || 
@@ -568,6 +572,7 @@ std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession2(cons
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
 	std::string composite_key = user + "+" + db_name + "+" +sessionID;
 	syslog(LOG_DEBUG, "Looking up policy for session ID %s → key: %s", sessionID.c_str(), composite_key.c_str());
+	std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex2);
 	auto policy_it = usertype_masking_policies2.find(composite_key);
 	if (policy_it != usertype_masking_policies2.end()) {
 		syslog(LOG_DEBUG, "Retrieved masking policy for %s", composite_key.c_str());
@@ -1963,7 +1968,48 @@ void PgSQL_Session::reset() {
 	}
 }
 
+// Drop this session's MFA grant state.
+//
+// user_database_access2 and user_database_privileges2 are keyed with a
+// "+<thread_session_id>" suffix and were never erased, so each login left an
+// entry behind for the life of the process. They cannot be released when MFA
+// completes -- checkPermission2() reads them on every query -- so the session
+// teardown is the only correct place.
+//
+// thread_session_id comes from __sync_fetch_and_add on a global counter, so it
+// is monotonic and never reused; a stale entry could not have been matched by a
+// later connection. This is a leak, not a privilege carry-over.
+static void erase_session_mfa_state2(unsigned long long thread_session_id) {
+	std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex2);
+	const std::string suffix = "+" + std::to_string(thread_session_id);
+	const auto ends_with_suffix = [&suffix](const std::string& k) {
+		return k.size() > suffix.size() &&
+			k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0;
+	};
+
+	for (auto it = user_database_access2.begin(); it != user_database_access2.end(); ) {
+		it = ends_with_suffix(it->first) ? user_database_access2.erase(it) : std::next(it);
+	}
+	// Nested: outer key is the username and is shared across sessions, so only
+	// the inner "<db>+<session>" entries may be removed.
+	for (auto& per_user : user_database_privileges2) {
+		auto& by_db = per_user.second;
+		for (auto it = by_db.begin(); it != by_db.end(); ) {
+			it = ends_with_suffix(it->first) ? by_db.erase(it) : std::next(it);
+		}
+	}
+	// Only written when a grant carries fieldMasking, so these two leaked on
+	// approved logins specifically. Same composite key as the access map.
+	for (auto it = usertype_masking_policies2.begin(); it != usertype_masking_policies2.end(); ) {
+		it = ends_with_suffix(it->first) ? usertype_masking_policies2.erase(it) : std::next(it);
+	}
+	// Keyed by the bare session id, so this one is an exact match.
+	session_to_usertype2.erase(std::to_string(thread_session_id));
+}
+
 PgSQL_Session::~PgSQL_Session() {
+
+	erase_session_mfa_state2(thread_session_id);
 
 	reset(); // we moved this out to allow CHANGE_USER
 
@@ -5785,26 +5831,52 @@ void PgSQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 						openlog("AuthSQL", LOG_PID, LOG_DAEMON);
 						std::string key = user + "_" + session_idp;
 						std::string authtoken;
-						authtoken = session_extra_data_map[key];
-						if (true) { 
+						{
+							std::lock_guard<std::mutex> tok_lock(session_extra_data_mutex);
+							auto tok_it = session_extra_data_map.find(key);
+							authtoken = (tok_it != session_extra_data_map.end()) ? tok_it->second : std::string();
+						}
+						{
 							try {
-								std::vector<std::string>& databases = user_database_access2[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
+									// Copy, not a reference: a reference into the map would
+									// outlive the lock, and another thread's erase at
+									// session teardown could invalidate it.
+									std::vector<std::string> databases;
+									{
+										std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex2);
+										databases = user_database_access2[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
+									}
 								auto it = std::find(databases.begin(), databases.end(), db_name);
 								if (it == databases.end()) {
+									syslog(LOG_ERR, "Access denied: user '%s' has no MFA-granted access to database '%s'", user.c_str(), db_name.c_str());
+									client_authenticated = false;
+									*wrong_pass = true;
 									client_myds->DSS=STATE_QUERY_SENT_NET;
 									char *err_msg = (char *)"Access denied: User does not have access to this database";
 									client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
 									RequestEnd(NULL);
-									l_free(pkt->size, pkt->ptr);
-									break; 
+									// pkt was already freed before this switch; freeing it
+									// again corrupts the heap. A `break` here would also
+									// fall through to the free_users<=0 check and emit a
+									// second, misleading "Too many connections" error.
+									return;
 								}
-								syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
+								syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), authtoken.c_str()); // not map[key]: operator[] would re-insert what we just erased
 								unsigned long thread_session_id = client_myds->sess->thread_session_id;
 								syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
-								syslog(LOG_INFO, "Mapped username '%s' to session ID %d", user.c_str(), thread_session_id);
+								syslog(LOG_INFO, "Mapped username '%s' to session ID %lu", user.c_str(), thread_session_id);
 							} catch (const std::exception &e) {
-								syslog(LOG_ERR, "Error: %s", e.what());
-								exit(1); 
+								// Deny this login instead of exit(1): an exception on one
+								// connection's access check is not a reason to take down
+								// the whole proxy for every other session.
+								syslog(LOG_ERR, "Error during database access check for user '%s': %s. Denying login.", user.c_str(), e.what());
+								client_authenticated = false;
+								*wrong_pass = true;
+								client_myds->DSS=STATE_QUERY_SENT_NET;
+								char *err_msg = (char *)"Access denied: authorization check could not be completed";
+								client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
+								RequestEnd(NULL);
+								return;
 							}
 						}
 					}
