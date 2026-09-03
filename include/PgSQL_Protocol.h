@@ -1,6 +1,7 @@
 #ifndef __POSTGRES_PROTOCOL_H
 #define __POSTGRES_PROTOCOL_H
 
+#include <mutex>
 #include "proxysql.h"
 #include "gen_utils.h"
 #include "MySQL_Protocol.h"
@@ -11,6 +12,12 @@ extern std::map<std::string, std::vector<std::string>> query_tables_fields2;
 extern std::string current_query_table2;
 extern std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map2;
 
+// MFA grant state, shared across threads. Written once per login, read on
+// every query, and erased at session teardown -- so concurrent find() and
+// erase() from different threads is reachable in normal operation, and on
+// std::unordered_map that is undefined behaviour rather than merely racy.
+// Take this mutex for ANY access to the four maps below.
+extern std::mutex mfa_state_mutex2;
 extern std::unordered_map<std::string, std::vector<std::string>> user_database_access2;
 extern std::unordered_map<std::string, std::string> session_to_usertype2;
 extern std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies2;

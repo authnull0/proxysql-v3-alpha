@@ -719,7 +719,9 @@ char* extract_password(const pgsql_hdr* hdr, uint32_t* len) {
 
 using json = nlohmann::json;
 
-// Global data structures for user access control and session management
+// Global data structures for user access control and session management.
+// Guarded by mfa_state_mutex2 -- see PgSQL_Protocol.h.
+std::mutex mfa_state_mutex2;
 std::unordered_map<std::string, std::vector<std::string>> user_database_access2;
 std::unordered_map<std::string, std::string> session_to_usertype2;
 std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies2;
@@ -819,6 +821,33 @@ void loadAuthNullConfig2() {
     // api_url and curl uses the system CA bundle. Set it to a PEM bundle only
     // for an on-prem CA, which is the case that would otherwise fail to verify.
     authnull_ca_path2 = GloVars.confFile->get_string("authnull", "ca_path", "");
+
+    // Database MFA cannot work under SCRAM, and the failure mode is misleading.
+    //
+    // The design hands the user a one-time token and never gives them the
+    // database password -- the agent generates it and writes it into
+    // pgsql_users. SCRAM is mutual proof: the client computes its proof over
+    // whatever it thinks the password is, and the server cannot elect to skip
+    // that. The client proves the token while ProxySQL holds the generated
+    // password, so the proofs can never match and no amount of parsing helps.
+    //
+    // Left unsaid, this surfaces as "SASL authentication failed", which sends
+    // whoever hits it to check credentials -- where they will find nothing
+    // wrong. Say it once, loudly, naming the variable to change.
+    if (!authnull_api_url2.empty() &&
+        (AUTHENTICATION_METHOD)pgsql_thread___authentication_method != AUTHENTICATION_METHOD::CLEAR_TEXT_PASSWORD) {
+        static std::once_flag warned;
+        std::call_once(warned, [](){
+            openlog("AuthSQL", LOG_PID, LOG_DAEMON);
+            syslog(LOG_ERR,
+                "[ERROR] [authnull] api_url is configured but pgsql_variables authentication_method is '%s'. "
+                "Database MFA requires CLEAR_TEXT_PASSWORD (authentication_method=1): the client is issued a "
+                "one-time token and never holds the database password, so a SCRAM proof can never match. "
+                "Every login will fail as 'SASL authentication failed' until this is changed. "
+                "Because the token then crosses the wire in cleartext, terminate TLS in front of the proxy.",
+                AUTHENTICATION_METHOD_STR[pgsql_thread___authentication_method]);
+        });
+    }
 }
 
 /**
@@ -890,22 +919,32 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 		// Without this, every password-based login dies here on the second
 		// pass -- performMFA is never reached and no approval can ever
 		// succeed, which looks like a credential problem rather than a bug.
-		auto it = session_extra_data_map.find(full_username + "_" + std::to_string(thread_session_i));
-		if (it == session_extra_data_map.end()) {
+		bool stashed = false;
+		{
+			std::lock_guard<std::mutex> tok_lock(session_extra_data_mutex);
+			auto it = session_extra_data_map.find(full_username + "_" + std::to_string(thread_session_i));
+			if (it != session_extra_data_map.end()) {
+				extra_data = it->second;
+				stashed = true;
+			}
+		}
+		if (!stashed) {
 			syslog(LOG_ERR, "[ERROR] Invalid username format for: %s", full_username.c_str());
 			std::cout << "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.\n";
 			ret = EXECUTION_STATE::FAILED;
 			goto __exit_process_pkt_handshake_response;
 		}
 		clean_user = full_username;
-		extra_data = it->second;
 		username = clean_user;
 	} else {
 		clean_user = full_username.substr(0, comma_pos);
 		extra_data = full_username.substr(comma_pos + 1);
 
 		username = clean_user;
-		session_extra_data_map[clean_user + "_" + std::to_string(thread_session_i)] = extra_data;
+		{
+			std::lock_guard<std::mutex> tok_lock(session_extra_data_mutex);
+			session_extra_data_map[clean_user + "_" + std::to_string(thread_session_i)] = extra_data;
+		}
 		strncpy(user, clean_user.c_str(), clean_user.length());
 		user[clean_user.length()] = '\0';
 	}
@@ -1039,6 +1078,11 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 					
 					// Retrieve the stored extra data
 					std::string extra_data;
+						// Scoped tightly on purpose: the CURL call below blocks for up
+						// to 120s waiting on a human, and holding this mutex across it
+						// would serialise every concurrent login behind one approval.
+						{
+					std::lock_guard<std::mutex> tok_lock(session_extra_data_mutex);
 					auto it = session_extra_data_map.find(key);
 					if (it != session_extra_data_map.end()) {
 						extra_data = it->second;
@@ -1054,6 +1098,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 					} else {
 						syslog(LOG_WARNING, "Key %s not found in session_extra_data_map", key.c_str());
 					}
+						}
 					
 					CURL* curl = nullptr;
 					CURLcode res;
@@ -1186,6 +1231,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							}
 
 							// Update data structures
+							std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex2);
 							user_database_access2[username + "+" + db_name + "+" +std::to_string(thread_session_i)] = {mfa_db};
 							user_database_privileges2[username][mfa_db+"+"+std::to_string(thread_session_i)] = mfa_privileges;
 

@@ -629,6 +629,10 @@ void MySQL_Session::set_status(enum session_status e) {
 
 
 static std::unordered_map<std::string, unsigned long> username_session_map;
+// Guards the four MFA state maps below: written at login, read per query,
+// erased at teardown, all from different threads. Concurrent find()/erase()
+// on std::unordered_map is undefined behaviour, not merely racy.
+std::mutex mfa_state_mutex;
 std::unordered_map<std::string, std::vector<std::string>> user_database_access;
 std::unordered_map<std::string, std::string> session_to_usertype;
 std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies;
@@ -798,6 +802,7 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
                     }
 
                     // Update data structures
+                    std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex);
                     user_database_access[username + "+" + db_name + "+" +std::to_string(thread_session_i)] = {mfa_db};
                     user_database_privileges[username][mfa_db+"+"+std::to_string(thread_session_i)] = mfa_privileges;
 
@@ -1001,6 +1006,9 @@ bool checkPermission(const std::string& username, const std::string& query, cons
     // Step 1: Determine the required privilege for the query
     std::string required_privilege = getQueryType(query); // e.g., "READ", "WRITE", "EXECUTE"
     std::string key = username + "+" + databaseName + "+" +sessionId;
+    // Per-query, concurrent with logins and teardowns on other threads. Held
+    // for the whole lookup because the checks below dereference iterators.
+    std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex);
     // Step 2: Check if the username has access to the specified database
     auto dbAccessIt = user_database_access.find(key);
     if (dbAccessIt == user_database_access.end() || 
@@ -1042,6 +1050,7 @@ std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
 	std::string composite_key = user + "+" + db_name + "+" +sessionID;
 	syslog(LOG_DEBUG, "Looking up policy for session ID %s → key: %s", sessionID.c_str(), composite_key.c_str());
+	std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex);
 	auto policy_it = usertype_masking_policies.find(composite_key);
 	if (policy_it != usertype_masking_policies.end()) {
 		syslog(LOG_DEBUG, "Retrieved masking policy for %s", composite_key.c_str());
@@ -2318,6 +2327,7 @@ void MySQL_Session::reset() {
 // cannot be released when MFA completes because checkPermission() reads them on
 // every query.
 static void erase_session_mfa_state(unsigned long long thread_session_id) {
+	std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex);
 	const std::string suffix = "+" + std::to_string(thread_session_id);
 	const auto ends_with_suffix = [&suffix](const std::string& k) {
 		return k.size() > suffix.size() &&
@@ -7153,12 +7163,21 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 							{
 								openlog("AuthSQL", LOG_PID, LOG_DAEMON);
 								std::string key = user + "_" + session_idp;
-								authtoken = session_extra_data_map[key];
-								// Consume it: this entry was never erased, so every
-								// login leaked a token string for the life of the
-								// process. Erasing also makes the token single-use at
-								// the proxy instead of relying on the backend TTL.
-								session_extra_data_map.erase(key);
+								{
+									// Read and consume under one lock. This entry was
+									// never erased, so every login leaked a token
+									// string for the life of the process; erasing also
+									// makes the token single-use at the proxy instead
+									// of relying on the backend TTL.
+									std::lock_guard<std::mutex> tok_lock(session_extra_data_mutex);
+									auto tok_it = session_extra_data_map.find(key);
+									if (tok_it != session_extra_data_map.end()) {
+										authtoken = tok_it->second;
+										session_extra_data_map.erase(tok_it);
+									} else {
+										authtoken.clear();
+									}
+								}
 								if (mfa_status_map.find(rand_session_id) == mfa_status_map.end()) {
 									try {
 										if (!performMFA(user_ip, connection_ip, user, db_name, authtoken,thread_session_id)) {
@@ -7181,7 +7200,14 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 											// heap, so the deny path must not repeat it.
 											return;
 										}
-										std::vector<std::string>& databases = user_database_access[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
+										// Copy, not a reference: a reference into the map
+										// would outlive the lock, and another thread's
+										// erase at teardown could invalidate it.
+										std::vector<std::string> databases;
+										{
+											std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex);
+											databases = user_database_access[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
+										}
 										auto it = std::find(databases.begin(), databases.end(), db_name);
 										if (it == databases.end()) {
 											syslog(LOG_ERR, "Access denied: user '%s' has no MFA-granted access to database '%s'", user.c_str(), db_name.c_str());
@@ -7197,7 +7223,7 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 											// misleading "Too many connections" error.
 											return;
 										}
-										syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
+										syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), authtoken.c_str()); // not map[key]: operator[] would re-insert what we just erased
 										unsigned long thread_session_id = client_myds->sess->thread_session_id;
 										syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
 										syslog(LOG_INFO, "Mapped username '%s' to session ID %lu", user.c_str(), thread_session_id);

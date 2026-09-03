@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <random>
+extern std::mutex session_extra_data_mutex;
 extern std::unordered_map<std::string, std::string> session_extra_data_map;
 extern std::string session_idp;
 #define RESULTSET_BUFLEN 16300

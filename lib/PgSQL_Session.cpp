@@ -527,6 +527,10 @@ bool checkPermission2(const std::string& username, const std::string& query, con
     // Step 1: Determine the required privilege for the query
     std::string required_privilege = getQueryType2(query); // e.g., "READ", "WRITE", "EXECUTE"
     std::string key = username + "+" + databaseName + "+" +sessionId;
+    // This runs per query while other threads insert at login and erase at
+    // teardown. Held for the whole lookup because the privilege check below
+    // dereferences iterators into both maps.
+    std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex2);
     // Step 2: Check if the username has access to the specified database
     auto dbAccessIt = user_database_access2.find(key);
     if (dbAccessIt == user_database_access2.end() || 
@@ -568,6 +572,7 @@ std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession2(cons
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
 	std::string composite_key = user + "+" + db_name + "+" +sessionID;
 	syslog(LOG_DEBUG, "Looking up policy for session ID %s → key: %s", sessionID.c_str(), composite_key.c_str());
+	std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex2);
 	auto policy_it = usertype_masking_policies2.find(composite_key);
 	if (policy_it != usertype_masking_policies2.end()) {
 		syslog(LOG_DEBUG, "Retrieved masking policy for %s", composite_key.c_str());
@@ -1975,6 +1980,7 @@ void PgSQL_Session::reset() {
 // is monotonic and never reused; a stale entry could not have been matched by a
 // later connection. This is a leak, not a privilege carry-over.
 static void erase_session_mfa_state2(unsigned long long thread_session_id) {
+	std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex2);
 	const std::string suffix = "+" + std::to_string(thread_session_id);
 	const auto ends_with_suffix = [&suffix](const std::string& k) {
 		return k.size() > suffix.size() &&
@@ -5825,10 +5831,21 @@ void PgSQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 						openlog("AuthSQL", LOG_PID, LOG_DAEMON);
 						std::string key = user + "_" + session_idp;
 						std::string authtoken;
-						authtoken = session_extra_data_map[key];
+						{
+							std::lock_guard<std::mutex> tok_lock(session_extra_data_mutex);
+							auto tok_it = session_extra_data_map.find(key);
+							authtoken = (tok_it != session_extra_data_map.end()) ? tok_it->second : std::string();
+						}
 						{
 							try {
-								std::vector<std::string>& databases = user_database_access2[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
+									// Copy, not a reference: a reference into the map would
+									// outlive the lock, and another thread's erase at
+									// session teardown could invalidate it.
+									std::vector<std::string> databases;
+									{
+										std::lock_guard<std::mutex> mfa_lock(mfa_state_mutex2);
+										databases = user_database_access2[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
+									}
 								auto it = std::find(databases.begin(), databases.end(), db_name);
 								if (it == databases.end()) {
 									syslog(LOG_ERR, "Access denied: user '%s' has no MFA-granted access to database '%s'", user.c_str(), db_name.c_str());
@@ -5844,7 +5861,7 @@ void PgSQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 									// second, misleading "Too many connections" error.
 									return;
 								}
-								syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
+								syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), authtoken.c_str()); // not map[key]: operator[] would re-insert what we just erased
 								unsigned long thread_session_id = client_myds->sess->thread_session_id;
 								syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
 								syslog(LOG_INFO, "Mapped username '%s' to session ID %lu", user.c_str(), thread_session_id);
