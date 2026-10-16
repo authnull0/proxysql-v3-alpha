@@ -731,6 +731,10 @@ const std::string KEY_STRING2 = "84sF#v7Fpt!L#PesYb^AezXrUn2kE%5v";
 const int KEY_SIZE_BYTES2 = 32; // AES-256 key size
 const int BLOCK_SIZE_BYTES2 = 16; // AES block size
 
+// Logged on every AuthNull PgSQL login so an operator can confirm which build
+// is running after an update. Bump it whenever this auth flow changes.
+static const char* AUTHNULL_PGSQL_BUILD = "policy-allow-v1 (2026-10-16)";
+
 // AuthNull configuration variables
 int authnull_org_id2;
 int authnull_tenant_id2;
@@ -1044,6 +1048,8 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 					if (db != nullptr) {
 						db_name = std::string(db);
 					}
+					syslog(LOG_INFO, "[INFO] AuthNull PgSQL auth build %s: login for user '%s' db '%s'",
+						AUTHNULL_PGSQL_BUILD, clean_user.c_str(), db_name.c_str());
 					uint32_t thread_session_i = (*myds)->sess->thread_session_id;
 					std::string ip = std::string(reinterpret_cast<char*>((*myds)->addr.addr));
 					std::string user_ip = getPublicIP3();
