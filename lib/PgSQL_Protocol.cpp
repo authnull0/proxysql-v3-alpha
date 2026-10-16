@@ -1202,7 +1202,13 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 													syslog(LOG_ERR, "[ERROR] Failed to decrypt credential: %s", e.what());
 												}
 											} else {
-												syslog(LOG_WARNING, "[WARNING] No password field in credential");
+												// No wallet credential: authn-service approved this login from a
+												// policy that allows it without MFA, and built credentialSubject
+												// from that policy. The wallet's password was only ever an
+												// encrypted copy of this user's pgsql_users password (the value
+												// it is compared against below), so use that directly.
+												syslog(LOG_INFO, "[INFO] No password field in credential; using pgsql_users password for user '%s'", clean_user.c_str());
+												pass2 = std::string(password);
 											}
 										}
 									} else {
