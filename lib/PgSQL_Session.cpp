@@ -401,25 +401,6 @@ std::vector<std::regex> read_patterns2;
 std::vector<std::regex> write_patterns2;
 std::vector<std::regex> execute_patterns2;
 
-std::string getPublicIP2() {
-    CURL *curl;
-    CURLcode res;
-    std::string readBuffer;
-
-    curl = curl_easy_init();
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "https://api.ipify.org");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, 
-            +[](void *ptr, size_t size, size_t nmemb, std::string *data) -> size_t {
-                data->append((char *)ptr, size * nmemb);
-                return size * nmemb;
-            });
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        res = curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
-    }
-    return readBuffer;
-}
 
 
 std::vector<std::string> read_pattern_strs2 = {
