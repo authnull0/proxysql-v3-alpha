@@ -2,6 +2,7 @@
 #include <openssl/rand.h>
 #include "proxysql.h"
 #include "cpp.h"
+#include "authnull_net.h"
 #include "PgSQL_Authentication.h"
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_Protocol.h"
@@ -731,6 +732,9 @@ std::unordered_map<std::string, std::string> session_extra_data_map2;
 int authnull_org_id2;
 int authnull_tenant_id2;
 std::string authnull_api_url2;
+// The proxy's own address, sent as database_host. Empty means the local end of each client's
+// connection (see authnull_net.h).
+std::string authnull_proxy_address2;
 
 /**
  * @brief Generate a unique session ID
@@ -747,25 +751,6 @@ std::string generateSessionID2() {
  * @brief Get public IP address of the server
  * @return IP address as string
  */
-std::string getPublicIP3() {
-    CURL *curl;
-    CURLcode res;
-    std::string readBuffer;
-
-    curl = curl_easy_init();
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "https://api.ipify.org");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, 
-            +[](void *ptr, size_t size, size_t nmemb, std::string *data) -> size_t {
-                data->append((char *)ptr, size * nmemb);
-                return size * nmemb;
-            });
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        res = curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
-    }
-    return readBuffer;
-}
 
 /**
  * @brief Helper function to convert byte array to hex string
@@ -840,6 +825,7 @@ void loadAuthNullConfig2() {
     authnull_org_id2 = authnullEnvOrConfInt("AUTHNULL_ORG_ID", "authnull", "org_id", 0);
     authnull_tenant_id2 = authnullEnvOrConfInt("AUTHNULL_TENANT_ID", "authnull", "tenant_id", 0);
     authnull_api_url2 = authnullEnvOrConf("AUTHNULL_API_URL", "authnull", "api_url", "");
+    authnull_proxy_address2 = authnullEnvOrConf("AUTHNULL_PROXY_ADDRESS", "authnull", "proxy_address", "");
     // get_int/get_string swallow a missing [authnull] section and hand back the default,
     // so an unconfigured proxy would otherwise fail every login with only a curl error.
     if (authnull_api_url2.empty() || authnull_org_id2 == 0 || authnull_tenant_id2 == 0) {
@@ -1041,8 +1027,16 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						db_name = std::string(db);
 					}
 					uint32_t thread_session_i = (*myds)->sess->thread_session_id;
-					std::string ip = std::string(reinterpret_cast<char*>((*myds)->addr.addr));
-					std::string user_ip = getPublicIP3();
+					// userIp is the CLIENT and database_host the PROXY, as on the MySQL path. This path
+					// used to send them the other way round -- the proxy's public address (from an
+					// api.ipify.org lookup) as userIp -- so AuthNull's network conditions compared
+					// the proxy instead of the user, and the MFA prompt named the client as the
+					// gateway. See authnull_net.h.
+					std::string client_ip = authnullPeerAddress((*myds)->fd);
+					if (client_ip.empty() && (*myds)->addr.addr != nullptr) {
+						client_ip = std::string(reinterpret_cast<char*>((*myds)->addr.addr));
+					}
+					std::string proxy_ip = authnullProxyAddress(authnull_proxy_address2, (*myds)->fd);
 					std::string key = clean_user + "_" + std::to_string(thread_session_i);
 					
 					// Retrieve the stored extra data
@@ -1072,11 +1066,11 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						nlohmann::json requestData = {
 							{"credentialType", "DATABASE"},
 							{"requestId", ""},
-							{"userIp", user_ip},
+							{"userIp", client_ip},
 							{"orgId", authnull_org_id2},
 							{"tenantId", authnull_tenant_id2},
 							{"dbUser", clean_user},
-							{"database_host", ip},
+							{"database_host", proxy_ip},
 							{"hostname", db_name},
 							{"databaseType", "postgres"},
 							{"databaseName", db_name},

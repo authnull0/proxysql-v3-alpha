@@ -18,7 +18,6 @@ extern std::string latestUser;
 
 std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const std::string& user,const std::string& db_name,const std::string& sessionID);
 
-std::string getPublicIP();
 bool performMFA(std::string user_ip, std::string user_device_ip, std::string user, std::string db_name);
 #include <functional>
 #include <vector>

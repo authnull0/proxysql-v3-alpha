@@ -4,6 +4,7 @@ using json = nlohmann::json;
 
 #include "MySQL_HostGroups_Manager.h"
 #include "MySQL_Thread.h"
+#include "authnull_net.h"
 #include "proxysql.h"
 #include "cpp.h"
 #include "proxysql_utils.h"
@@ -650,6 +651,9 @@ std::string authtoken;
 int authnull_org_id;
 int authnull_tenant_id;
 std::string authnull_api_url;
+// The proxy's own address, sent as database_host. Empty means the local end of each client's
+// connection (see authnull_net.h).
+std::string authnull_proxy_address;
 #include <cstdlib>
 #include <climits>
 #include <cerrno>
@@ -696,6 +700,7 @@ void loadAuthNullConfig() {
     authnull_org_id = authnullEnvOrConfInt("AUTHNULL_ORG_ID", "authnull", "org_id", 0);
     authnull_tenant_id = authnullEnvOrConfInt("AUTHNULL_TENANT_ID", "authnull", "tenant_id", 0);
     authnull_api_url = authnullEnvOrConf("AUTHNULL_API_URL", "authnull", "api_url", "");
+    authnull_proxy_address = authnullEnvOrConf("AUTHNULL_PROXY_ADDRESS", "authnull", "proxy_address", "");
     // get_int/get_string swallow a missing [authnull] section and hand back the default,
     // so an unconfigured proxy would otherwise fail every login with only a curl error.
     if (authnull_api_url.empty() || authnull_org_id == 0 || authnull_tenant_id == 0) {
@@ -902,25 +907,6 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
 }
 std::unordered_map<std::string, bool> mfa_status_map; 
 
-std::string getPublicIP() {
-    CURL *curl;
-    CURLcode res;
-    std::string readBuffer;
-
-    curl = curl_easy_init();
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "https://api.ipify.org");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, 
-            +[](void *ptr, size_t size, size_t nmemb, std::string *data) -> size_t {
-                data->append((char *)ptr, size * nmemb);
-                return size * nmemb;
-            });
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        res = curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
-    }
-    return readBuffer;
-}
 
 
 std::vector<std::string> read_pattern_strs = {
@@ -5693,7 +5679,10 @@ __get_pkts_from_client:
 									} else {
 										query = "unknown";
 									}
-									std::string user_ip = getPublicIP();
+									// The proxy's address, for the log line below: configured, or the local end
+									// of this connection. It was an api.ipify.org lookup -- on every query.
+									std::string user_ip = authnullProxyAddress(authnull_proxy_address,
+										client_myds ? client_myds->fd : -1);
 									std::string device_ip = "unknown";
 									std::string db_name = "unknown";
 									std::string user = "unknown";
@@ -7052,7 +7041,10 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
             }
         }
     }
-	std:: string user_ip = getPublicIP(); 
+	// The proxy's address, sent to AuthNull as database_host (performMFA's user_ip): configured,
+	// or the local end of this connection. It was an api.ipify.org lookup on every login.
+	std::string user_ip = authnullProxyAddress(authnull_proxy_address,
+		(client_myds != nullptr) ? client_myds->fd : -1);
 	bool is_encrypted = client_myds->encrypted;
 	bool handshake_response_return = client_myds->myprot.process_pkt_handshake_response((unsigned char *)pkt->ptr,pkt->size);
 	bool handshake_err = true;
