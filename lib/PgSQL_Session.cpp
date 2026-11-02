@@ -131,6 +131,7 @@ static const std::set<std::string> pgsql_variables_strings = {
 };
 
 #include "proxysql_find_charset.h"
+#include "authnull_query.h"
 
 extern PgSQL_Authentication* GloPgAuth;
 extern MySQL_LDAP_Authentication* GloMyLdapAuth;
@@ -397,116 +398,15 @@ std::map<std::string, std::string> alias_to_table2;
 std::map<std::string, std::vector<std::string>> query_tables_fields2;
 std::string current_query_table2;
 std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map2;
-std::vector<std::regex> read_patterns2;
-std::vector<std::regex> write_patterns2;
-std::vector<std::regex> execute_patterns2;
 
 
-
-std::vector<std::string> read_pattern_strs2 = {
-	"^\\s*SELECT",
-	"^\\s*SHOW",
-	"^\\s*DESCRIBE",
-	"^\\s*EXPLAIN",
-	"^\\s*WITH\\s+.+\\s+SELECT"  
-};
-
-std::vector<std::string> write_pattern_strs2 = {
-	"^\\s*INSERT",
-	"^\\s*UPDATE",
-	"^\\s*DELETE",
-	"^\\s*REPLACE",
-	"^\\s*MERGE",
-	"^\\s*UPSERT",
-	"^\\s*LOAD\\s+DATA"
-};
-
-std::vector<std::string> execute_pattern_strs2 = {
-	"^\\s*CREATE",
-	"^\\s*ALTER",
-	"^\\s*DROP",
-	"^\\s*TRUNCATE",
-	"^\\s*GRANT",
-	"^\\s*REVOKE",
-	"^\\s*EXECUTE",
-	"^\\s*CALL",
-	"^\\s*BEGIN",
-	"^\\s*START\\s+TRANSACTION",
-	"^\\s*COMMIT",
-	"^\\s*ROLLBACK",
-	"^\\s*SET",
-	"^\\s*USE"
-};
-
-std::string normalizeQuery2(const std::string& query) {
-	std::string result;
-	bool in_whitespace = false;
-	
-	for (char c : query) {
-		if (std::isspace(c)) {
-			if (!in_whitespace) {
-				result += ' ';
-				in_whitespace = true;
-			}
-		} else {
-			result += std::toupper(c);
-			in_whitespace = false;
-		}
-	}
-	
-	size_t comment_pos = result.find("--");
-	if (comment_pos != std::string::npos) {
-		result = result.substr(0, comment_pos);
-	}
-	for (const auto& pattern : read_pattern_strs2) {
-		read_patterns2.push_back(std::regex(pattern, std::regex_constants::icase));
-	}
-	
-	for (const auto& pattern : write_pattern_strs2) {
-		write_patterns2.push_back(std::regex(pattern, std::regex_constants::icase));
-	}
-	
-	for (const auto& pattern : execute_pattern_strs2) {
-		execute_patterns2.push_back(std::regex(pattern, std::regex_constants::icase));
-	}
-	
-	return result;
-}
 
 bool contains2(const std::vector<std::string>& vec, const std::string& value) {
 	return std::find(vec.begin(), vec.end(), value) != vec.end();
 }
 
-std::string getQueryType2(const std::string& query) {
-	std::string normalized_query = normalizeQuery2(query);
-	
-	for (const auto& pattern : read_patterns2) {
-		if (std::regex_search(normalized_query, pattern)) {
-			return "READ";
-		}
-	}
-	
-	for (const auto& pattern : write_patterns2) {
-		if (std::regex_search(normalized_query, pattern)) {
-			return "WRITE";
-		}
-	}
-	
-	for (const auto& pattern : execute_patterns2) {
-		if (std::regex_search(normalized_query, pattern)) {
-			return "EXECUTE";
-		}
-	}
-	
-	// Default to EXECUTE for unrecognized queries as a safety measure
-	return "EXECUTE";
-}
-
-
 bool checkPermission2(const std::string& username, const std::string& query, const std::string& databaseName,const std::string& sessionId) {
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
-    // Step 1: Determine the required privilege for the query
-    std::string required_privilege = getQueryType2(query); // e.g., "READ", "WRITE", "EXECUTE"
     std::string key = username + "+" + databaseName + "+" +sessionId;
     // Step 2: Check if the username has access to the specified database
     auto dbAccessIt = user_database_access2.find(key);
@@ -524,12 +424,14 @@ bool checkPermission2(const std::string& username, const std::string& query, con
         if (dbPrivsIt != userPrivsIt->second.end()) {
             std::vector<std::string> user_privs = dbPrivsIt->second;
             
-            // Step 4: Check if the required privilege is present
-            if (contains2(user_privs, required_privilege)) {
-                syslog(LOG_DEBUG, "Permission granted for %s on %s for %s", username.c_str(), databaseName.c_str(), required_privilege.c_str());
+            // Step 4: every statement in the query needs only privileges the session holds.
+            // See authnull_query.h: the query is read the way Postgres reads it and split into
+            // statements, so "select 1; insert ..." and a data-modifying WITH are not READ.
+            if (authnullQueryPermitted(user_privs, query, AuthnullDialect::Postgres)) {
+                syslog(LOG_DEBUG, "Permission granted for %s on %s", username.c_str(), databaseName.c_str());
                 return true;
             } else {
-                syslog(LOG_DEBUG, "Permission denied for %s on %s: lacks %s", username.c_str(), databaseName.c_str(), required_privilege.c_str());
+                syslog(LOG_INFO, "Permission denied for %s on %s: query needs a privilege the session was not granted", username.c_str(), databaseName.c_str());
                 return false;
             }
         } else {
