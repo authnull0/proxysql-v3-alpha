@@ -3,6 +3,7 @@
 #include "proxysql.h"
 #include "cpp.h"
 #include "authnull_net.h"
+#include "authnull_backend_role.h"
 #include "PgSQL_Authentication.h"
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_Protocol.h"
@@ -735,6 +736,8 @@ std::string authnull_api_url2;
 // The proxy's own address, sent as database_host. Empty means the local end of each client's
 // connection (see authnull_net.h).
 std::string authnull_proxy_address2;
+// What to do when a session's restricted backend role is not in pgsql_users; see authnull_backend_role.h.
+std::string authnull_backend_roles2;
 
 /**
  * @brief Generate a unique session ID
@@ -826,6 +829,7 @@ void loadAuthNullConfig2() {
     authnull_tenant_id2 = authnullEnvOrConfInt("AUTHNULL_TENANT_ID", "authnull", "tenant_id", 0);
     authnull_api_url2 = authnullEnvOrConf("AUTHNULL_API_URL", "authnull", "api_url", "");
     authnull_proxy_address2 = authnullEnvOrConf("AUTHNULL_PROXY_ADDRESS", "authnull", "proxy_address", "");
+    authnull_backend_roles2 = authnullEnvOrConf("AUTHNULL_BACKEND_ROLES", "authnull", "backend_roles", "prefer");
     // get_int/get_string swallow a missing [authnull] section and hand back the default,
     // so an unconfigured proxy would otherwise fail every login with only a curl error.
     if (authnull_api_url2.empty() || authnull_org_id2 == 0 || authnull_tenant_id2 == 0) {
@@ -884,6 +888,10 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
     std::string session_idp;
 	std::string username;
 	uint32_t thread_session_i;
+	// The restricted role this session connects to Postgres as, when there is one (set after MFA
+	// approval; see authnull_backend_role.h). Empty: the policy's own role, as before.
+	std::string backend_user;
+	char* backend_password = NULL;
 
     if (!user || *user == '\0') {
         proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , user='%s'. Client password pkt before startup packet.\n", (*myds), (*myds)->sess, user);
@@ -1249,7 +1257,44 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							}
 							std::string backend_pass(password);
 
-							std::string key = username + "+" + db_name + "+" + std::to_string(thread_session_i);
+							// THE RESTRICTED ROLE. For a READ and/or WRITE policy, connect to Postgres as
+							// the role database-agent made with exactly those privileges on exactly these
+							// tables, so the database refuses what the policy did not grant -- including
+							// what no query-text check can see, such as a function that writes.
+							//
+							// The client still authenticated as clean_user (the comparison below is
+							// unchanged); only the backend login differs. Everything this session reads
+							// later is keyed by the session's username, so it is recorded under the role.
+							std::string map_user = username;
+							std::string role_name;
+							if (authnullBackendRoleName(mfa_db, clean_user, mfa_privileges, mfa_tables, role_name)) {
+								AuthnullBackendRoleMode mode = authnullParseBackendRoleMode(authnull_backend_roles2);
+								if (mode != AuthnullBackendRoleMode::Off) {
+									bool r_ssl = false, r_tp = true, r_ff = false;
+									int r_hg = -1, r_mc = 0;
+									char* rp = GloPgAuth->lookup((char*)role_name.c_str(), USERNAME_FRONTEND, &r_ssl, &r_hg, &r_tp, &r_ff, &r_mc, NULL, NULL);
+									if (rp != nullptr && *rp != '\0') {
+										backend_user = role_name;
+										if (backend_password) free(backend_password);
+										backend_password = rp;
+										map_user = role_name;
+										session_extra_data_map[role_name + "_" + std::to_string(thread_session_i)] = extra_data;
+										syslog(LOG_INFO, "[authnull] user '%s' db '%s' connects as restricted role %s (%s)",
+											clean_user.c_str(), mfa_db.c_str(), role_name.c_str(), json(mfa_privileges).dump().c_str());
+									} else {
+										if (rp) free(rp);
+										if (mode == AuthnullBackendRoleMode::Enforce) {
+											syslog(LOG_ERR, "[authnull] restricted role %s for user '%s' db '%s' is not provisioned and backend_roles=enforce; refusing session",
+												role_name.c_str(), clean_user.c_str(), mfa_db.c_str());
+											throw std::runtime_error("restricted backend role not provisioned");
+										}
+										syslog(LOG_WARNING, "[authnull] restricted role %s for user '%s' db '%s' is not provisioned; using the policy's role (backend_roles=prefer)",
+											role_name.c_str(), clean_user.c_str(), mfa_db.c_str());
+									}
+								}
+							}
+
+							std::string key = map_user + "+" + db_name + "+" + std::to_string(thread_session_i);
 							std::map<std::string, std::vector<std::string>> masking_policy;
 							const json& fieldMasking = credential["fieldMasking"];
 							for (auto& table : mfa_tables) {
@@ -1262,7 +1307,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 
 							// Publish the session mapping only once it is complete.
 							user_database_access2[key] = {mfa_db};
-							user_database_privileges2[username][mfa_db + "+" + std::to_string(thread_session_i)] = mfa_privileges;
+							user_database_privileges2[map_user][mfa_db + "+" + std::to_string(thread_session_i)] = mfa_privileges;
 							usertype_masking_policies2[key] = masking_policy;
 							session_to_usertype2[std::to_string(thread_session_i)] = key;
 
@@ -1418,8 +1463,14 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 		if (userinfo->username) free(userinfo->username);
 		if (userinfo->password) free(userinfo->password);
 
-		userinfo->username = strdup((const char*)user);
-		userinfo->password = strdup((const char*)password);
+		if (!backend_user.empty() && backend_password != NULL) {
+			// The backend connection is made as the restricted role (see the MFA block).
+			userinfo->username = strdup(backend_user.c_str());
+			userinfo->password = strdup(backend_password);
+		} else {
+			userinfo->username = strdup((const char*)user);
+			userinfo->password = strdup((const char*)password);
+		}
 
 		const char* db = (*myds)->myconn->conn_params.get_value(PG_DATABASE);
 		userinfo->set_dbname(db ? db : userinfo->username);
@@ -1440,6 +1491,10 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 
 __exit_process_pkt_handshake_response:
 	free(pass);
+	if (backend_password) {
+		free(backend_password);
+		backend_password = NULL;
+	}
 	if (password) {
 		free(password);
 		password = NULL;
