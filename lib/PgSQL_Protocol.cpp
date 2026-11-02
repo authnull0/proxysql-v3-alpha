@@ -3,6 +3,7 @@
 #include "proxysql.h"
 #include "cpp.h"
 #include "authnull_net.h"
+#include "authnull_auth.h"
 #include "PgSQL_Authentication.h"
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_Protocol.h"
@@ -1011,10 +1012,15 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 				break;
 			}
 			if (user) {
-				if (clean_user == "admin") {
-					// Admin user follows normal authentication flow: keep the password the
-					// client supplied rather than substituting an MFA-sourced one. Without
+				if (!authnullRequiresMFA(session_type, PROXYSQL_SESSION_PGSQL, clean_user)) {
+					// ProxySQL's own interfaces (admin 6132, stats) follow the normal password check:
+					// keep the password the client supplied rather than an MFA-sourced one. Without
 					// this, pass2 stays empty and the comparison below is against "".
+					//
+					// Decided by SESSION TYPE, never by username. This used to be clean_user == "admin",
+					// which also exempted a database role named "admin" on the client port (6133): it
+					// reached the database with its password alone. See authnull_auth.h.
+					//
 					// std::string(pass) not (pass, pass_len): CLEAR_TEXT_PASSWORD does not trim
 					// the trailing NUL the way the MD5 branch above does, and pass is
 					// NUL-terminated (the MD5 branch strcmp()s it).
