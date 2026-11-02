@@ -1,4 +1,5 @@
 #include "../deps/json/json.hpp"
+#include "authnull_query.h"
 using json = nlohmann::json;
 #define PROXYJSON
 
@@ -644,9 +645,6 @@ std::string current_query_table;
 std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map;
 std::string latestDB;
 std::string latestUser;
-std::vector<std::regex> read_patterns;
-std::vector<std::regex> write_patterns;
-std::vector<std::regex> execute_patterns;
 std::string authtoken;
 int authnull_org_id;
 int authnull_tenant_id;
@@ -909,110 +907,12 @@ std::unordered_map<std::string, bool> mfa_status_map;
 
 
 
-std::vector<std::string> read_pattern_strs = {
-	"^\\s*SELECT",
-	"^\\s*SHOW",
-	"^\\s*DESCRIBE",
-	"^\\s*EXPLAIN",
-	"^\\s*WITH\\s+.+\\s+SELECT"  
-};
-
-std::vector<std::string> write_pattern_strs = {
-	"^\\s*INSERT",
-	"^\\s*UPDATE",
-	"^\\s*DELETE",
-	"^\\s*REPLACE",
-	"^\\s*MERGE",
-	"^\\s*UPSERT",
-	"^\\s*LOAD\\s+DATA"
-};
-
-std::vector<std::string> execute_pattern_strs = {
-	"^\\s*CREATE",
-	"^\\s*ALTER",
-	"^\\s*DROP",
-	"^\\s*TRUNCATE",
-	"^\\s*GRANT",
-	"^\\s*REVOKE",
-	"^\\s*EXECUTE",
-	"^\\s*CALL",
-	"^\\s*BEGIN",
-	"^\\s*START\\s+TRANSACTION",
-	"^\\s*COMMIT",
-	"^\\s*ROLLBACK",
-	"^\\s*SET",
-	"^\\s*USE"
-};
-
-std::string normalizeQuery(const std::string& query) {
-	std::string result;
-	bool in_whitespace = false;
-	
-	for (char c : query) {
-		if (std::isspace(c)) {
-			if (!in_whitespace) {
-				result += ' ';
-				in_whitespace = true;
-			}
-		} else {
-			result += std::toupper(c);
-			in_whitespace = false;
-		}
-	}
-	
-	size_t comment_pos = result.find("--");
-	if (comment_pos != std::string::npos) {
-		result = result.substr(0, comment_pos);
-	}
-	for (const auto& pattern : read_pattern_strs) {
-		read_patterns.push_back(std::regex(pattern, std::regex_constants::icase));
-	}
-	
-	for (const auto& pattern : write_pattern_strs) {
-		write_patterns.push_back(std::regex(pattern, std::regex_constants::icase));
-	}
-	
-	for (const auto& pattern : execute_pattern_strs) {
-		execute_patterns.push_back(std::regex(pattern, std::regex_constants::icase));
-	}
-	
-	return result;
-}
-
 bool contains(const std::vector<std::string>& vec, const std::string& value) {
 	return std::find(vec.begin(), vec.end(), value) != vec.end();
 }
 
-std::string getQueryType(const std::string& query) {
-	std::string normalized_query = normalizeQuery(query);
-	
-	for (const auto& pattern : read_patterns) {
-		if (std::regex_search(normalized_query, pattern)) {
-			return "READ";
-		}
-	}
-	
-	for (const auto& pattern : write_patterns) {
-		if (std::regex_search(normalized_query, pattern)) {
-			return "WRITE";
-		}
-	}
-	
-	for (const auto& pattern : execute_patterns) {
-		if (std::regex_search(normalized_query, pattern)) {
-			return "EXECUTE";
-		}
-	}
-	
-	// Default to EXECUTE for unrecognized queries as a safety measure
-	return "EXECUTE";
-}
-
-
 bool checkPermission(const std::string& username, const std::string& query, const std::string& databaseName,const std::string& sessionId) {
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
-    // Step 1: Determine the required privilege for the query
-    std::string required_privilege = getQueryType(query); // e.g., "READ", "WRITE", "EXECUTE"
     std::string key = username + "+" + databaseName + "+" +sessionId;
     // Step 2: Check if the username has access to the specified database
     auto dbAccessIt = user_database_access.find(key);
@@ -1030,12 +930,14 @@ bool checkPermission(const std::string& username, const std::string& query, cons
         if (dbPrivsIt != userPrivsIt->second.end()) {
             std::vector<std::string> user_privs = dbPrivsIt->second;
             
-            // Step 4: Check if the required privilege is present
-            if (contains(user_privs, required_privilege)) {
-                syslog(LOG_DEBUG, "Permission granted for %s on %s for %s", username.c_str(), databaseName.c_str(), required_privilege.c_str());
+            // Step 4: every statement in the query needs only privileges the session holds.
+            // See authnull_query.h: the query is read the way MySQL reads it and split into
+            // statements, so "select 1; insert ..." and a data-modifying WITH are not READ.
+            if (authnullQueryPermitted(user_privs, query, AuthnullDialect::MySQL)) {
+                syslog(LOG_DEBUG, "Permission granted for %s on %s", username.c_str(), databaseName.c_str());
                 return true;
             } else {
-                syslog(LOG_DEBUG, "Permission denied for %s on %s: lacks %s", username.c_str(), databaseName.c_str(), required_privilege.c_str());
+                syslog(LOG_INFO, "Permission denied for %s on %s: query needs a privilege the session was not granted", username.c_str(), databaseName.c_str());
                 return false;
             }
         } else {
