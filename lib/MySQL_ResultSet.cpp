@@ -766,25 +766,9 @@ bool MySQL_ResultSet::get_resultset(PtrSizeArray *PSarrayFinal) {
 	current_field_names.clear();
     // current_query_fields.clear();
 	query_tables_fields.clear();
-    if (myprot) {
-        std::cout << "[DEBUG] Final Result Set Before Sending:\n";
-        std::cout << "-------------------------------------------------\n";
-
-        for (unsigned int i = 0; i < PSarrayOUT.len; i++) {
-            PtrSize_t *pkt = PSarrayOUT.index(i);
-            std::string packet_data((char*)pkt->ptr, pkt->size);
-            if (packet_data.find("defmysq") != std::string::npos) continue;
-
-            for (char &c : packet_data) {
-                if (c < 32 || c > 126) c = ' ';  
-            }
-
-            std::cout << "[DEBUG] Row " << i << ": " << packet_data << std::endl;
-        }
-
-        std::cout << "-------------------------------------------------\n";
-        std::cout << "[DEBUG] Total Rows Sent: " << num_rows << std::endl;
-    }
+    // The rows used to be printed here, every one, to ProxySQL's log: customers' query results, and
+    // -- since the admin interface speaks this protocol -- every managed role's password whenever the
+    // agent read pgsql_users. Never print a result set (test/authnull/authnull_no_data_in_logs_test.cpp).
 	alias_to_table.clear(); // Clear the map of alias to table
     query_tables_fields.clear(); // Clear the map of query tables fields
     current_query_table.clear(); // Clear the current query table string
