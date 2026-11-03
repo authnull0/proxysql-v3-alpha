@@ -1,6 +1,7 @@
 #include "../deps/json/json.hpp"
 #include "authnull_query.h"
 #include "authnull_log.h"
+#include "authnull_tls.h"
 using json = nlohmann::json;
 #define PROXYJSON
 
@@ -653,6 +654,10 @@ std::string authnull_api_url;
 // The proxy's own address, sent as database_host. Empty means the local end of each client's
 // connection (see authnull_net.h).
 std::string authnull_proxy_address;
+// How the call to authn-service is secured, and why api_url may not be used (empty: it may); see
+// authnull_tls.h.
+AuthnullTlsSettings authnull_tls;
+std::string authnull_api_url_problem;
 #include <cstdlib>
 #include <climits>
 #include <cerrno>
@@ -700,6 +705,17 @@ void loadAuthNullConfig() {
     authnull_tenant_id = authnullEnvOrConfInt("AUTHNULL_TENANT_ID", "authnull", "tenant_id", 0);
     authnull_api_url = authnullEnvOrConf("AUTHNULL_API_URL", "authnull", "api_url", "");
     authnull_proxy_address = authnullEnvOrConf("AUTHNULL_PROXY_ADDRESS", "authnull", "proxy_address", "");
+    authnull_tls.verify = authnullParseBool(authnullEnvOrConf("AUTHNULL_TLS_VERIFY", "authnull", "tls_verify", "true"), true);
+    authnull_tls.ca_file = authnullEnvOrConf("AUTHNULL_CA_FILE", "authnull", "ca_file", "");
+    authnull_tls.allow_insecure_http = authnullParseBool(
+        authnullEnvOrConf("AUTHNULL_ALLOW_INSECURE_HTTP", "authnull", "allow_insecure_http", "false"), false);
+    authnull_api_url_problem = authnull_api_url.empty() ? "" : authnullApiUrlProblem(authnull_api_url, authnull_tls);
+    if (!authnull_api_url_problem.empty()) {
+        syslog(LOG_ERR, "[authnull] %s (api_url='%s'); all MFA-gated logins will be denied", authnull_api_url_problem.c_str(), authnull_api_url.c_str());
+    }
+    if (!authnull_tls.verify && authnullUrlScheme(authnull_api_url) == AuthnullUrlScheme::Https) {
+        syslog(LOG_WARNING, "[authnull] tls_verify = false: authn-service's certificate is NOT checked, so anyone on the network path can answer for it. Use ca_file for a private CA instead.");
+    }
     // get_int/get_string swallow a missing [authnull] section and hand back the default,
     // so an unconfigured proxy would otherwise fail every login with only a curl error.
     if (authnull_api_url.empty() || authnull_org_id == 0 || authnull_tenant_id == 0) {
@@ -735,6 +751,11 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
 
     if (!curl) {
         std::cerr << "CURL Initialization Failed!" << std::endl;
+        return false;
+    }
+    if (!authnull_api_url_problem.empty()) {
+        syslog(LOG_ERR, "[authnull] %s; login denied", authnull_api_url_problem.c_str());
+        curl_easy_cleanup(curl);
         return false;
     }
 
@@ -777,6 +798,19 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
     // can possibly respond. 90s = 60s TTL + headroom. Connect timeout stays at 10s.
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L); // 90 seconds: push-MFA challenge TTL (60s) + headroom
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L); // 10 seconds connect timeout
+    // authn-service's answer decides the login and the request carries the user's token: check
+    // the certificate (curl's default, made explicit and configurable) and keep redirects on the
+    // URL's own scheme (authnull_tls.h).
+    {
+        AuthnullCurlTls tls = authnullCurlTls(authnull_api_url, authnull_tls);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, tls.verify_peer);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, tls.verify_host);
+        if (!tls.ca_file.empty()) {
+            curl_easy_setopt(curl, CURLOPT_CAINFO, tls.ca_file.c_str());
+        }
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, tls.protocols);
+        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, tls.protocols);
+    }
 
     res = curl_easy_perform(curl);
     
