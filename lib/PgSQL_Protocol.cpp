@@ -6,6 +6,7 @@
 #include "authnull_auth.h"
 #include "authnull_backend_role.h"
 #include "authnull_tls.h"
+#include "authnull_session_limits.h"
 #include "PgSQL_Authentication.h"
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_Protocol.h"
@@ -1354,6 +1355,24 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							user_database_privileges2[map_user][mfa_db + "+" + std::to_string(thread_session_i)] = mfa_privileges;
 							usertype_masking_policies2[key] = masking_policy;
 							session_to_usertype2[std::to_string(thread_session_i)] = key;
+
+							// The policy's session controls, if any: the thread's maintenance pass and the
+							// query path end the session when it reaches them (authnull_session_limits.h).
+							// Set or cleared on every login, so a reused id never inherits limits.
+							{
+								int max_minutes = 0, idle_minutes = 0;
+								if (authnullSessionLimitFromJSON(credential, max_minutes, idle_minutes)) {
+									AuthnullSessionLimit limit;
+									limit.started_s = (long long)time(nullptr);
+									limit.max_minutes = max_minutes;
+									limit.idle_minutes = idle_minutes;
+									authnullSessionLimits().set(thread_session_i, limit);
+									syslog(LOG_INFO, "[authnull] session %u for %s on %s: max %d min, idle %d min (0 = no limit)",
+										thread_session_i, username.c_str(), mfa_db.c_str(), max_minutes, idle_minutes);
+								} else {
+									authnullSessionLimits().erase(thread_session_i);
+								}
+							}
 
 							syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s",
 								username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
