@@ -10,6 +10,7 @@
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_Protocol.h"
 #include <syslog.h>
+#include "authnull_caller_token_curl.h"
 extern "C" {
 #include "usual/time.h"
 }
@@ -841,6 +842,10 @@ void loadAuthNullConfig2() {
     authnull_tls2.allow_insecure_http = authnullParseBool(
         authnullEnvOrConf("AUTHNULL_ALLOW_INSECURE_HTTP", "authnull", "allow_insecure_http", "false"), false);
     authnull_api_url_problem2 = authnull_api_url2.empty() ? "" : authnullApiUrlProblem(authnull_api_url2, authnull_tls2);
+    // The proxy's own credential to authn-service (authnull_caller_token.h).
+    authnullConfigureCaller(authnullEnvOrConf("AUTHNULL_CLIENT_ID", "authnull", "client_id", ""),
+                            authnullEnvOrConf("AUTHNULL_CLIENT_SECRET", "authnull", "client_secret", ""),
+                            authnullEnvOrConf("AUTHNULL_TOKEN_URL", "authnull", "token_url", ""), authnull_tls2);
     if (!authnull_api_url_problem2.empty()) {
         syslog(LOG_ERR, "[authnull] %s (api_url='%s'); all MFA-gated logins will be denied", authnull_api_url_problem2.c_str(), authnull_api_url2.c_str());
     }
@@ -1110,6 +1115,8 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 
 						std::string json_payload = requestData.dump();
 						headers = curl_slist_append(headers, "Content-Type: application/json");
+						// This proxy's caller token, when it has a credential (authnull_caller_token.h).
+						std::string caller_token = authnullAddCallerAuth(headers);
 
 						curl_easy_setopt(curl, CURLOPT_URL, authnull_api_url2.c_str());
 						curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -1153,6 +1160,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						
 						curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 						syslog(LOG_INFO, "HTTP Status Code: %ld", http_code);
+						authnullCallerTokenRefused(caller_token, http_code);
 						
 						if (http_code != 200) {
 							syslog(LOG_ERR, "[ERROR] AuthNull API returned non-200 status: %ld", http_code);
