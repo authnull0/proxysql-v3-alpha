@@ -1,4 +1,5 @@
 #include "../deps/json/json.hpp"
+#include "authnull_log.h"
 using json = nlohmann::json;
 #define PROXYJSON
 
@@ -2408,7 +2409,7 @@ bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned
         strncpy(reinterpret_cast<char*>(vars1.user), clean_user.c_str(), clean_user.length());
         vars1.user[clean_user.length()] = '\0';  // Null-terminate safely
 
-        syslog(LOG_DEBUG, "[DEBUG] Updated user: %s Session: %s Extra data: %s", clean_user.c_str(), session_idp.c_str(), extra_data.c_str());
+        syslog(LOG_DEBUG, "[DEBUG] Updated user: %s Session: %s Token: %s", clean_user.c_str(), session_idp.c_str(), authnullTokenHint(extra_data).c_str());
     }
 
     if (hdr.pkt_id == 0 && *pkt == 2) {
