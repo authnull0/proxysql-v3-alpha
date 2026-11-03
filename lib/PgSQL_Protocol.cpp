@@ -5,6 +5,7 @@
 #include "authnull_net.h"
 #include "authnull_auth.h"
 #include "authnull_backend_role.h"
+#include "authnull_tls.h"
 #include "PgSQL_Authentication.h"
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_Protocol.h"
@@ -739,6 +740,10 @@ std::string authnull_api_url2;
 std::string authnull_proxy_address2;
 // What to do when a session's restricted backend role is not in pgsql_users; see authnull_backend_role.h.
 std::string authnull_backend_roles2;
+// How the call to authn-service is secured, and why api_url may not be used (empty: it may); see
+// authnull_tls.h.
+AuthnullTlsSettings authnull_tls2;
+std::string authnull_api_url_problem2;
 
 /**
  * @brief Generate a unique session ID
@@ -831,6 +836,17 @@ void loadAuthNullConfig2() {
     authnull_api_url2 = authnullEnvOrConf("AUTHNULL_API_URL", "authnull", "api_url", "");
     authnull_proxy_address2 = authnullEnvOrConf("AUTHNULL_PROXY_ADDRESS", "authnull", "proxy_address", "");
     authnull_backend_roles2 = authnullEnvOrConf("AUTHNULL_BACKEND_ROLES", "authnull", "backend_roles", "prefer");
+    authnull_tls2.verify = authnullParseBool(authnullEnvOrConf("AUTHNULL_TLS_VERIFY", "authnull", "tls_verify", "true"), true);
+    authnull_tls2.ca_file = authnullEnvOrConf("AUTHNULL_CA_FILE", "authnull", "ca_file", "");
+    authnull_tls2.allow_insecure_http = authnullParseBool(
+        authnullEnvOrConf("AUTHNULL_ALLOW_INSECURE_HTTP", "authnull", "allow_insecure_http", "false"), false);
+    authnull_api_url_problem2 = authnull_api_url2.empty() ? "" : authnullApiUrlProblem(authnull_api_url2, authnull_tls2);
+    if (!authnull_api_url_problem2.empty()) {
+        syslog(LOG_ERR, "[authnull] %s (api_url='%s'); all MFA-gated logins will be denied", authnull_api_url_problem2.c_str(), authnull_api_url2.c_str());
+    }
+    if (!authnull_tls2.verify && authnullUrlScheme(authnull_api_url2) == AuthnullUrlScheme::Https) {
+        syslog(LOG_WARNING, "[authnull] tls_verify = false: authn-service's certificate is NOT checked, so anyone on the network path can answer for it. Use ca_file for a private CA instead.");
+    }
     // get_int/get_string swallow a missing [authnull] section and hand back the default,
     // so an unconfigured proxy would otherwise fail every login with only a curl error.
     if (authnull_api_url2.empty() || authnull_org_id2 == 0 || authnull_tenant_id2 == 0) {
@@ -1112,8 +1128,22 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						// deciding on the push, zero bytes flow for up to 60s, so a 15s/50B-per-sec
 						// floor aborted the request roughly 15s in - even earlier than the old 30s
 						// CURLOPT_TIMEOUT. Do not reintroduce them on a blocking endpoint.
-						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-						curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+						// authn-service's answer decides the login and the request carries the user's
+						// token, so the certificate is checked and the scheme can't change on a
+						// redirect (authnull_tls.h). These were 0: anyone on the path could answer.
+						if (!authnull_api_url_problem2.empty()) {
+							throw std::runtime_error("[authnull] " + authnull_api_url_problem2);
+						}
+						{
+							AuthnullCurlTls tls = authnullCurlTls(authnull_api_url2, authnull_tls2);
+							curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, tls.verify_peer);
+							curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, tls.verify_host);
+							if (!tls.ca_file.empty()) {
+								curl_easy_setopt(curl, CURLOPT_CAINFO, tls.ca_file.c_str());
+							}
+							curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, tls.protocols);
+							curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, tls.protocols);
+						}
 						
 						res = curl_easy_perform(curl);
 						if (res != CURLE_OK) {
