@@ -35,6 +35,7 @@ using json = nlohmann::json;
 #include <curl/curl.h>
 #include <regex>
 #include <syslog.h>
+#include "authnull_caller_token_curl.h"
 #include "libinjection.h"
 #include "libinjection_sqli.h"
 
@@ -710,6 +711,10 @@ void loadAuthNullConfig() {
     authnull_tls.allow_insecure_http = authnullParseBool(
         authnullEnvOrConf("AUTHNULL_ALLOW_INSECURE_HTTP", "authnull", "allow_insecure_http", "false"), false);
     authnull_api_url_problem = authnull_api_url.empty() ? "" : authnullApiUrlProblem(authnull_api_url, authnull_tls);
+    // The proxy's own credential to authn-service (authnull_caller_token.h).
+    authnullConfigureCaller(authnullEnvOrConf("AUTHNULL_CLIENT_ID", "authnull", "client_id", ""),
+                            authnullEnvOrConf("AUTHNULL_CLIENT_SECRET", "authnull", "client_secret", ""),
+                            authnullEnvOrConf("AUTHNULL_TOKEN_URL", "authnull", "token_url", ""), authnull_tls);
     if (!authnull_api_url_problem.empty()) {
         syslog(LOG_ERR, "[authnull] %s (api_url='%s'); all MFA-gated logins will be denied", authnull_api_url_problem.c_str(), authnull_api_url.c_str());
     }
@@ -779,6 +784,8 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
 
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
+    // This proxy's caller token, when it has a credential (authnull_caller_token.h).
+    std::string caller_token = authnullAddCallerAuth(headers);
 
     std::string response;
     curl_easy_setopt(curl, CURLOPT_URL, authnull_api_url.c_str());
@@ -817,6 +824,7 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
     // Get HTTP status code
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     syslog(LOG_INFO, "HTTP Status Code: %ld", http_code);
+    authnullCallerTokenRefused(caller_token, http_code);
     curl_easy_cleanup(curl);
     curl_slist_free_all(headers);
 

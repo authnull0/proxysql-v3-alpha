@@ -59,6 +59,10 @@ authnull=
 #	tls_verify=false
 #	Plain http:// is accepted only to this machine (127.0.0.1:2882) unless:
 #	allow_insecure_http=true
+#	This proxy's credential to authn-service, from its db.env (include/authnull_caller_token.h):
+#	client_id="dpc-..."
+#	client_secret="dps_..."
+#	token_url="https://onprem.dev.authnull.com/api/v1/database/proxy/token"
 }
 
 admin_variables=
