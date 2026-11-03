@@ -3186,7 +3186,23 @@ void PgSQL_Thread::idle_thread_to_kill_idle_sessions() {
 	for (i = 0; i < SESS_TO_SCAN && mysess_idx < mysql_sessions->len; i++) {
 		uint32_t sess_pos = mysess_idx;
 		PgSQL_Session* mysess = (PgSQL_Session*)mysql_sessions->index(sess_pos);
-		if (mysess->idle_since < min_idle || mysess->killed == true) {
+		// AuthNull session controls for a session parked on this idle thread: the worker's
+		// maintenance pass (ProcessAllSessions_MaintenanceLoop) never sees it while it is here, so its
+		// idle timeout and maximum length are checked now, and it is ended the way wait_timeout ends
+		// it (authnull_session_limits.h).
+		bool authnull_end = false;
+		if (mysess->killed == false) {
+			AuthnullSessionLimit limit;
+			if (authnullSessionLimits().get(mysess->thread_session_id, limit)) {
+				unsigned long long idle_ms = curtime > mysess->idle_since ? (curtime - mysess->idle_since) / 1000 : 0;
+				std::string why = authnullSessionLimitReason(limit, (long long)time(nullptr), idle_ms);
+				if (!why.empty()) {
+					proxy_warning("[authnull] closing idle session %u: %s\n", mysess->thread_session_id, why.c_str());
+					authnull_end = true;
+				}
+			}
+		}
+		if (mysess->idle_since < min_idle || mysess->killed == true || authnull_end) {
 			mysess->killed = true;
 			PgSQL_Data_Stream* tmp_myds = mysess->client_myds;
 			int dsidx = tmp_myds->poll_fds_idx;
