@@ -809,7 +809,8 @@ void extractTableAndFieldsFromQuery2(const std::string& query, const unsigned lo
     field_alias_map2.clear(); 
     current_query_table2.clear();
     
-    std::cout << "[DEBUG] Parsing query: " << query << std::endl;
+    // Never print the query: its text can carry anything the client sent, secrets included
+    // (test/authnull/authnull_no_data_in_logs_test.cpp).
 
     std::string normalizedQuery = query;
     std::transform(normalizedQuery.begin(), normalizedQuery.end(), normalizedQuery.begin(), ::tolower);
