@@ -53,6 +53,16 @@ authnull=
 	org_id=2
 	tenant_id=1
 	api_url="https://onprem.dev.authnull.com/authnull0/api/v1/authn/v3/do-authenticationV4"
+#	authn-service's certificate is checked (include/authnull_tls.h). For a private CA:
+#	ca_file="/etc/authnull/ca.pem"
+#	Lab only -- turns the certificate check off:
+#	tls_verify=false
+#	Plain http:// is accepted only to this machine (127.0.0.1:2882) unless:
+#	allow_insecure_http=true
+#	This proxy's credential to authn-service, from its db.env (include/authnull_caller_token.h):
+#	client_id="dpc-..."
+#	client_secret="dps_..."
+#	token_url="https://onprem.dev.authnull.com/api/v1/database/proxy/token"
 }
 
 admin_variables=

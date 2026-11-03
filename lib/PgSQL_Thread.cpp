@@ -23,6 +23,7 @@ using json = nlohmann::json;
 #include "StatCounters.h"
 #include "MySQL_PreparedStatement.h"
 #include "PgSQL_Logger.hpp"
+#include "authnull_session_limits.h"
 
 #include <fcntl.h>
 
@@ -3508,6 +3509,18 @@ void PgSQL_Thread::ProcessAllSessions_CompletedMirrorSession(unsigned int& n, Pg
 // this function was inline in PgSQL_Thread::process_all_sessions()
 void PgSQL_Thread::ProcessAllSessions_MaintenanceLoop(PgSQL_Session * sess, unsigned long long sess_time, unsigned int& total_active_transactions_) {
 	unsigned int numTrx = 0;
+	// AuthNull session controls: a session past its policy's maximum length or idle timeout is
+	// closed here, whether or not the client sends anything (authnull_session_limits.h).
+	if (sess->killed == false) {
+		AuthnullSessionLimit limit;
+		if (authnullSessionLimits().get(sess->thread_session_id, limit)) {
+			std::string why = authnullSessionLimitReason(limit, (long long)time(nullptr), sess_time / 1000);
+			if (!why.empty()) {
+				sess->killed = true;
+				proxy_warning("[authnull] closing session %u: %s\n", sess->thread_session_id, why.c_str());
+			}
+		}
+	}
 	total_active_transactions_ += sess->active_transactions;
 	sess->to_process = 1;
 	if ((sess_time / 1000 > (unsigned long long)pgsql_thread___max_transaction_idle_time) || (sess_time / 1000 > (unsigned long long)pgsql_thread___wait_timeout)) {

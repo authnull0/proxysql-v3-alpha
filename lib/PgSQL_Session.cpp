@@ -133,6 +133,7 @@ static const std::set<std::string> pgsql_variables_strings = {
 #include "proxysql_find_charset.h"
 #include "authnull_query.h"
 #include "authnull_log.h"
+#include "authnull_session_limits.h"
 
 extern PgSQL_Authentication* GloPgAuth;
 extern MySQL_LDAP_Authentication* GloMyLdapAuth;
@@ -1848,6 +1849,9 @@ void PgSQL_Session::reset() {
 }
 
 PgSQL_Session::~PgSQL_Session() {
+
+	// The session's AuthNull limits, if it had any (authnull_session_limits.h).
+	authnullSessionLimits().erase(thread_session_id);
 
 	reset(); // we moved this out to allow CHANGE_USER
 
@@ -4144,6 +4148,24 @@ __get_pkts_from_client:
 									}
 								}
 								std::string seid = std::to_string(this->thread_session_id); 
+								// A session past the policy's maximum length runs nothing more, even between
+								// two maintenance passes (authnull_session_limits.h).
+								{
+									AuthnullSessionLimit limit;
+									if (authnullSessionLimits().get(this->thread_session_id, limit)) {
+										std::string why = authnullSessionLimitReason(limit, (long long)time(nullptr), 0);
+										if (!why.empty()) {
+											syslog(LOG_WARNING, "[authnull] ending session %u of %s on %s: %s", this->thread_session_id, user.c_str(), db_name.c_str(), why.c_str());
+											client_myds->DSS=STATE_QUERY_SENT_NET;
+											std::string msg = "Session ended: " + why;
+											client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"57P01", (char *)msg.c_str(), true);
+											RequestEnd(NULL);
+											l_free(pkt.size, pkt.ptr);
+											killed = true;
+											break;
+										}
+									}
+								}
 								bool result = checkPermission2(user, query, db_name,seid);
 								if (result == false){
 									syslog(LOG_INFO, "[DEBUG] Query Not OK");
