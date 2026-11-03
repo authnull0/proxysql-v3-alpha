@@ -132,6 +132,7 @@ static const std::set<std::string> pgsql_variables_strings = {
 
 #include "proxysql_find_charset.h"
 #include "authnull_query.h"
+#include "authnull_log.h"
 
 extern PgSQL_Authentication* GloPgAuth;
 extern MySQL_LDAP_Authentication* GloMyLdapAuth;
@@ -5666,9 +5667,15 @@ void PgSQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 					user = client_myds->myconn->userinfo->username;
 					{
 						openlog("AuthSQL", LOG_PID, LOG_DAEMON);
-						std::string key = user + "_" + session_idp;
+						// The key PgSQL_Protocol wrote the connection token under: user and this session's
+						// id. It used session_idp, the MySQL path's global, so on Postgres it never matched,
+						// and operator[] then added an empty entry to the global map on every login.
+						std::string key = user + "_" + std::to_string(thread_session_id);
 						std::string authtoken;
-						authtoken = session_extra_data_map[key];
+						{
+							auto tok = session_extra_data_map.find(key);
+							if (tok != session_extra_data_map.end()) authtoken = tok->second;
+						}
 						if (true) { 
 							try {
 								std::vector<std::string>& databases = user_database_access2[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
@@ -5681,7 +5688,7 @@ void PgSQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 									l_free(pkt->size, pkt->ptr);
 									break; 
 								}
-								syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
+								syslog(LOG_INFO, "Connection token for %s: %s", key.c_str(), authnullTokenHint(authtoken).c_str());
 								unsigned long thread_session_id = client_myds->sess->thread_session_id;
 								syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
 								syslog(LOG_INFO, "Mapped username '%s' to session ID %d", user.c_str(), thread_session_id);

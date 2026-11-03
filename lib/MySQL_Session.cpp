@@ -1,5 +1,6 @@
 #include "../deps/json/json.hpp"
 #include "authnull_query.h"
+#include "authnull_log.h"
 using json = nlohmann::json;
 #define PROXYJSON
 
@@ -7070,7 +7071,7 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 											mfa_deny_msg = "Access denied: User does not have access to this database";
 											break; 
 										}
-										syslog(LOG_INFO, "Extra data for %s: %s", key.c_str(), session_extra_data_map[key].c_str());
+										syslog(LOG_INFO, "Connection token for %s: %s", key.c_str(), authnullTokenHint(session_extra_data_map[key]).c_str());
 										unsigned long thread_session_id = client_myds->sess->thread_session_id;
 										syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
 										syslog(LOG_INFO, "Mapped username '%s' to session ID %d", user.c_str(), thread_session_id);
