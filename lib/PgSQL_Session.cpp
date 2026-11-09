@@ -1850,6 +1850,11 @@ void PgSQL_Session::reset() {
 }
 
 PgSQL_Session::~PgSQL_Session() {
+	if (authnull_mfa_pkt.ptr != NULL) {
+		l_free(authnull_mfa_pkt.size, authnull_mfa_pkt.ptr);
+		authnull_mfa_pkt.ptr = NULL;
+	}
+	// authnull_mfa_call, if still running, finishes on its own thread and frees itself.
 
 	// The session's AuthNull limits, if it had any (authnull_session_limits.h).
 	authnullSessionLimits().erase(thread_session_id);
@@ -5061,6 +5066,14 @@ int PgSQL_Session::handler() {
 		}
 	}
 
+	// A login waiting on its MFA push: once the call has answered, its password packet goes back to
+	// the client's input and the handshake runs again with it (authnull_mfa_call.h).
+	if (authnull_mfa_pkt.ptr != NULL && client_myds != NULL && (!authnull_mfa_call || authnull_mfa_call->done())) {
+		client_myds->PSarrayIN->add(authnull_mfa_pkt.ptr, authnull_mfa_pkt.size);
+		authnull_mfa_pkt.ptr = NULL;
+		authnull_mfa_pkt.size = 0;
+	}
+
 	housekeeping_before_pkts();
 	handler_ret = get_pkts_from_client(wrong_pass, pkt);
 	if (handler_ret != 0) {
@@ -5601,6 +5614,11 @@ void PgSQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 
 		if (state == EXECUTION_STATE::PENDING) {
 			l_free(pkt->size, pkt->ptr);
+			return;
+		}
+		if (state == EXECUTION_STATE::PENDING_MFA) {
+			// Kept, not freed: handler() hands it back once the push is answered.
+			authnull_mfa_pkt = *pkt;
 			return;
 		}
 		

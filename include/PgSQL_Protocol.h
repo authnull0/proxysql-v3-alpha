@@ -67,7 +67,8 @@ struct ScramState;
 enum class EXECUTION_STATE {
 	FAILED = 0,
 	SUCCESSFUL,
-	PENDING
+	PENDING,
+	PENDING_MFA // waiting on the MFA push, off this thread (authnull_mfa_call.h)
 };
 
 struct pgsql_hdr {

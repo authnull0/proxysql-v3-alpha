@@ -10,6 +10,7 @@
 #include "Base_Session.h"
 #include "cpp.h"
 #include "PgSQL_Variables.h"
+#include "authnull_mfa_call.h"
 #include "Base_Session.h"
 
 
@@ -286,6 +287,12 @@ public:
 	PgSQL_Data_Stream* client_myds;
 #endif // 0
 	PgSQL_Data_Stream* server_myds;
+	// A login waiting on its MFA push (authnull_mfa_call.h): the call, the client's password packet
+	// (run again once the call answers), and the username as the client sent it ("<user>,<token>";
+	// the handshake trims it in place).
+	std::shared_ptr<AuthnullMfaCall> authnull_mfa_call;
+	PtrSize_t authnull_mfa_pkt { 0, NULL };
+	std::string authnull_mfa_username;
 #if 0
 	/*
 	 * @brief Store the hostgroups that hold connections that have been flagged as 'expired' by the

@@ -3648,7 +3648,8 @@ void PgSQL_Thread::process_all_sessions() {
 				continue;
 			}
 		}
-		if (sess->status == CONNECTING_CLIENT) {
+		// A login waiting on its MFA push is not a stalled handshake: the push call bounds it (90 s).
+		if (sess->status == CONNECTING_CLIENT && sess->authnull_mfa_pkt.ptr == NULL) {
 			unsigned long long sess_time = sess->IdleTime();
 			if (sess_time / 1000 > (unsigned long long)pgsql_thread___connect_timeout_client) {
 				proxy_warning("Closing not established client connection %s:%d after %llums\n", sess->client_myds->addr.addr, sess->client_myds->addr.port, sess_time / 1000);
@@ -3707,6 +3708,13 @@ void PgSQL_Thread::process_all_sessions() {
 			delete sess;
 		}
 		else {
+			if (sess->authnull_mfa_pkt.ptr != NULL) {
+				// Waiting on its MFA push, off this thread: look again soon, without a client event.
+				sess->to_process = 1;
+				if (mypolls.poll_timeout == 0 || mypolls.poll_timeout > kAuthnullMfaPollMicros) {
+					mypolls.poll_timeout = kAuthnullMfaPollMicros;
+				}
+			}
 			if (sess->to_process == 1) {
 				if (sess->pause_until <= curtime) {
 					rc = sess->handler();
