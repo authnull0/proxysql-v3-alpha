@@ -7,6 +7,7 @@
 #include "authnull_backend_role.h"
 #include "authnull_tls.h"
 #include "authnull_session_limits.h"
+#include "authnull_mfa_call.h"
 #include "PgSQL_Authentication.h"
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_Protocol.h"
@@ -923,6 +924,11 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
     }
 
     full_username = std::string(user);
+    // The pass after an MFA push answers: user was trimmed in place on the first pass, so the name
+    // as the client sent it was kept (authnull_mfa_call.h).
+    if (!(*myds)->sess->authnull_mfa_username.empty()) {
+        full_username = (*myds)->sess->authnull_mfa_username;
+    }
     comma_pos = full_username.find(',');
 	if (comma_pos == std::string::npos || comma_pos == full_username.length() - 1) {
 		syslog(LOG_ERR, "[ERROR] Invalid username format for: %s", full_username.c_str());
@@ -1086,17 +1092,25 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 					}
 					
 					CURL* curl = nullptr;
-					CURLcode res;
 					long http_code = 0;
 					std::string response = "";
 					struct curl_slist* headers = nullptr;
 
+					// The push call blocks until the person answers (up to 90 s), so it is not made on
+					// this worker thread, which serves other sessions too (authnull_mfa_call.h). The
+					// first pass starts it and the login waits (PENDING_MFA); the pass after it answers
+					// reads the answer here and goes on as before.
+					std::shared_ptr<AuthnullMfaCall>& mfa_call = (*myds)->sess->authnull_mfa_call;
+					AuthnullMfaAnswer mfa_answer;
+					bool mfa_answered = false, mfa_waiting = false;
+					if (mfa_call && mfa_call->done()) {
+						mfa_answer = mfa_call->take();
+						mfa_call.reset();
+						(*myds)->sess->authnull_mfa_username.clear();
+						mfa_answered = true;
+					}
+
 					try {
-						curl = curl_easy_init();
-						if (!curl) {
-							syslog(LOG_ERR, "[ERROR] CURL Initialization Failed!");
-							throw std::runtime_error("CURL init failed");
-						}
 						
 						std::time_t epoch_time = std::time(nullptr);
 						nlohmann::json requestData = {
@@ -1115,16 +1129,28 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						};
 
 						std::string json_payload = requestData.dump();
+						if (!mfa_answered) {
+						if (!mfa_call) {
+						curl = curl_easy_init();
+						if (!curl) {
+							syslog(LOG_ERR, "[ERROR] CURL Initialization Failed!");
+							throw std::runtime_error("CURL init failed");
+						}
 						headers = curl_slist_append(headers, "Content-Type: application/json");
 						// This proxy's caller token, when it has a credential (authnull_caller_token.h).
 						std::string caller_token = authnullAddCallerAuth(headers);
+						// The call outlives this pass: its body is copied, and the answer goes to a
+						// buffer the call owns.
+						std::shared_ptr<std::string> body = std::make_shared<std::string>();
 
 						curl_easy_setopt(curl, CURLOPT_URL, authnull_api_url2.c_str());
 						curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 						curl_easy_setopt(curl, CURLOPT_POST, 1L);
-						curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload.c_str());
+						curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, json_payload.c_str());
 						curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback2);
-						curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+						curl_easy_setopt(curl, CURLOPT_WRITEDATA, body.get());
+						// Off this thread, curl must not use signals for its timeouts.
+						curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 						curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 						curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
 						// do-authenticationV4 BLOCKS while the user approves the push (Okta/Duo).
@@ -1153,15 +1179,42 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, tls.protocols);
 						}
 						
-						res = curl_easy_perform(curl);
-						if (res != CURLE_OK) {
-							syslog(LOG_ERR, "[ERROR] CURL request failed: %s", curl_easy_strerror(res));
-							throw std::runtime_error(std::string("CURL error: ") + curl_easy_strerror(res));
+						CURL* h = curl;
+						struct curl_slist* hl = headers;
+						mfa_call = AuthnullMfaCall::start([h, hl, body, caller_token]() {
+							AuthnullMfaAnswer a;
+							a.caller_token = caller_token;
+							a.curl_code = (int)curl_easy_perform(h);
+							curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &a.http_code);
+							a.body = std::move(*body);
+							curl_easy_cleanup(h);
+							curl_slist_free_all(hl);
+							return a;
+						});
+						if (!mfa_call) {
+							// Past the cap on logins waiting for a push: refuse rather than block.
+							syslog(LOG_ERR, "[authnull] %d logins already waiting on an MFA push; refusing user '%s' db '%s'",
+								AuthnullMfaCall::in_flight(), clean_user.c_str(), db_name.c_str());
+							throw std::runtime_error("too many logins waiting on MFA");
+						}
+						curl = nullptr;   // the call owns the handle and the headers now
+						headers = nullptr;
+						(*myds)->sess->authnull_mfa_username = full_username;
+						syslog(LOG_INFO, "[authnull] MFA push for user '%s' db '%s' sent; the login waits off-thread",
+							clean_user.c_str(), db_name.c_str());
+						}
+						mfa_waiting = true;
+						} else {
+						if (mfa_answer.curl_code != CURLE_OK) {
+							const char* why = mfa_answer.curl_code < 0 ? "the call did not run" : curl_easy_strerror((CURLcode)mfa_answer.curl_code);
+							syslog(LOG_ERR, "[ERROR] CURL request failed: %s", why);
+							throw std::runtime_error(std::string("CURL error: ") + why);
 						}
 						
-						curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+						http_code = mfa_answer.http_code;
+						response = std::move(mfa_answer.body);
 						syslog(LOG_INFO, "HTTP Status Code: %ld", http_code);
-						authnullCallerTokenRefused(caller_token, http_code);
+						authnullCallerTokenRefused(mfa_answer.caller_token, http_code);
 						
 						if (http_code != 200) {
 							syslog(LOG_ERR, "[ERROR] AuthNull API returned non-200 status: %ld", http_code);
@@ -1383,12 +1436,19 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							syslog(LOG_ERR, "[ERROR] Failed to parse API response as JSON: %s", e.what());
 							throw;
 						}
+						} // the answer
 					} catch (const std::exception& e) {
 						syslog(LOG_ERR, "[ERROR] Exception during authentication process: %s", e.what());
+						mfa_waiting = false;
+						(*myds)->sess->authnull_mfa_username.clear();
 					}
 					
 					if (curl) curl_easy_cleanup(curl);
 					if (headers) curl_slist_free_all(headers);
+					if (mfa_waiting) {
+						ret = EXECUTION_STATE::PENDING_MFA;
+						goto __exit_process_pkt_handshake_response;
+					}
 				}
 			}
 			if (pass) {
