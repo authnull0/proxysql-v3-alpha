@@ -41,6 +41,18 @@ int main() {
 	expect(name("d", "r", {"READ"}, {"Sales . Orders"}) == name("d", "r", {"READ"}, {"sales.orders"}), "schema-qualified table");
 	expect(name("d", "r", {"READ"}, {"public.t"}) == name("d", "r", {"READ"}, {"t"}), "public schema is the bare name");
 
+	// Custom privileges (AUTH-227): verbs. A verb set that is exactly whole groups keeps its v1 name
+	// (SELECT is READ; SELECT, INSERT, UPDATE, DELETE is READ, WRITE), so roles made before verbs
+	// reached ProxySQL stay valid; any other set is v2, over the sorted verbs. Vectors computed in
+	// Python; database-agent asserts the same.
+	expect(name("dbmfa_test", "dbmfa_writer", {"SELECT"}, four) == "an_8f3a1492e83ffc13", "SELECT is READ's role");
+	expect(name("dbmfa_test", "dbmfa_writer", {"SELECT", "INSERT", "UPDATE", "DELETE"}, four) == "an_7722746c2680046f",
+		"all four verbs are READ,WRITE's role");
+	expect(name("dbmfa_test", "dbmfa_writer", {"READ", "INSERT", "UPDATE", "DELETE"}, four) == "an_7722746c2680046f", "mixed, whole groups");
+	expect(name("dbmfa_test", "dbmfa_writer", {"SELECT", "INSERT"}, four) == "an_f0e09c5084ba5b55", "vector v2 SELECT,INSERT");
+	expect(name("dbmfa_test", "dbmfa_writer", {"read", " insert"}, four) == "an_f0e09c5084ba5b55", "READ,INSERT is SELECT,INSERT");
+	expect(name("salesdb", "readonly_app", {"UPDATE", "TRUNCATE", "SELECT"}, {}) == "an_937b3d2d6c1ba244", "vector v2 with TRUNCATE");
+
 	// No restricted role when EXECUTE is granted, a privilege is unknown, or none is given.
 	bool ok = true;
 	name("d", "r", {"READ", "EXECUTE"}, {"t"}, &ok); expect(!ok, "EXECUTE keeps the policy's role");

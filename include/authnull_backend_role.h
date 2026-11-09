@@ -12,6 +12,12 @@
 //	"an_" + first 16 hex of SHA-256("v1|<db, lower>|<role>|<privileges, upper, sorted>|<tables, sorted>")
 //
 // where a table is lower case, its bare name in schema public and schema.table otherwise.
+//
+// Privileges may also be SQL verbs (custom privileges, AUTH-227): SELECT, INSERT, UPDATE, DELETE,
+// TRUNCATE, with READ = SELECT and WRITE = INSERT, UPDATE, DELETE. A verb set that is exactly whole
+// groups is named as those groups ("v1", above), so SELECT alone is READ's role; any other set is
+//
+//	"an_" + first 16 hex of SHA-256("v2|<db, lower>|<role>|<verbs, upper, sorted>|<tables, sorted>")
 // database-agent's BackendRoleName (src/pkg/backendrole.go) computes the same; both test files
 // assert the same vectors. EXECUTE in the privileges means no restricted role: DDL needs what the
 // policy's own role holds.
@@ -96,20 +102,34 @@ inline bool authnullBackendRoleName(const std::string& database, const std::stri
 	const std::vector<std::string>& privileges, const std::vector<std::string>& tables, std::string& out) {
 	// Qualified, not a using-directive: ProxySQL has a global d::trim() that would make calls ambiguous.
 	namespace d = authnull_backend_role_detail;
-	std::set<std::string> privs;
+	std::set<std::string> verbs;
 	for (const auto& p : privileges) {
 		std::string u = d::upper(d::trim(p));
-		if (u != "READ" && u != "WRITE") return false;
-		privs.insert(u);
+		if (u == "READ") verbs.insert("SELECT");
+		else if (u == "WRITE") { verbs.insert("INSERT"); verbs.insert("UPDATE"); verbs.insert("DELETE"); }
+		else if (u == "SELECT" || u == "INSERT" || u == "UPDATE" || u == "DELETE" || u == "TRUNCATE") verbs.insert(u);
+		else return false; // EXECUTE, or a privilege nobody knows
 	}
-	if (privs.empty()) return false;
+	if (verbs.empty()) return false;
+	// Whole groups keep the v1 name.
+	bool read = verbs.count("SELECT") > 0;
+	bool write = verbs.count("INSERT") && verbs.count("UPDATE") && verbs.count("DELETE");
+	size_t grouped = (read ? 1 : 0) + (write ? 3 : 0);
+	std::string version = "v2";
+	std::set<std::string> privs = verbs;
+	if (grouped == verbs.size()) {
+		version = "v1";
+		privs.clear();
+		if (read) privs.insert("READ");
+		if (write) privs.insert("WRITE");
+	}
 
 	std::set<std::string> ts;
 	for (const auto& t : tables) {
 		if (!d::trim(t).empty()) ts.insert(d::canonicalTable(t));
 	}
 
-	std::string canonical = "v1|" + d::lower(d::trim(database)) + "|" + d::trim(role) + "|";
+	std::string canonical = version + "|" + d::lower(d::trim(database)) + "|" + d::trim(role) + "|";
 	bool first = true;
 	for (const auto& p : privs) { canonical += (first ? "" : ",") + p; first = false; }
 	canonical += "|";
