@@ -1,7 +1,16 @@
-// Which policy privileges (READ, WRITE, EXECUTE) a client query needs.
+// Which policy privileges a client query needs.
 //
-// A database policy grants a session some of READ, WRITE and EXECUTE, and ProxySQL refuses a query
-// that needs one it was not granted (checkPermission / checkPermission2). The classifier that
+// A database policy grants a session privileges, and ProxySQL refuses a query that needs one it was
+// not granted (checkPermission / checkPermission2). Privileges are SQL verbs -- SELECT, INSERT,
+// UPDATE, DELETE, TRUNCATE -- and EXECUTE for everything else; READ, WRITE and EXECUTE are the
+// original groups and keep their meaning:
+//
+//	READ     SELECT
+//	WRITE    INSERT, UPDATE, DELETE
+//	EXECUTE  EXECUTE, TRUNCATE (TRUNCATE was never WRITE)
+//
+// so a policy saying SELECT and INSERT can insert and cannot update, where READ and WRITE can do
+// both. (authn-service used to collapse SELECT+INSERT into READ+WRITE: custom privileges, AUTH-227.) The classifier that
 // decided "needs" looked at the first word of the whole query text, and two queries got a
 // READ-only session to write on the lab (2 Nov):
 //
@@ -15,15 +24,20 @@
 // refused rather than guessed.
 //
 // Within a statement:
-//   SELECT, VALUES, TABLE, SHOW, DESCRIBE, a read-only WITH        READ
-//   ... that also writes (INSERT/UPDATE/DELETE/MERGE inside), or locks rows (FOR UPDATE/SHARE)   WRITE
-//   ... INTO (SELECT INTO creates a table; INTO OUTFILE writes a file)                          EXECUTE
-//   EXPLAIN ANALYZE <stmt> runs <stmt>; plain EXPLAIN is READ
-//   INSERT, UPDATE, DELETE, MERGE, REPLACE, UPSERT, LOAD, COPY ... FROM                          WRITE
-//   COPY ... TO STDOUT is an export, READ; any other COPY                                        EXECUTE
-//   anything else (DDL, GRANT, SET, DO, CALL, BEGIN, ...)                                        EXECUTE
-// plus, wherever they are called, functions with side effects (set_config, setval, dblink_exec,
-// lo_import, pg_terminate_backend, load_file, ...).
+//   SELECT, VALUES, TABLE, SHOW, DESCRIBE, a read-only WITH                          SELECT
+//   ... with INSERT / UPDATE / DELETE inside (a writing CTE)                         + that verb
+//   ... MERGE inside: INSERT, UPDATE, DELETE; MySQL REPLACE: INSERT, DELETE
+//   ... row locks (FOR UPDATE/SHARE, LOCK IN SHARE MODE)                             + UPDATE
+//   ... INTO (SELECT INTO creates a table; INTO OUTFILE writes a file)               + EXECUTE
+//   EXPLAIN ANALYZE <stmt> runs <stmt>; plain EXPLAIN is SELECT
+//   INSERT (with ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: + UPDATE), UPDATE, DELETE
+//   MERGE: the actions it names; REPLACE: INSERT, DELETE; UPSERT: INSERT, UPDATE
+//   LOAD, COPY ... FROM                                                              INSERT
+//   COPY ... TO STDOUT is an export, SELECT; any other COPY                          EXECUTE
+//   TRUNCATE                                                                         TRUNCATE
+//   anything else (DDL, GRANT, SET, DO, CALL, BEGIN, ...)                            EXECUTE
+// plus, wherever they are called, functions with side effects: setval, nextval, lo_* (UPDATE);
+// set_config, dblink_exec, lo_import, pg_terminate_backend, load_file, ... (EXECUTE).
 //
 // LIMITS. This is a gate in front of the database, not the database's own permission system: a
 // user-defined function with side effects reads as a call to an unknown function, which is READ.
@@ -239,26 +253,36 @@ inline void addCalls(const std::vector<Tok>& t, std::set<std::string>& need) {
 		if (t[i].kind != TokKind::Word && t[i].kind != TokKind::QuotedIdent) continue;
 		std::string fn = lower(t[i].text);
 		if (executeFunctions().count(fn)) need.insert("EXECUTE");
-		else if (writeFunctions().count(fn)) need.insert("WRITE");
+		else if (writeFunctions().count(fn)) need.insert("UPDATE");
 	}
 }
 
 inline void classify(const std::vector<Tok>& t, std::set<std::string>& need);
 
-// A query statement (SELECT, WITH, VALUES, ...): READ, raised by what is inside it.
-inline void classifyQuery(const std::vector<Tok>& t, std::set<std::string>& need) {
-	need.insert("READ");
+// addWrites: the verbs the writes anywhere in t need -- INSERT, UPDATE, DELETE, and MERGE's and
+// REPLACE's -- and row locks.
+inline void addWrites(const std::vector<Tok>& t, std::set<std::string>& need) {
 	for (size_t i = 0; i < t.size(); i++) {
-		if (t[i].kind != TokKind::Word) continue;
+		if (t[i].kind != TokKind::Word || calledAt(t, i)) continue; // REPLACE(...), INSERT(...): string functions
 		const std::string& w = t[i].text;
-		bool writes = (w == "INSERT" || w == "UPDATE" || w == "DELETE" || w == "MERGE" || w == "REPLACE");
-		if (writes && !calledAt(t, i)) need.insert("WRITE"); // REPLACE(...) and INSERT(...) are string functions
+		if (w == "INSERT" || w == "UPDATE" || w == "DELETE") need.insert(w);
+		if (w == "MERGE") { need.insert("INSERT"); need.insert("UPDATE"); need.insert("DELETE"); }
+		if (w == "REPLACE") { need.insert("INSERT"); need.insert("DELETE"); }
 		if (w == "FOR" && (isWord(t, i + 1, "UPDATE") || isWord(t, i + 1, "SHARE") ||
 			isWord(t, i + 1, "NO") || isWord(t, i + 1, "KEY"))) {
-			need.insert("WRITE"); // row locks
+			need.insert("UPDATE"); // row locks
 		}
-		if (w == "LOCK" && isWord(t, i + 1, "IN")) need.insert("WRITE"); // MySQL LOCK IN SHARE MODE
-		if (w == "INTO" && !(i > 0 && t[i - 1].kind == TokKind::Word &&
+		if (w == "LOCK" && isWord(t, i + 1, "IN")) need.insert("UPDATE"); // MySQL LOCK IN SHARE MODE
+	}
+}
+
+// A query statement (SELECT, WITH, VALUES, ...): SELECT, raised by what is inside it.
+inline void classifyQuery(const std::vector<Tok>& t, std::set<std::string>& need) {
+	need.insert("SELECT");
+	addWrites(t, need);
+	for (size_t i = 0; i < t.size(); i++) {
+		if (t[i].kind != TokKind::Word) continue;
+		if (t[i].text == "INTO" && !(i > 0 && t[i - 1].kind == TokKind::Word &&
 			(t[i - 1].text == "INSERT" || t[i - 1].text == "REPLACE" || t[i - 1].text == "MERGE"))) {
 			need.insert("EXECUTE"); // SELECT INTO creates a table; INTO OUTFILE writes a file
 		}
@@ -279,7 +303,7 @@ inline void classify(const std::vector<Tok>& t, std::set<std::string>& need) {
 		return;
 	}
 	if (k == "SHOW" || k == "DESCRIBE" || k == "DESC") {
-		need.insert("READ");
+		need.insert("SELECT");
 		return;
 	}
 	if (k == "EXPLAIN") {
@@ -299,7 +323,7 @@ inline void classify(const std::vector<Tok>& t, std::set<std::string>& need) {
 			if (t[i].text == "ANALYZE" || t[i].text == "ANALYSE") analyze = true;
 			i++;
 		}
-		if (!analyze) { need.insert("READ"); return; }
+		if (!analyze) { need.insert("SELECT"); return; }
 		classify(std::vector<Tok>(t.begin() + static_cast<long>(i), t.end()), need);
 		return;
 	}
@@ -311,16 +335,28 @@ inline void classify(const std::vector<Tok>& t, std::set<std::string>& need) {
 			if (x.text == "TO") to = true;
 			if (x.text == "STDOUT") stdout_ = true;
 		}
-		if (from) need.insert("WRITE");
-		else if (to && stdout_) need.insert("READ");
+		if (from) need.insert("INSERT");
+		else if (to && stdout_) need.insert("SELECT");
 		else need.insert("EXECUTE");
 		return;
 	}
-	if (k == "INSERT" || k == "UPDATE" || k == "DELETE" || k == "MERGE" || k == "REPLACE" ||
-		k == "UPSERT" || k == "LOAD") {
-		need.insert("WRITE");
+	if (k == "MERGE") {
+		// The actions it names (WHEN ... THEN INSERT / UPDATE / DELETE), not the MERGE word itself.
+		for (size_t i = first + 1; i < t.size(); i++) {
+			if (t[i].kind == TokKind::Word && (t[i].text == "INSERT" || t[i].text == "UPDATE" || t[i].text == "DELETE") && !calledAt(t, i)) {
+				need.insert(t[i].text);
+			}
+		}
+		if (need.empty()) need.insert("UPDATE");
 		return;
 	}
+	if (k == "INSERT" || k == "UPDATE" || k == "DELETE" || k == "REPLACE") {
+		addWrites(t, need); // the statement's own verb, an upsert's UPDATE, writes in its CTEs
+		return;
+	}
+	if (k == "UPSERT") { need.insert("INSERT"); need.insert("UPDATE"); return; }
+	if (k == "LOAD") { need.insert("INSERT"); return; }
+	if (k == "TRUNCATE") { need.insert("TRUNCATE"); return; }
 	need.insert("EXECUTE");
 }
 
@@ -338,13 +374,31 @@ inline std::set<std::string> authnullRequiredPrivileges(const std::string& sql, 
 	return need;
 }
 
+// authnullGrantedVerbs: a policy's privileges as the verbs the classifier speaks. The groups expand
+// (READ, WRITE, EXECUTE above); a verb is itself; anything else grants nothing.
+inline std::set<std::string> authnullGrantedVerbs(const std::vector<std::string>& granted) {
+	std::set<std::string> out;
+	for (const auto& g : granted) {
+		std::string p;
+		for (char c : g) {
+			if (!std::isspace(static_cast<unsigned char>(c))) p += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+		}
+		if (p == "READ") out.insert("SELECT");
+		else if (p == "WRITE") { out.insert("INSERT"); out.insert("UPDATE"); out.insert("DELETE"); }
+		else if (p == "EXECUTE") { out.insert("EXECUTE"); out.insert("TRUNCATE"); }
+		else if (p == "SELECT" || p == "INSERT" || p == "UPDATE" || p == "DELETE" || p == "TRUNCATE") out.insert(p);
+	}
+	return out;
+}
+
 // authnullQueryPermitted: may a session granted these privileges run sql?
 inline bool authnullQueryPermitted(const std::vector<std::string>& granted, const std::string& sql, AuthnullDialect d) {
 	bool ok = false;
 	std::set<std::string> need = authnullRequiredPrivileges(sql, d, ok);
 	if (!ok) return false;
+	std::set<std::string> have = authnullGrantedVerbs(granted);
 	for (const auto& p : need) {
-		if (std::find(granted.begin(), granted.end(), p) == granted.end()) return false;
+		if (!have.count(p)) return false;
 	}
 	return true;
 }

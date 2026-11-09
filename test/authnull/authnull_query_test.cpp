@@ -91,6 +91,53 @@ int main() {
 	permits(MY, READ_ONLY, "select 1; delete from t", false, "multi-statement");
 	permits(MY, READ_ONLY, "select * from customers", true, "plain select");
 
+	// --- custom privileges: a policy may name SQL verbs instead of READ/WRITE/EXECUTE ---
+	// SELECT and INSERT mean exactly that: no UPDATE or DELETE riding along with "WRITE".
+	const P SEL_INS = {"SELECT", "INSERT"};
+	permits(PG, SEL_INS, "select * from t", true, "verbs: select");
+	permits(PG, SEL_INS, "insert into t values (1)", true, "verbs: insert");
+	permits(PG, SEL_INS, "update t set a = 1", false, "verbs: update not granted");
+	permits(PG, SEL_INS, "delete from t", false, "verbs: delete not granted");
+	permits(PG, SEL_INS, "truncate t", false, "verbs: truncate not granted");
+	permits(PG, SEL_INS, "copy t from stdin", true, "verbs: copy from is an insert");
+	permits(PG, SEL_INS, "insert into t values (1) on conflict (id) do update set a = 2", false, "verbs: upsert also updates");
+	permits(PG, SEL_INS, "merge into t using s on t.id = s.id when matched then update set a = 1", false, "verbs: merge");
+	permits(PG, SEL_INS, "select * from t for update", false, "verbs: row lock needs update");
+	permits(PG, SEL_INS, "with d as (delete from t returning id) select id from d", false, "verbs: delete inside a CTE");
+	permits(PG, SEL_INS, "create table x (id int)", false, "verbs: DDL");
+	permits(PG, SEL_INS, "select nextval('s')", false, "verbs: nextval changes a sequence");
+	permits(MY, SEL_INS, "insert into t values (1) on duplicate key update a = 2", false, "verbs: mysql upsert also updates");
+	permits(MY, SEL_INS, "replace into t values (1)", false, "verbs: mysql replace deletes");
+
+	const P SEL_UPD = {"SELECT", "UPDATE"};
+	permits(PG, SEL_UPD, "update t set a = 1 where id = 2", true, "verbs: update");
+	permits(PG, SEL_UPD, "select * from t for update", true, "verbs: row lock with update");
+	permits(PG, SEL_UPD, "select setval('s', 5)", true, "verbs: setval with update");
+	permits(PG, SEL_UPD, "insert into t values (1)", false, "verbs: insert not granted");
+	permits(PG, {"SELECT", "INSERT", "UPDATE"}, "insert into t values (1) on conflict (id) do update set a = 2", true, "verbs: upsert with both");
+	permits(MY, {"SELECT", "INSERT", "DELETE"}, "replace into t values (1)", true, "verbs: replace with both");
+
+	permits(PG, {"SELECT", "DELETE"}, "delete from t where id = 1", true, "verbs: delete");
+	permits(PG, {"SELECT", "TRUNCATE"}, "truncate table t", true, "verbs: truncate");
+	permits(PG, {"SELECT", "TRUNCATE"}, "delete from t", false, "verbs: truncate is not delete");
+	permits(PG, {"SELECT"}, "select 1", true, "verbs: SELECT is READ");
+	permits(PG, {"select", " insert "}, "insert into t values (1)", true, "verbs: case and spaces");
+	permits(PG, {"SELECT", "INSERT", "UPDATE", "DELETE"},
+		"merge into t using s on t.id = s.id when matched then update set a = 1 when not matched then insert values (1)",
+		true, "verbs: merge with all three");
+
+	// --- the groups are unchanged ---
+	permits(PG, READ_WRITE, "truncate t", false, "groups: WRITE still cannot truncate");
+	permits(PG, ALL, "truncate t", true, "groups: EXECUTE still can");
+	permits(PG, READ_WRITE, "insert into t values (1) on conflict (id) do update set a = 2", true, "groups: upsert");
+	permits(PG, READ_WRITE, "select * from t for update", true, "groups: row lock");
+	permits(PG, READ_WRITE, "select nextval('s')", true, "groups: nextval");
+	permits(MY, READ_WRITE, "replace into t values (1)", true, "groups: replace");
+	permits(PG, {"READ", "INSERT"}, "insert into t values (1)", true, "groups and verbs mixed");
+	permits(PG, {"READ", "INSERT"}, "update t set a = 1", false, "groups and verbs mixed: no update");
+	permits(PG, {"WRITE"}, "select 1", false, "groups: WRITE does not read");
+	permits(PG, {"BOGUS"}, "select 1", false, "an unknown privilege grants nothing");
+
 	if (failures) {
 		std::fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;
