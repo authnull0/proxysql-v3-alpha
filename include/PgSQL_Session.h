@@ -293,6 +293,8 @@ public:
 	std::shared_ptr<AuthnullMfaCall> authnull_mfa_call;
 	PtrSize_t authnull_mfa_pkt { 0, NULL };
 	std::string authnull_mfa_username;
+	// Why authn-service refused this login, for the client's error (authnull_refusal.h).
+	std::string authnull_refusal;
 #if 0
 	/*
 	 * @brief Store the hostgroups that hold connections that have been flagged as 'expired' by the

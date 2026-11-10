@@ -133,6 +133,7 @@ static const std::set<std::string> pgsql_variables_strings = {
 #include "proxysql_find_charset.h"
 #include "authnull_query.h"
 #include "authnull_log.h"
+#include "authnull_refusal.h"
 #include "authnull_session_limits.h"
 
 extern PgSQL_Authentication* GloPgAuth;
@@ -5956,7 +5957,11 @@ void PgSQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 			}
 #endif // DEBUG
 			sprintf(_s, "ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
-			client_myds->myprot.generate_error_packet(true, false, _s, PGSQL_ERROR_CODES::ERRCODE_INVALID_PASSWORD, true, true);
+			{
+				// The reason authn-service gave, when it refused the login (authnull_refusal.h).
+				std::string denied = authnullDeniedMessage(_s, authnull_refusal);
+				client_myds->myprot.generate_error_packet(true, false, denied.c_str(), PGSQL_ERROR_CODES::ERRCODE_INVALID_PASSWORD, true, true);
+			}
 			proxy_error("%s\n", _s);
 			free(_s);
 			__sync_fetch_and_add(&PgHGM->status.access_denied_wrong_password, 1);

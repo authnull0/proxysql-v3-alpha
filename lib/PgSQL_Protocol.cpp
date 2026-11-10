@@ -1240,6 +1240,7 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 									clean_user.c_str(), db_name.c_str(),
 									jsonResponse.value("message", std::string("no message")).c_str(),
 									jsonResponse.value("requestId", std::string("-")).c_str());
+								(*myds)->sess->authnull_refusal = jsonResponse.value("message", std::string(""));
 								throw std::runtime_error("Authentication refused by authn-service (isValid=false)");
 							}
 
