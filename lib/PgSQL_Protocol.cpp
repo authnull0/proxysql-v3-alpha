@@ -7,6 +7,7 @@
 #include "authnull_backend_role.h"
 #include "authnull_tls.h"
 #include "authnull_session_limits.h"
+#include "authnull_recording.h"
 #include "authnull_mfa_call.h"
 #include "PgSQL_Authentication.h"
 #include "PgSQL_Data_Stream.h"
@@ -332,12 +333,9 @@ void PG_pkt::write_DataRow(const char *tupdesc, ...) {
         int len = 0;
         if (val) {
             len = strlen(val);
-            syslog(LOG_INFO, "PG_pkt::write_DataRow: Field %d, len=%d, data='%.*s'",
-                   i, len, std::min(16, len), val);
             put_uint32(len);
             put_bytes(val, len);
         } else {
-            syslog(LOG_INFO, "PG_pkt::write_DataRow: Field %d is NULL", i);
             put_uint32(-1);
         }
     }
@@ -1432,6 +1430,12 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 									authnullSessionLimits().erase(thread_session_i);
 								}
 							}
+							// Whether the policy asks for the session's statements to be recorded
+							// (authnull_recording.h). Set on every login.
+							(*myds)->sess->authnull_record = authnullRecordFromJSON(credential);
+							if ((*myds)->sess->authnull_record) {
+								syslog(LOG_INFO, "[authnull] session %u for %s on %s is recorded", thread_session_i, username.c_str(), mfa_db.c_str());
+							}
 
 							syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s",
 								username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
@@ -2050,23 +2054,8 @@ unsigned int PgSQL_Protocol::copy_row_to_PgSQL_Query_Result(bool send, PgSQL_Que
     const unsigned int numFields = pg_query_result->num_fields;
     unsigned int total_size = 0;
     
-    // Log number of rows and fields clearly
-    syslog(LOG_INFO, "Processing results - Total Rows: %u | Total Fields: %u", numRows, numFields);
-    
+    // Result data never goes to the log (test/authnull/authnull_no_data_in_logs_test.cpp).
     for (unsigned int i = 0; i < numRows; i++) {
-        // Build row data string for logging
-        std::string row_data = "";
-        for (unsigned int j = 0; j < numFields; j++) {
-            if (PQgetisnull(result, i, j)) {
-                row_data += "NULL\t";
-            } else {
-                row_data += std::string(PQgetvalue(result, i, j)) + "\t";
-            }
-        }
-        
-        // Log each row with distinct marker
-        syslog(LOG_INFO, "ROW[%u]: %s", i, row_data.c_str());
-        
         // --- Build data packet ---
         unsigned int size = 1 + 4 + 2;
         for (unsigned int j = 0; j < numFields; j++) {

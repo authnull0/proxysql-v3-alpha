@@ -5643,7 +5643,6 @@ __get_pkts_from_client:
 											}
 										}
 									}
-									syslog(LOG_INFO, "Query Executed: %s", query.c_str());
 									syslog(LOG_INFO, "User IP: %s, Device IP: %s", user_ip.c_str(), device_ip.c_str());
 									syslog(LOG_INFO, "User: %s, Database: %s", user.c_str(), db_name.c_str());
 									std::string seid = std::to_string(this->thread_session_id); 

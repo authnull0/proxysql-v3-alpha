@@ -36,7 +36,8 @@ static void forbid(const std::string& path, const std::vector<std::string>& need
 	int n = 0;
 	while (std::getline(lines, line)) {
 		n++;
-		if (line.find("std::cout") == std::string::npos && line.find("printf(") == std::string::npos) continue;
+		if (line.find("std::cout") == std::string::npos && line.find("printf(") == std::string::npos &&
+			line.find("syslog(") == std::string::npos) continue;
 		for (const auto& needle : needles) {
 			if (line.find(needle) != std::string::npos) {
 				std::fprintf(stderr, "FAIL %s:%d prints %s: %s\n", path.c_str(), n, needle.c_str(), line.c_str());
@@ -49,9 +50,13 @@ static void forbid(const std::string& path, const std::vector<std::string>& need
 int main() {
 	// Result sets: the rows, as sent.
 	forbid("lib/MySQL_ResultSet.cpp", {"packet_data", "[DEBUG] Row", "Result Set Before Sending"});
+	// PgSQL result sets: copy_row_to_PgSQL_Query_Result wrote every row it sent to syslog.
+	forbid("lib/PgSQL_Protocol.cpp", {"ROW[", "row_data", "PQgetvalue", "data='%.*s'"});
 	// Sessions: the query text.
-	forbid("lib/MySQL_Session.cpp", {"Parsing query", "<< query", "<< q <<"});
-	forbid("lib/PgSQL_Session.cpp", {"Parsing query", "<< query", "<< q <<"});
+	// syslog too: the query text belongs in a session recording, masked, only when the policy asks
+	// for one (authnull_recording.h), never in the system log.
+	forbid("lib/MySQL_Session.cpp", {"Parsing query", "<< query", "<< q <<", "query.c_str()", "Query Executed"});
+	forbid("lib/PgSQL_Session.cpp", {"Parsing query", "<< query", "<< q <<", "query.c_str()", "Query Executed"});
 
 	if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
 	std::puts("ok");
