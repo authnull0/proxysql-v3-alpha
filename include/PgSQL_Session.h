@@ -181,6 +181,7 @@ private:
 	 */
 	void RequestEnd(PgSQL_Data_Stream*) override;
 	void LogQuery(PgSQL_Data_Stream*);
+	void authnullRecordQuery();
 
 	void handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY___create_mirror_session();
 	int handler_again___status_PINGING_SERVER();
@@ -295,6 +296,11 @@ public:
 	std::string authnull_mfa_username;
 	// Why authn-service refused this login, for the client's error (authnull_refusal.h).
 	std::string authnull_refusal;
+	// Session recording (authnull_recording.h): whether the policy asked for it; whether ProxySQL
+	// refused the statement now ending; the backend's error for it, if any.
+	bool authnull_record = false;
+	bool authnull_refused = false;
+	std::string authnull_query_error;
 #if 0
 	/*
 	 * @brief Store the hostgroups that hold connections that have been flagged as 'expired' by the

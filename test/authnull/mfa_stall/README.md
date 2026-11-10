@@ -45,3 +45,15 @@ CONNECTION` with a bad id, an unknown id and then its own id. To run it, swap `v
   and ProxySQL stayed up;
 - the kill answered `1|session 4 killed`, and the session's next query got "server closed the
   connection".
+
+## Session recording (`rectest.sh`)
+
+`RECORD=1 ./rectest.sh 2 0 [proxysql binary]` makes the stub ask for recording
+(`credentialSubject.session.record`). `rec.py` runs, as `stall_fast` (READ only), a select, a refused
+insert, a refused `ALTER ROLE ... PASSWORD`, a statement that errors, and a select of a literal. The
+script prints the spool (`AUTHNULL_RECORDING_DIR=/tmp/stalltest/spool`) and counts the syslog lines
+holding the password, the literal or the table name, which must be 0.
+
+Lab, 10 Nov 2026: five lines in one 0600 bucket file, in a 0700 directory. The refused statements have
+`allowed: false` and the refusal. The password reads `'***'`. The error is `[42P01] relation "nosuch" does not exist`.
+There were 0 syslog lines. Without `RECORD` there is no spool at all.

@@ -135,6 +135,7 @@ static const std::set<std::string> pgsql_variables_strings = {
 #include "authnull_log.h"
 #include "authnull_refusal.h"
 #include "authnull_session_limits.h"
+#include "authnull_recording.h"
 
 extern PgSQL_Authentication* GloPgAuth;
 extern MySQL_LDAP_Authentication* GloMyLdapAuth;
@@ -3483,7 +3484,6 @@ void PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		} else {
 			query = "unknown";
 		}
-		syslog(LOG_INFO, "Query Executed 1: %s", query.c_str());
 		qpo = GloPgQPro->process_query(this, pkt.ptr, pkt.size, &CurrentQuery);
 		if (thread->variables.stats_time_query_processor) {
 			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &endt);
@@ -3633,7 +3633,6 @@ void PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		} else {
 			query = "unknown";
 		}
-		syslog(LOG_INFO, "Query Executed 2: %s", query.c_str());
 		qpo = GloPgQPro->process_query(this, NULL, 0, &CurrentQuery);
 		if (qpo->max_lag_ms >= 0) {
 			thread->status_variables.stvar[st_var_queries_with_max_lag_ms]++;
@@ -4165,6 +4164,8 @@ __get_pkts_from_client:
 											syslog(LOG_WARNING, "[authnull] ending session %u of %s on %s: %s", this->thread_session_id, user.c_str(), db_name.c_str(), why.c_str());
 											client_myds->DSS=STATE_QUERY_SENT_NET;
 											std::string msg = "Session ended: " + why;
+											authnull_refused = true;
+											authnull_query_error = msg;
 											client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"57P01", (char *)msg.c_str(), true);
 											RequestEnd(NULL);
 											l_free(pkt.size, pkt.ptr);
@@ -4178,13 +4179,13 @@ __get_pkts_from_client:
 									syslog(LOG_INFO, "[DEBUG] Query Not OK");
 									client_myds->DSS=STATE_QUERY_SENT_NET;
 									char *err_msg = (char *)"Access denied: Query not permitted for this user";
+									authnull_refused = true;
+									authnull_query_error = err_msg;
 									client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
 									RequestEnd(NULL);
 									l_free(pkt.size, pkt.ptr);
 									break; 
 								}
-								syslog(LOG_INFO, "User: %s, Database: %s", user.c_str(), db_name.c_str());
-								syslog(LOG_INFO, "Query Executed 3: %s", query.c_str());
 								unsigned long session_id = this->thread_session_id;
 								extractTableAndFieldsFromQuery2(query, session_id, user, db_name);
 								syslog(LOG_DEBUG, "[DEBUG] process_query using session ID: %lu", session_id);
@@ -4418,7 +4419,6 @@ __get_pkts_from_client:
 						} else {
 							query = "unknown";
 						}
-						syslog(LOG_INFO, "Query Executed 4: %s", query.c_str());
 						qpo = GloPgQPro->process_query(this, pkt.ptr, pkt.size, &CurrentQuery);
 						if (thread->variables.stats_time_query_processor) {
 							clock_gettime(CLOCK_THREAD_CPUTIME_ID, &endt);
@@ -4846,6 +4846,7 @@ bool PgSQL_Session::handler_minus1_ClientLibraryError(PgSQL_Data_Stream* myds) {
 
 // this function was inline
 void PgSQL_Session::handler_minus1_LogErrorDuringQuery(PgSQL_Connection* myconn) {
+	authnull_query_error = myconn->get_error_code_with_message(); // SQLSTATE and the primary message: no DETAIL
 	if (pgsql_thread___verbose_query_error) {
 		proxy_warning("Error during query on (%d,%s,%d,%lu) , user \"%s@%s\" , dbname \"%s\" , %s . digest_text = \"%s\"\n", myconn->parent->myhgc->hid, myconn->parent->address, myconn->parent->port, myconn->get_mysql_thread_id(), client_myds->myconn->userinfo->username, (client_myds->addr.addr ? client_myds->addr.addr : (char*)"unknown"), client_myds->myconn->userinfo->dbname, myconn->get_error_code_with_message().c_str(), CurrentQuery.QueryParserArgs.digest_text);
 	} else {
@@ -7801,6 +7802,11 @@ void PgSQL_Session::LogQuery(PgSQL_Data_Stream* myds) {
 	// we need to access statistics before calling CurrentQuery.end()
 	// so we track the time here
 	CurrentQuery.end_time = thread->curtime;
+	if (authnull_record) {
+		authnullRecordQuery();
+	}
+	authnull_refused = false;
+	authnull_query_error.clear();
 
 	if (qpo) {
 		if (qpo->log == 1) {
@@ -7815,6 +7821,49 @@ void PgSQL_Session::LogQuery(PgSQL_Data_Stream* myds) {
 		}
 	}
 }
+// authnullRecordQuery writes the statement now ending to the recording spool (authnull_recording.h):
+// its text (masked there), whether it ran, rows, duration and error -- never result data.
+void PgSQL_Session::authnullRecordQuery() {
+	AuthnullRecordedStatement st;
+	st.session_id = thread_session_id;
+	const char* q = NULL;
+	size_t ql = 0;
+	if (status == PROCESSING_STMT_EXECUTE && CurrentQuery.stmt_info) {
+		q = (const char*)CurrentQuery.stmt_info->query;
+		ql = CurrentQuery.stmt_info->query_length;
+	} else {
+		q = (const char*)CurrentQuery.QueryPointer;
+		ql = CurrentQuery.QueryLength;
+	}
+	if (q == NULL || ql == 0) return;
+	while (ql > 0 && q[ql - 1] == '\0') ql--;
+	st.statement.assign(q, ql);
+	uint64_t real = realtime_time();
+	uint64_t mono = thread->curtime;
+	if (CurrentQuery.start_time) {
+		st.at_ms = (long long)((CurrentQuery.start_time + real - mono) / 1000);
+		if (CurrentQuery.end_time > CurrentQuery.start_time) {
+			st.duration_ms = (long long)((CurrentQuery.end_time - CurrentQuery.start_time) / 1000);
+		}
+	} else {
+		st.at_ms = (long long)(real / 1000);
+	}
+	if (client_myds && client_myds->myconn && client_myds->myconn->userinfo) {
+		if (client_myds->myconn->userinfo->username) st.user = client_myds->myconn->userinfo->username;
+		if (client_myds->myconn->userinfo->dbname) st.database = client_myds->myconn->userinfo->dbname;
+	}
+	if (client_myds && client_myds->addr.addr) {
+		st.client = std::string(client_myds->addr.addr) + ":" + std::to_string(client_myds->addr.port);
+	}
+	st.allowed = !authnull_refused;
+	st.rows = CurrentQuery.rows_sent;
+	if (CurrentQuery.have_affected_rows) st.affected = CurrentQuery.affected_rows;
+	st.error = authnull_query_error;
+	if (!authnullRecorder().append(authnullRecordLine(st))) {
+		proxy_warning("[authnull] could not write the recording of session %u\n", thread_session_id);
+	}
+}
+
 void PgSQL_Session::RequestEnd(PgSQL_Data_Stream* myds) {
 	// check if multiplexing needs to be disabled
 	char* qdt = NULL;
