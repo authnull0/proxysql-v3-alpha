@@ -30,11 +30,15 @@ struct AuthnullSessionLimit {
 	long long started_s = 0; // when the session was let in (Unix seconds)
 	int max_minutes = 0;     // 0: no limit
 	int idle_minutes = 0;    // 0: no limit
+	long long ends_s = 0;    // an access grant's end, Unix seconds; 0: none
 };
 
-// authnullSessionLimitFromJSON reads credentialSubject.session. False when it carries no limit.
-inline bool authnullSessionLimitFromJSON(const nlohmann::json& cs, int& max_minutes, int& idle_minutes) {
+// authnullSessionLimitFromJSON reads credentialSubject.session: the policy's limits, and endsAt --
+// the end of the access grant the login was let through on (authnull-service
+// docs/DB-ACCESS-REQUESTS.md). False when it carries no limit.
+inline bool authnullSessionLimitFromJSON(const nlohmann::json& cs, int& max_minutes, int& idle_minutes, long long& ends_s) {
 	max_minutes = idle_minutes = 0;
+	ends_s = 0;
 	if (!cs.is_object() || !cs.contains("session") || !cs["session"].is_object()) return false;
 	const nlohmann::json& s = cs["session"];
 	auto read = [&s](const char* k) -> int {
@@ -45,7 +49,16 @@ inline bool authnullSessionLimitFromJSON(const nlohmann::json& cs, int& max_minu
 	};
 	max_minutes = read("maxDurationMinutes");
 	idle_minutes = read("idleTimeoutMinutes");
-	return max_minutes > 0 || idle_minutes > 0;
+	if (s.contains("endsAt") && s["endsAt"].is_number_integer() && s["endsAt"].get<long long>() > 0) {
+		ends_s = s["endsAt"].get<long long>();
+	}
+	return max_minutes > 0 || idle_minutes > 0 || ends_s > 0;
+}
+
+inline bool authnullSessionLimitFromJSON(const nlohmann::json& cs, int& max_minutes, int& idle_minutes) {
+	long long ends_s = 0;
+	bool any = authnullSessionLimitFromJSON(cs, max_minutes, idle_minutes, ends_s);
+	return any && (max_minutes > 0 || idle_minutes > 0);
 }
 
 // authnullSessionLimitReason says why the session must end now, or "" when it may go on.
@@ -56,6 +69,9 @@ inline std::string authnullSessionLimitReason(const AuthnullSessionLimit& l, lon
 	}
 	if (l.idle_minutes > 0 && idle_ms / 1000 >= static_cast<unsigned long long>(l.idle_minutes) * 60) {
 		return "idle for longer than the policy's idle timeout (" + std::to_string(l.idle_minutes) + " min)";
+	}
+	if (l.ends_s > 0 && now_s >= l.ends_s) {
+		return "the access grant it was approved on has ended";
 	}
 	return "";
 }
