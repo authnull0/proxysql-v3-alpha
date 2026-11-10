@@ -72,11 +72,11 @@ int main() {
 	// --- one JSON line per statement ---
 	AuthnullRecordedStatement st;
 	st.session_id = 195; st.at_ms = 1794296684123; st.duration_ms = 12; st.user = "dbmfa_writer"; st.database = "dbmfa_test";
-	st.client = "172.18.0.11:41148"; st.statement = "ALTER ROLE x PASSWORD 'p'"; st.allowed = true; st.rows = 3; st.affected = 1;
+	st.client = "172.18.0.11:41148"; st.statement = "ALTER ROLE x PASSWORD 'p'"; st.allowed = true; st.rows = 3; st.affected = 1; st.hostgroup = 6;
 	std::string line = authnullRecordLine(st);
 	auto j = nlohmann::json::parse(line);
 	expect(j["sid"] == 195 && j["at"] == 1794296684123LL && j["durMs"] == 12 && j["user"] == "dbmfa_writer" && j["db"] == "dbmfa_test" &&
-		j["client"] == "172.18.0.11:41148" && j["allowed"] == true && j["rows"] == 3 && j["affected"] == 1, "record fields: " + line);
+		j["client"] == "172.18.0.11:41148" && j["allowed"] == true && j["rows"] == 3 && j["affected"] == 1 && j["hg"] == 6, "record fields: " + line);
 	expect(j["stmt"] == "ALTER ROLE x PASSWORD '***'", "the line's statement is masked");
 	expect(line.find('\n') == std::string::npos, "one line");
 	st.allowed = false; st.error = "Access denied: Query not permitted for this user";
