@@ -1,3 +1,4 @@
+#include "authnull_kill.h"
 #include "../deps/json/json.hpp"
 using json = nlohmann::json;
 #define PROXYJSON
@@ -333,6 +334,30 @@ bool admin_handler_command_kill_connection(char *query_no_space, unsigned int qu
 		SPA->send_error_msg_to_client(sess, buf);
 	}
 	return false;
+}
+
+// PGSQL KILL CONNECTION <id> ends a Postgres client session (authnull_kill.h). It answers with a
+// row -- killed 1 or 0, and why -- rather than an admin error: an error reply on the Postgres admin
+// interface hits assert(0) in PgSQL_Protocol::generate_error_packet (the session is in STATE_SLEEP)
+// and takes ProxySQL down, which an unknown id must not do.
+template <typename S>
+bool admin_handler_command_pgsql_kill_connection(char *query_no_space, unsigned int query_no_space_length, S* sess, ProxySQL_Admin *pa, char **q, unsigned int *ql) {
+	uint32_t id = 0;
+	const char* answer;
+	char buf[128];
+	if (!authnullParseKillID(query_no_space, id)) {
+		answer = "SELECT 0 AS killed, 'usage: PGSQL KILL CONNECTION <session id>' AS detail";
+	} else if (GloPTH && GloPTH->kill_session(id)) {
+		snprintf(buf, sizeof(buf), "SELECT 1 AS killed, 'session %u killed' AS detail", id);
+		answer = buf;
+	} else {
+		snprintf(buf, sizeof(buf), "SELECT 0 AS killed, 'no PgSQL session %u' AS detail", id);
+		answer = buf;
+	}
+	l_free(*ql, *q);
+	*q = l_strdup(answer);
+	*ql = strlen(*q) + 1;
+	return true;
 }
 
 template <typename S>
@@ -2707,6 +2732,11 @@ void admin_session_handler(S* sess, void *_pa, PtrSize_t *pkt) {
 		if ((query_no_space_length>5) && ( (!strncasecmp("SAVE ", query_no_space, 5)) || (!strncasecmp("LOAD ", query_no_space, 5))) ) {
 			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Received LOAD or SAVE command\n");
 			run_query=admin_handler_command_load_or_save(query_no_space, query_no_space_length, sess, pa, &query, &query_length);
+			goto __run_query;
+		}
+		if ((query_no_space_length>22) && !strncasecmp(kAuthnullPgsqlKill, query_no_space, 22)) {
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Received PGSQL KILL CONNECTION command\n");
+			run_query=admin_handler_command_pgsql_kill_connection(query_no_space, query_no_space_length, sess, pa, &query, &query_length);
 			goto __run_query;
 		}
 		if ((query_no_space_length>16) && ( (!strncasecmp("KILL CONNECTION ", query_no_space, 16)) || (!strncasecmp("KILL CONNECTION ", query_no_space, 16))) ) {

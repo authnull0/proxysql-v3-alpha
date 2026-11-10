@@ -35,3 +35,13 @@ stub's approval carries `session.endsAt` 20 seconds out, as authn-service sends 
 through on an access grant. ProxySQL must end the session then. To run it, swap `victims.py` for
 `grantend.py` in `run.sh`. Result on the lab, 10 Nov 2026: queries answered until 17.1 s, and at
 20.1 s `ERROR: Session ended: the access grant it was approved on has ended`.
+
+## Killing a session
+
+`killtest.py` opens one session, finds it in `stats_pgsql_processlist`, and sends `PGSQL KILL
+CONNECTION` with a bad id, an unknown id and then its own id. To run it, swap `victims.py` for
+`killtest.py` in `run.sh`, and export `ADMIN_PW` there. Result on the lab, 10 Nov 2026:
+- the bad id and the unknown id were answered as rows (`0|usage: …`, `0|no PgSQL session 99999`)
+  and ProxySQL stayed up;
+- the kill answered `1|session 4 killed`, and the session's next query got "server closed the
+  connection".
