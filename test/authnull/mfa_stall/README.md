@@ -27,3 +27,11 @@ With the call made off the thread:
 
     threads=1, 4 victims:          0/4 stalled (worst 0.00 s), fresh login 0.13 s
     threads=4, 8 victims, 6 held:  0/8 stalled (worst 0.01 s), fresh login 0.11 s, all 6 held logins succeeded
+
+## Access grant end
+
+`grantend.py` runs one `stall_fast` session that queries every 3 seconds. With `ENDS_IN=20`, the
+stub's approval carries `session.endsAt` 20 seconds out, as authn-service sends it for a login let
+through on an access grant. ProxySQL must end the session then. To run it, swap `victims.py` for
+`grantend.py` in `run.sh`. Result on the lab, 10 Nov 2026: queries answered until 17.1 s, and at
+20.1 s `ERROR: Session ended: the access grant it was approved on has ended`.

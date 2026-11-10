@@ -1414,14 +1414,16 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							// Set or cleared on every login, so a reused id never inherits limits.
 							{
 								int max_minutes = 0, idle_minutes = 0;
-								if (authnullSessionLimitFromJSON(credential, max_minutes, idle_minutes)) {
+								long long ends_s = 0;
+								if (authnullSessionLimitFromJSON(credential, max_minutes, idle_minutes, ends_s)) {
 									AuthnullSessionLimit limit;
 									limit.started_s = (long long)time(nullptr);
 									limit.max_minutes = max_minutes;
 									limit.idle_minutes = idle_minutes;
+									limit.ends_s = ends_s;
 									authnullSessionLimits().set(thread_session_i, limit);
-									syslog(LOG_INFO, "[authnull] session %u for %s on %s: max %d min, idle %d min (0 = no limit)",
-										thread_session_i, username.c_str(), mfa_db.c_str(), max_minutes, idle_minutes);
+									syslog(LOG_INFO, "[authnull] session %u for %s on %s: max %d min, idle %d min (0 = no limit), access grant ends %lld (0 = none)",
+										thread_session_i, username.c_str(), mfa_db.c_str(), max_minutes, idle_minutes, ends_s);
 								} else {
 									authnullSessionLimits().erase(thread_session_i);
 								}

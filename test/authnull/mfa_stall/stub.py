@@ -17,7 +17,7 @@ class H(BaseHTTPRequestHandler):
             return
         out = json.dumps({"isValid": True, "requestId": "stub-" + user, "credentialSubject": {
             "databaseName": body.get("databaseName", "postgres"),
-            "privilege": ["READ"], "tables": ["t"], "fieldMasking": {"t": []}}}).encode()
+            "privilege": [p.strip() for p in os.environ.get("PRIVS", "READ").split(",")], "tables": ["t"], "fieldMasking": {"t": []}, **({"session": {"endsAt": int(time.time()) + int(os.environ["ENDS_IN"])}} if os.environ.get("ENDS_IN") else {})}}).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
     def log_message(self, *a): pass

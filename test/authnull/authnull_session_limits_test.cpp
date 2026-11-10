@@ -48,6 +48,31 @@ int main() {
 	r.erase(42);
 	expect(!r.get(42, got) && r.size() == 0, "erased with the session");
 
+	// An access grant's end (credentialSubject.session.endsAt, Unix seconds): the session ends then,
+	// whatever the policy's own limits say (authnull-service docs/DB-ACCESS-REQUESTS.md).
+	{
+		int mx = 0, idle = 0;
+		long long ends = 0;
+		auto cs = json::parse(R"({"session":{"endsAt":1794312000}})");
+		expect(authnullSessionLimitFromJSON(cs, mx, idle, ends), "endsAt alone is a limit");
+		expect(ends == 1794312000 && mx == 0 && idle == 0, "endsAt read");
+		cs = json::parse(R"({"session":{"endsAt":1794312000,"maxDurationMinutes":30}})");
+		authnullSessionLimitFromJSON(cs, mx, idle, ends);
+		expect(ends == 1794312000 && mx == 30, "endsAt beside the policy's limits");
+		for (const char* bad : {R"({"session":{"endsAt":"soon"}})", R"({"session":{"endsAt":-5}})", R"({"session":{}})"}) {
+			auto b = json::parse(bad);
+			bool any = authnullSessionLimitFromJSON(b, mx, idle, ends);
+			expect(!any && ends == 0, "an endsAt that does not read is no limit");
+		}
+		AuthnullSessionLimit l;
+		l.started_s = 1794310000;
+		l.ends_s = 1794312000;
+		expect(authnullSessionLimitReason(l, 1794311999, 0).empty(), "before the grant's end");
+		expect(authnullSessionLimitReason(l, 1794312000, 0).find("access grant") != std::string::npos, "at the grant's end");
+		l.max_minutes = 10; // the policy's limit comes first
+		expect(authnullSessionLimitReason(l, 1794310600, 0).find("maximum session") != std::string::npos, "the earlier limit");
+	}
+
 	if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
 	std::puts("ok");
 	return 0;
