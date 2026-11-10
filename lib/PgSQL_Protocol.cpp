@@ -1125,6 +1125,9 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							{"databaseType", "postgres"},
 							{"databaseName", db_name},
 							{"token", extra_data},
+							// This session's id, which the access log keeps, so the session ProxySQL's
+							// process list shows can be named (authnull-service docs/DB-LIVE-SESSIONS.md).
+							{"proxySessionId", thread_session_i},
 							{"timestamp", epoch_time}
 						};
 
