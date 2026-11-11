@@ -1,3 +1,4 @@
+#include "authnull_auth.h"
 #include "../deps/json/json.hpp"
 #include "authnull_log.h"
 using json = nlohmann::json;
@@ -2549,6 +2550,18 @@ __do_auth:
 			} else {
 				free(addl_pass);
 			}
+		}
+	}
+
+	// The console's connection string sends the AuthNull token as the password, which no account
+	// holds; the MFA call that follows decides on it (authnull_auth.h).
+	if (!ret) {
+		bool accepted = authnullTokenLoginAccepted(false, (*myds)->auth_in_progress != 0,
+			(*myds)->sess->session_type == PROXYSQL_SESSION_MYSQL, !(*myds)->sess->authnull_mfa_token.empty(),
+			vars1.password != NULL);
+		if (accepted) {
+			proxy_debug(PROXY_DEBUG_MYSQL_AUTH, 5, "Session=%p , DS=%p , username='%s' . AuthNull token login; MFA decides\n", (*myds), (*myds)->sess, vars1.user);
+			ret = true;
 		}
 	}
 

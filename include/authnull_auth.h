@@ -23,4 +23,19 @@ inline bool authnullRequiresMFA(SessionType session_type, SessionType client_ses
 	return session_type == client_session_type;
 }
 
+// authnullTokenLoginAccepted: whether a MySQL login passes ProxySQL's password check.
+//
+// The console's MySQL connection string is "-u<user>,<token> -p<token>": the token is the
+// credential, and authn-service decides on it in the MFA call that follows. ProxySQL compares the
+// client's password with the account's in mysql_users through MySQL's salted hash, so it can
+// neither read the token there nor swap in the backend password the way the PostgreSQL path does
+// (PgSQL_Protocol.cpp, pass2). The check therefore stands aside for exactly these logins: a client
+// session, carrying a token, for a user ProxySQL has an account for -- and not part-way through an
+// auth switch, where the final round decides. Everything else keeps the password check.
+inline bool authnullTokenLoginAccepted(bool password_ok, bool auth_in_progress, bool client_session,
+		bool has_token, bool account_exists) {
+	if (password_ok) return true;
+	return !auth_in_progress && client_session && has_token && account_exists;
+}
+
 #endif // AUTHNULL_AUTH_H
