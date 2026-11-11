@@ -9090,6 +9090,7 @@ void MySQL_Session::authnullRecordQuery() {
 		st.client = std::string(client_myds->addr.addr) + ":" + std::to_string(client_myds->addr.port);
 	}
 	st.hostgroup = current_hostgroup >= 0 ? current_hostgroup : default_hostgroup;
+	st.engine = "mysql";
 	st.allowed = !authnull_refused;
 	st.rows = CurrentQuery.rows_sent;
 	if (CurrentQuery.have_affected_rows) st.affected = CurrentQuery.affected_rows;

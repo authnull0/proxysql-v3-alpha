@@ -183,6 +183,7 @@ struct AuthnullRecordedStatement {
 	std::string database;
 	std::string client;
 	int hostgroup = -1;          // the server it ran on; the agent uploads it as that server's
+	std::string engine;          // "mysql" or "postgres": ProxySQL numbers each engine's hostgroups separately
 	std::string statement;       // as received; authnullRecordLine masks it
 	bool allowed = true;         // false: ProxySQL refused it
 	unsigned long long rows = 0;
@@ -195,7 +196,7 @@ inline std::string authnullRecordLine(const AuthnullRecordedStatement& s) {
 	nlohmann::json j = {
 		{"sid", s.session_id}, {"at", s.at_ms}, {"durMs", s.duration_ms}, {"user", s.user}, {"db", s.database},
 		{"client", s.client}, {"stmt", authnullMaskSecrets(s.statement)}, {"allowed", s.allowed},
-		{"rows", s.rows}, {"affected", s.affected}, {"hg", s.hostgroup},
+		{"rows", s.rows}, {"affected", s.affected}, {"hg", s.hostgroup}, {"engine", s.engine},
 	};
 	if (!s.error.empty()) j["error"] = s.error.size() > 500 ? s.error.substr(0, 500) : s.error;
 	return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
