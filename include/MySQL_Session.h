@@ -26,6 +26,7 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
 #include "cpp.h"
 #include "MySQL_Variables.h"
 #include "Base_Session.h"
+#include "authnull_mfa_call.h"
 
 #ifndef PROXYJSON
 #define PROXYJSON
@@ -282,6 +283,25 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 
 	public:
 	std::string rand_session_id;
+	// AuthNull login (authnull_login_answer.h): the connection token the client sent ("user,token"),
+	// kept on the session -- it was a process-wide global every worker thread overwrote, so one
+	// login could be checked with another's token; the MFA call running off this thread
+	// (authnull_mfa_call.h); whether the handshake is being resumed with its answer; and why
+	// authn-service refused, for the client's error (authnull_refusal.h).
+	std::string authnull_mfa_token;
+	std::shared_ptr<AuthnullMfaCall> authnull_mfa_call;
+	bool authnull_mfa_resume = false;
+	std::string authnull_refusal;
+	// The user and database this session's privilege and masking entries are under, so its end
+	// erases them; empty until a login is approved.
+	std::string authnull_map_user;
+	std::string authnull_map_db;
+	// Session recording (authnull_recording.h): whether the policy asked for it; whether ProxySQL
+	// refused the statement now ending; the backend's error for it, if any.
+	bool authnull_record = false;
+	bool authnull_refused = false;
+	std::string authnull_query_error;
+	void authnullRecordQuery();
 	bool handler_again___status_SETTING_GENERIC_VARIABLE(int *_rc, const char *var_name, const char *var_value, bool no_quote=false, bool set_transaction=false);
 	bool handler_again___status_SETTING_SQL_LOG_BIN(int *);
 	std::stack<enum session_status> previous_status;

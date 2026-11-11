@@ -109,4 +109,11 @@ inline AuthnullSessionLimits& authnullSessionLimits() {
 	return l;
 }
 
+// The MySQL sessions' limits: ProxySQL numbers its MySQL and PostgreSQL sessions separately, so the
+// same id names two sessions and each engine keeps its own registry.
+inline AuthnullSessionLimits& authnullMySQLSessionLimits() {
+	static AuthnullSessionLimits l;
+	return l;
+}
+
 #endif // AUTHNULL_SESSION_LIMITS_H

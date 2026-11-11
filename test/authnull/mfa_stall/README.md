@@ -57,3 +57,22 @@ holding the password, the literal or the table name, which must be 0.
 Lab, 10 Nov 2026: five lines in one 0600 bucket file, in a 0700 directory. The refused statements have
 `allowed: false` and the refusal. The password reads `'***'`. The error is `[42P01] relation "nosuch" does not exist`.
 There were 0 syslog lines. Without `RECORD` there is no spool at all.
+
+## MySQL (`run_my.sh`)
+
+`./run_my.sh <mysql threads> <victims> [proxysql binary] [script]` does the same with a `mysql:8.0`
+container (127.0.0.1:15498) behind ProxySQL's MySQL port (16033), using the `mysql` client.
+- `victims_my.py` (the default) is the stall test.
+- `rec_my.py` (with `PRIVS=READ,INSERT RECORD=1`) is the recording check.
+- `limits_my.py` (with `ENDS_IN=12`) is the access-grant end.
+
+Lab, 11 Nov 2026, 1 MySQL thread, 4 victims:
+
+    blocking call (on-prem before this change): 4/4 stalled 19.94 s, fresh login 18.05 s
+    off the thread:                              0/4 stalled (worst 0.00 s), fresh login 0.07 s
+
+- **Refusal:** the refused login reads "Access denied: multi-factor authentication was not
+  approved: denied by the stub", so the client now sees authn-service's reason.
+- **Recording:** six lines. The password reads `'***'` and the duplicate-key error reads
+  `Duplicate entry '***' for key '***'`. 0 syslog lines held a value.
+- **Session limits:** the session was ended about 12 s after login.
