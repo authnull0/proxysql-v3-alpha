@@ -76,3 +76,19 @@ Lab, 11 Nov 2026, 1 MySQL thread, 4 victims:
 - **Recording:** six lines. The password reads `'***'` and the duplicate-key error reads
   `Duplicate entry '***' for key '***'`. 0 syslog lines held a value.
 - **Session limits:** the session was ended about 12 s after login.
+
+## Admin errors on the PgSQL admin port (`admin_err.sh`)
+
+`./admin_err.sh [proxysql binary]` starts a throwaway ProxySQL (no database needed) and sends the
+PgSQL admin port (16132) statements that answer with an error: SQLite errors (`select * from
+nosuch_table;`, `nonsense;`, a mistyped `LOAD`/`SAVE`) and ProxySQL's own (`PROXYSQL START;` when
+started, `KILL CONNECTION 99999;`, `PROXYSQL RESUME;` when not paused). After each it checks that
+ProxySQL is still running and answers `select 1`, then that one connection goes on after two errors.
+
+Lab, 11 Nov 2026:
+- **Before** (`/usr/bin/proxysql`, on-prem): the SQLite errors came back with SQLSTATE 28000 (invalid
+  authorization) and `PROXYSQL START;` aborted ProxySQL: `PgSQL_Protocol.cpp:1725:
+  generate_error_packet ... Assertion '0' failed`. Every ProxySQL error on that port did the same.
+- **After:** all nine answered `ERROR` and ProxySQL stayed up. Syntax errors read 42601, the unknown
+  table 42P01, ProxySQL's own errors XX000. The same connection answered `select 42` after two errors.
+  `./run.sh 2 4`: 0/4 stalled. `killtest.sh`: unchanged (rows, then `1|session 4 killed`).
