@@ -337,9 +337,9 @@ bool admin_handler_command_kill_connection(char *query_no_space, unsigned int qu
 }
 
 // PGSQL KILL CONNECTION <id> ends a Postgres client session (authnull_kill.h). It answers with a
-// row -- killed 1 or 0, and why -- rather than an admin error: an error reply on the Postgres admin
-// interface hits assert(0) in PgSQL_Protocol::generate_error_packet (the session is in STATE_SLEEP)
-// and takes ProxySQL down, which an unknown id must not do.
+// row -- killed 1 or 0, and why -- rather than an admin error, which the database agent reads. (An
+// admin error on the Postgres interface used to hit assert(0) in PgSQL_Protocol::generate_error_packet
+// and take ProxySQL down; ProxySQL_Admin::send_error_msg_to_client no longer does.)
 template <typename S>
 bool admin_handler_command_pgsql_kill_connection(char *query_no_space, unsigned int query_no_space_length, S* sess, ProxySQL_Admin *pa, char **q, unsigned int *ql) {
 	uint32_t id = 0;

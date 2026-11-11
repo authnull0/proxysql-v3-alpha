@@ -9,6 +9,7 @@
 #include "authnull_session_limits.h"
 #include "authnull_recording.h"
 #include "authnull_mfa_call.h"
+#include "authnull_admin_error.h"
 #include "PgSQL_Authentication.h"
 #include "PgSQL_Data_Stream.h"
 #include "PgSQL_Protocol.h"
@@ -272,9 +273,11 @@ void SQLite3_to_Postgres(PtrSizeArray *psa, SQLite3_result *result, char *error,
 		PG_pkt pkt(64);
 		if (error) {
 			// there was an error
-			pkt.write_generic('E', "cscscsc",
+			// the SQLSTATE says what went wrong (authnull_admin_error.h); it was 28000 for everything
+			pkt.write_generic('E', "cscscscsc",
 				'S', "ERROR",
-				'C', "28000",
+				'V', "ERROR",
+				'C', authnullAdminSqlState(error),
 				'M', error, 0);
 /*
 			if (strcmp(error,(char *)"database is locked")==0) {

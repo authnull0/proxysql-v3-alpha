@@ -77,6 +77,7 @@ using json = nlohmann::json;
 #include <uuid/uuid.h>
 
 #include "PgSQL_Protocol.h"
+#include "authnull_admin_error.h"
 //#include "usual/time.h"
 
 using std::string;
@@ -5625,10 +5626,15 @@ void ProxySQL_Admin::send_error_msg_to_client(S* sess, const char *msg, uint16_t
 		myds->DSS = STATE_SLEEP;
 	} else if constexpr (std::is_same_v<S, PgSQL_Session>) {
 		// Code for PostgreSQL clients
+		// The admin session is in STATE_SLEEP here, for which generate_error_packet() has no case and
+		// hits assert(0): any admin error took ProxySQL down. As for MySQL above, the reply is sent
+		// from STATE_QUERY_SENT_DS. The SQLSTATE comes from authnull_admin_error.h.
 		PgSQL_Data_Stream* myds = sess->client_myds;
+		myds->DSS = STATE_QUERY_SENT_DS;
 		char* new_msg = (char*)malloc(strlen(msg) + sizeof(prefix_msg));
 		sprintf(new_msg, "%s%s", prefix_msg, msg);
-		myds->myprot.generate_error_packet(true, true, new_msg, PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION, false);
+		myds->myprot.generate_error_packet(true, true, new_msg,
+			authnullAdminErrorCode<PGSQL_ERROR_CODES>(msg), false);
 		free(new_msg);
 		myds->DSS = STATE_SLEEP;
 	} else {
