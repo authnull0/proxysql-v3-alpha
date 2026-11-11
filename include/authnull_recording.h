@@ -136,6 +136,36 @@ inline std::string authnullMaskSecrets(const std::string& sql) {
 	return out;
 }
 
+// authnullMaskErrorValues hides the values a MySQL error message quotes ("Duplicate entry
+// 'jane@acme.com' for key ..."): every quoted run becomes '***'. PostgreSQL keeps such values in
+// DETAIL, which is never recorded; MySQL has only the one message. A quote right after a letter or
+// digit is an apostrophe ("doesn't"), not a value.
+inline std::string authnullMaskErrorValues(const std::string& msg) {
+	std::string out;
+	out.reserve(msg.size());
+	size_t i = 0;
+	while (i < msg.size()) {
+		char c = msg[i];
+		bool opens = c == '\'' && (i == 0 || !std::isalnum(static_cast<unsigned char>(msg[i - 1])));
+		if (!opens) {
+			out += c;
+			i++;
+			continue;
+		}
+		size_t j = i + 1;
+		while (j < msg.size()) {
+			if (msg[j] == '\'') {
+				if (j + 1 < msg.size() && msg[j + 1] == '\'') { j += 2; continue; }
+				break;
+			}
+			j++;
+		}
+		out += "'***'";
+		i = (j < msg.size()) ? j + 1 : msg.size();
+	}
+	return out;
+}
+
 // authnullRecordFromJSON: whether the policy asks for the session to be recorded
 // (credentialSubject.session.record, a boolean).
 inline bool authnullRecordFromJSON(const nlohmann::json& cs) {

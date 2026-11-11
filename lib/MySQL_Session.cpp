@@ -2,6 +2,10 @@
 #include "authnull_query.h"
 #include "authnull_log.h"
 #include "authnull_tls.h"
+#include "authnull_login_answer.h"
+#include "authnull_refusal.h"
+#include "authnull_session_limits.h"
+#include "authnull_recording.h"
 using json = nlohmann::json;
 #define PROXYJSON
 
@@ -638,6 +642,9 @@ std::unordered_map<std::string, std::vector<std::string>> user_database_access;
 std::unordered_map<std::string, std::string> session_to_usertype;
 std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies;
 std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges;
+// Guards the four maps above: every worker thread writes them (a login publishes, a session's end
+// erases) and reads them (each query's privilege check, masking).
+std::mutex authnull_mysql_maps_mu;
 
 
 std::string current_table;
@@ -662,6 +669,8 @@ std::string authnull_api_url_problem;
 #include <cstdlib>
 #include <climits>
 #include <cerrno>
+void loadAuthNullConfigNow();
+
 // authnullEnvOrConf reads a setting from the environment first, falling back to proxysql.cnf.
 //
 // WHY THE ENVIRONMENT WINS
@@ -701,7 +710,15 @@ static int authnullEnvOrConfInt(const char *env, const char *section, const char
     return GloVars.confFile->get_int(section, key, fallback);
 }
 
+// loadAuthNullConfig reads the settings once, for the process: it ran in every session's
+// constructor, rewriting these strings on whichever worker thread made the session while others read
+// them.
 void loadAuthNullConfig() {
+    static std::once_flag once;
+    std::call_once(once, loadAuthNullConfigNow);
+}
+
+void loadAuthNullConfigNow() {
     authnull_org_id = authnullEnvOrConfInt("AUTHNULL_ORG_ID", "authnull", "org_id", 0);
     authnull_tenant_id = authnullEnvOrConfInt("AUTHNULL_TENANT_ID", "authnull", "tenant_id", 0);
     authnull_api_url = authnullEnvOrConf("AUTHNULL_API_URL", "authnull", "api_url", "");
@@ -746,206 +763,48 @@ int generateRandomSessionID() {
     return dis(gen);
 }
 
-bool performMFA(std::string user_ip, std::string user_device_ip, std::string user, std::string db_name, std::string authtoken, int thread_session_i) {
-    openlog("AuthSQL", LOG_PID, LOG_DAEMON);
-    CURL *curl;
-    CURLcode res;
-    long http_code = 0;
-    curl = curl_easy_init();
-    std::time_t epoch_time = std::time(nullptr);
-
+// authnullMysqlLoginCall makes a MySQL login's call to authn-service. It runs off the worker thread
+// (authnull_mfa_call.h): do-authenticationV4 blocks while the person answers the push, up to the
+// challenge's 60 s TTL, so the timeout is 90 s. url and tls are copies taken when the login started;
+// the call reads no setting another thread could be rewriting. The body carries a bearer token and
+// is never logged; neither is the answer, except at LOG_DEBUG.
+static AuthnullMfaAnswer authnullMysqlLoginCall(const std::string& url, const AuthnullCurlTls& tls, const std::string& body) {
+    AuthnullMfaAnswer out;
+    CURL *curl = curl_easy_init();
     if (!curl) {
-        std::cerr << "CURL Initialization Failed!" << std::endl;
-        return false;
+        return out; // curl_code -1: never ran, a refusal
     }
-    if (!authnull_api_url_problem.empty()) {
-        syslog(LOG_ERR, "[authnull] %s; login denied", authnull_api_url_problem.c_str());
-        curl_easy_cleanup(curl);
-        return false;
-    }
-
-    nlohmann::json requestData = {
-        {"username", user}, 
-        {"credentialType", "DATABASE"},
-        {"orgId", authnull_org_id},
-        {"tenantId", authnull_tenant_id},
-        {"requestId", ""},
-        {"dbUser", user},
-        {"userIp", user_device_ip},
-        {"database_host", user_ip},
-        {"hostname", db_name},
-        {"databaseType", "mysql"},
-        {"databaseName", db_name},
-		{"token", authtoken},
-        {"timestamp", epoch_time}
-    };
-
-    std::string json_payload = requestData.dump();
-
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
     // This proxy's caller token, when it has a credential (authnull_caller_token.h).
-    std::string caller_token = authnullAddCallerAuth(headers);
-
-    std::string response;
-    curl_easy_setopt(curl, CURLOPT_URL, authnull_api_url.c_str());
+    out.caller_token = authnullAddCallerAuth(headers);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    
-    // Handle redirects
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
-    
-    // Set timeout to prevent hanging
-    // do-authenticationV4 BLOCKS while the user approves the push (Okta/Duo).
-    // Challenge TTL is 60s, so anything below that aborts the request before the user
-    // can possibly respond. 90s = 60s TTL + headroom. Connect timeout stays at 10s.
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L); // 90 seconds: push-MFA challenge TTL (60s) + headroom
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L); // 10 seconds connect timeout
-    // authn-service's answer decides the login and the request carries the user's token: check
-    // the certificate (curl's default, made explicit and configurable) and keep redirects on the
-    // URL's own scheme (authnull_tls.h).
-    {
-        AuthnullCurlTls tls = authnullCurlTls(authnull_api_url, authnull_tls);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, tls.verify_peer);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, tls.verify_host);
-        if (!tls.ca_file.empty()) {
-            curl_easy_setopt(curl, CURLOPT_CAINFO, tls.ca_file.c_str());
-        }
-        curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, tls.protocols);
-        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, tls.protocols);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L);        // push-MFA challenge TTL (60 s) + headroom
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);         // not the main thread: no SIGALRM for timeouts
+    // authn-service's answer decides the login and the request carries the user's token: check the
+    // certificate and keep redirects on the URL's own scheme (authnull_tls.h).
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, tls.verify_peer);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, tls.verify_host);
+    if (!tls.ca_file.empty()) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, tls.ca_file.c_str());
     }
-
-    res = curl_easy_perform(curl);
-    
-    // Get HTTP status code
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    syslog(LOG_INFO, "HTTP Status Code: %ld", http_code);
-    authnullCallerTokenRefused(caller_token, http_code);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, tls.protocols);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, tls.protocols);
+    out.curl_code = (int)curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
     curl_easy_cleanup(curl);
     curl_slist_free_all(headers);
-
-    if (res == CURLE_OK) {
-        // DO NOT LOG THE REQUEST OR THE RESPONSE BODY AT INFO. requestData carries
-        // {"token", authtoken}, which is a BEARER CREDENTIAL -- authn-service resolves it to a user
-        // identity in Redis, so whoever holds it can authenticate as that person through this proxy
-        // until it expires. It was written in full, pretty-printed, on every database login. The
-        // Postgres path in lib/PgSQL_Protocol.cpp carries the same note and the same fix.
-        //
-        // Full bodies stay available at LOG_DEBUG for debugging.
-        syslog(LOG_DEBUG, "[DEBUG] Full API response: %s", response.c_str());
-        syslog(LOG_INFO, "MFA API call completed for db '%s' (http %ld)", db_name.c_str(), http_code);
-
-        if (http_code >= 200 && http_code < 300) {
-            try {
-                json jsonResponse = json::parse(response);
-
-                // Invariant: HTTP 200 carrying isValid:false is a REFUSAL, not a transport
-                // error. Anything that is not an explicit approval must deny.
-                if (!jsonResponse.contains("isValid") || !jsonResponse["isValid"].is_boolean()
-                    || jsonResponse["isValid"].get<bool>() != true) {
-                    syslog(LOG_WARNING, "MFA refused by authn-service for user '%s' db '%s': %s",
-                        user.c_str(), db_name.c_str(), jsonResponse.dump().c_str());
-                    return false;
-                }
-
-                syslog(LOG_INFO, "MFA Verified Successfully!");
-
-                // Privilege/masking payload. Historically this arrived as the DID/VC
-                // verifiable credential under ["credential"]["credentialSubject"]; the
-                // push-MFA endpoint is expected to return the same shape built from the
-                // matched DATABASE policy. Accept it at either location.
-                const json* credential_ptr = nullptr;
-                if (jsonResponse.contains("credential") && jsonResponse["credential"].is_object()
-                    && jsonResponse["credential"].contains("credentialSubject")
-                    && jsonResponse["credential"]["credentialSubject"].is_object()) {
-                    credential_ptr = &jsonResponse["credential"]["credentialSubject"];
-                } else if (jsonResponse.contains("credentialSubject")
-                    && jsonResponse["credentialSubject"].is_object()) {
-                    credential_ptr = &jsonResponse["credentialSubject"];
-                }
-
-                // An approval alone is not enough to open a session. Without the privilege
-                // and field-masking mapping the session would run unrestricted and unmasked,
-                // so a missing credentialSubject must DENY, not fall through to success.
-                if (credential_ptr == nullptr) {
-                    syslog(LOG_ERR, "MFA approved but response carries no credentialSubject; refusing session for user '%s' db '%s' (no privilege/masking mapping available)",
-                        user.c_str(), db_name.c_str());
-                    return false;
-                }
-
-                const json& credential = *credential_ptr;
-
-                if (!credential.contains("databaseName") || !credential["databaseName"].is_string()) {
-                    syslog(LOG_ERR, "MFA approved but credentialSubject has no databaseName; refusing session for user '%s'", user.c_str());
-                    return false;
-                }
-
-                std::string username = user; // Using the passed user parameter
-                std::string mfa_db = credential["databaseName"].get<std::string>();
-
-                // Extract privileges
-                std::vector<std::string> mfa_privileges;
-                if (credential.contains("privilege") && credential["privilege"].is_array()) {
-                    mfa_privileges = credential["privilege"].get<std::vector<std::string>>();
-                }
-                if (mfa_privileges.empty()) {
-                    syslog(LOG_ERR, "MFA approved but no privileges returned for user '%s' db '%s'; refusing session", username.c_str(), mfa_db.c_str());
-                    return false;
-                }
-
-                // Extract tables
-                std::vector<std::string> mfa_tables;
-                if (credential.contains("tables") && credential["tables"].is_array()) {
-                    mfa_tables = credential["tables"].get<std::vector<std::string>>();
-                }
-
-                // The masking policy has to be resolvable before the session is allowed.
-                // Previously an absent fieldMasking object left usertype_masking_policies
-                // unset, which silently served unmasked data for the whole session.
-                if (!credential.contains("fieldMasking") || !credential["fieldMasking"].is_object()) {
-                    syslog(LOG_ERR, "MFA approved but credentialSubject has no fieldMasking object for user '%s' db '%s'; refusing session rather than serving unmasked data", username.c_str(), mfa_db.c_str());
-                    return false;
-                }
-
-                std::string key = username + "+" + db_name + "+" + std::to_string(thread_session_i);
-                std::map<std::string, std::vector<std::string>> masking_policy;
-                const json& fieldMasking = credential["fieldMasking"];
-                for (auto& table : mfa_tables) {
-                    if (fieldMasking.contains(table) && fieldMasking[table].is_array()) {
-                        masking_policy[table] = fieldMasking[table].get<std::vector<std::string>>();
-                    } else {
-                        masking_policy[table] = {};
-                    }
-                }
-
-                // Publish the session mapping only once it is complete.
-                user_database_access[key] = {mfa_db};
-                user_database_privileges[username][mfa_db + "+" + std::to_string(thread_session_i)] = mfa_privileges;
-                usertype_masking_policies[key] = masking_policy;
-                session_to_usertype[std::to_string(thread_session_i)] = key;
-
-                syslog(LOG_INFO, "Mapped MFA data for %s: DB=%s, Privileges=%s", username.c_str(), mfa_db.c_str(), json(mfa_privileges).dump().c_str());
-
-                return true;
-            } catch (json::exception &e) {
-                // Unparseable/unexpected response: deny.
-                syslog(LOG_ERR, "MFA JSON parsing error: %s | Response: %s", e.what(), response.c_str());
-                return false;
-            }
-        } else {
-            syslog(LOG_ERR, "MFA HTTP error: status code %ld, response: %s", http_code, response.c_str());
-        }
-    } else {
-        // Timeout or transport failure must DENY, never allow.
-        syslog(LOG_ERR, "MFA CURL error: %s (denying session)", curl_easy_strerror(res));
-    }
-
-    return false;
+    return out;
 }
+
 std::unordered_map<std::string, bool> mfa_status_map; 
 
 
@@ -957,6 +816,7 @@ bool contains(const std::vector<std::string>& vec, const std::string& value) {
 bool checkPermission(const std::string& username, const std::string& query, const std::string& databaseName,const std::string& sessionId) {
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
     std::string key = username + "+" + databaseName + "+" +sessionId;
+    std::lock_guard<std::mutex> maps_lock(authnull_mysql_maps_mu);
     // Step 2: Check if the username has access to the specified database
     auto dbAccessIt = user_database_access.find(key);
     if (dbAccessIt == user_database_access.end() || 
@@ -1000,6 +860,7 @@ std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession(const
     openlog("AuthSQL", LOG_PID, LOG_DAEMON);
 	std::string composite_key = user + "+" + db_name + "+" +sessionID;
 	syslog(LOG_DEBUG, "Looking up policy for session ID %s → key: %s", sessionID.c_str(), composite_key.c_str());
+	std::lock_guard<std::mutex> maps_lock(authnull_mysql_maps_mu);
 	auto policy_it = usertype_masking_policies.find(composite_key);
 	if (policy_it != usertype_masking_policies.end()) {
 		syslog(LOG_DEBUG, "Retrieved masking policy for %s", composite_key.c_str());
@@ -2313,6 +2174,24 @@ MySQL_Session::~MySQL_Session() {
 		delete client_myds;
 	}
     mfa_status_map.erase(rand_session_id);
+	// This session's privilege, access and masking entries, and its limits: they were never erased,
+	// so they grew without bound and a later session reusing the id could inherit them.
+	if (!authnull_map_user.empty()) {
+		std::string sid = std::to_string(thread_session_id);
+		std::string key = authnull_map_user + "+" + authnull_map_db + "+" + sid;
+		std::lock_guard<std::mutex> maps_lock(authnull_mysql_maps_mu);
+		user_database_access.erase(key);
+		usertype_masking_policies.erase(key);
+		auto st = session_to_usertype.find(sid);
+		if (st != session_to_usertype.end() && st->second == key) session_to_usertype.erase(st);
+		auto up = user_database_privileges.find(authnull_map_user);
+		if (up != user_database_privileges.end()) {
+			up->second.erase(authnull_map_db + "+" + sid);
+			if (up->second.empty()) user_database_privileges.erase(up);
+		}
+	}
+	authnullMySQLSessionLimits().erase(thread_session_id);
+	// authnull_mfa_call, if still running, finishes on its own thread and frees itself.
 	if (default_schema) {
 		free(default_schema);
 	}
@@ -4710,6 +4589,25 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		status=WAITING_CLIENT_DATA;
 		return;
 	} else {
+		// A prepared statement is held to the session's privileges like a plain query: it was not
+		// checked at all, so PREPARE then EXECUTE ran anything (authnull_query.h).
+		if (client_myds && client_myds->myconn && client_myds->myconn->userinfo && client_myds->myconn->userinfo->username) {
+			std::string query;
+			if (pkt.ptr && pkt.size > sizeof(mysql_hdr) + 1) {
+				query = std::string((char*)pkt.ptr + sizeof(mysql_hdr) + 1, pkt.size - sizeof(mysql_hdr) - 1);
+			}
+			std::string user = client_myds->myconn->userinfo->username;
+			std::string db_name = client_myds->myconn->userinfo->schemaname ? client_myds->myconn->userinfo->schemaname : "";
+			if (!checkPermission(user, query, db_name, std::to_string(thread_session_id))) {
+				syslog(LOG_INFO, "[authnull] prepared statement refused for %s on %s", user.c_str(), db_name.c_str());
+				l_free(pkt.size,pkt.ptr);
+				client_myds->setDSS_STATE_QUERY_SENT_NET();
+				client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"28000",(char *)"Access denied: Query not permitted for this user");
+				client_myds->DSS=STATE_SLEEP;
+				status=WAITING_CLIENT_DATA;
+				return;
+			}
+		}
 		thread->status_variables.stvar[st_var_frontend_stmt_prepare]++;
 		thread->status_variables.stvar[st_var_queries]++;
 		// if we reach here, we are not on MySQL module
@@ -5646,11 +5544,33 @@ __get_pkts_from_client:
 									syslog(LOG_INFO, "User IP: %s, Device IP: %s", user_ip.c_str(), device_ip.c_str());
 									syslog(LOG_INFO, "User: %s, Database: %s", user.c_str(), db_name.c_str());
 									std::string seid = std::to_string(this->thread_session_id); 
+									// A session past its policy's maximum length or access grant runs nothing
+									// more, even between two maintenance passes (authnull_session_limits.h).
+									{
+										AuthnullSessionLimit limit;
+										if (authnullMySQLSessionLimits().get(this->thread_session_id, limit)) {
+											std::string why = authnullSessionLimitReason(limit, (long long)time(nullptr), 0);
+											if (!why.empty()) {
+												syslog(LOG_WARNING, "[authnull] ending MySQL session %u of %s on %s: %s", this->thread_session_id, user.c_str(), db_name.c_str(), why.c_str());
+												client_myds->DSS=STATE_QUERY_SENT_NET;
+												std::string msg = "Session ended: " + why;
+												authnull_refused = true;
+												authnull_query_error = msg;
+												client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"HY000", (char *)msg.c_str(), true);
+												RequestEnd(NULL);
+												l_free(pkt.size, pkt.ptr);
+												killed = true;
+												break;
+											}
+										}
+									}
 									bool result = checkPermission(user, query, db_name,seid);
 									if (result == false){
 										syslog(LOG_INFO, "[DEBUG] Query Not OK");
 										client_myds->DSS=STATE_QUERY_SENT_NET;
 										char *err_msg = (char *)"Access denied: Query not permitted for this user";
+										authnull_refused = true;
+										authnull_query_error = err_msg;
 										client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
 										RequestEnd(NULL);
 										l_free(pkt.size, pkt.ptr);
@@ -6077,6 +5997,8 @@ bool MySQL_Session::handler_minus1_ClientLibraryError(MySQL_Data_Stream *myds, i
 
 // this function was inline
 void MySQL_Session::handler_minus1_LogErrorDuringQuery(MySQL_Connection *myconn, int myerr, char *errmsg) {
+	// For the session's recording: the error, with the values MySQL quotes in it hidden (authnull_recording.h).
+	authnull_query_error = authnullMaskErrorValues("[" + std::to_string(myerr) + "] " + std::string(errmsg ? errmsg : mysql_error(myconn->mysql)));
 	if (mysql_thread___verbose_query_error) {
 		proxy_warning("Error during query on (%d,%s,%d,%lu) , user \"%s@%s\" , schema \"%s\" , %d, %s . digest_text = \"%s\"\n", myconn->parent->myhgc->hid, myconn->parent->address, myconn->parent->port, myconn->get_mysql_thread_id(), client_myds->myconn->userinfo->username, (client_myds->addr.addr ? client_myds->addr.addr : (char *)"unknown" ), client_myds->myconn->userinfo->schemaname, myerr, ( errmsg ? errmsg : mysql_error(myconn->mysql)), CurrentQuery.QueryParserArgs.digest_text );
 	} else {
@@ -6388,6 +6310,18 @@ int MySQL_Session::handler() {
 			}
 		}
 	}
+	}
+
+	// A login waiting on its MFA push (authnull_mfa_call.h): nothing to do until the call answers;
+	// then the handshake goes on from where it stopped, with the answer.
+	if (status == CONNECTING_CLIENT && authnull_mfa_call) {
+		if (!authnull_mfa_call->done()) {
+			return 0;
+		}
+		PtrSize_t none { 0, NULL };
+		authnull_mfa_resume = true;
+		handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(&none, &wrong_pass);
+		authnull_mfa_resume = false;
 	}
 
 	// housekeeping_before_pkts() performs tasks only if hgs_expired_conns.size() is not 0
@@ -6991,7 +6925,8 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 	std::string user_ip = authnullProxyAddress(authnull_proxy_address,
 		(client_myds != nullptr) ? client_myds->fd : -1);
 	bool is_encrypted = client_myds->encrypted;
-	bool handshake_response_return = client_myds->myprot.process_pkt_handshake_response((unsigned char *)pkt->ptr,pkt->size);
+	// Resumed with the MFA answer (handler()): the client's packet was read, and freed, the first time.
+	bool handshake_response_return = authnull_mfa_resume ? true : client_myds->myprot.process_pkt_handshake_response((unsigned char *)pkt->ptr,pkt->size);
 	bool handshake_err = true;
 
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION,8,"Session=%p , DS=%p , handshake_response=%d , switching_auth_stage=%d , is_encrypted=%d , client_encrypted=%d\n", this, client_myds, handshake_response_return, client_myds->switching_auth_stage, is_encrypted, client_myds->encrypted);
@@ -7051,7 +6986,9 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 				}
 			}
 		}
-		l_free(pkt->size,pkt->ptr);
+		if (!authnull_mfa_resume) {
+			l_free(pkt->size,pkt->ptr);
+		}
 		//if (client_myds->encrypted==false) {
 			if (client_myds->myconn->userinfo->schemaname==NULL) {
 #ifdef PROXYSQLCLICKHOUSE
@@ -7089,43 +7026,74 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 							db_name = client_myds->myconn->userinfo->schemaname;
 							user = client_myds->myconn->userinfo->username;
 							{
+								// The push call runs off this worker thread (authnull_mfa_call.h): the
+								// first pass starts it and the handshake waits; handler() resumes it here
+								// with the answer (authnull_mfa_resume).
 								openlog("AuthSQL", LOG_PID, LOG_DAEMON);
-								std::string key = user + "_" + session_idp;
-								authtoken = session_extra_data_map[key];
-								if (mfa_status_map.find(rand_session_id) == mfa_status_map.end()) { 
-									try {
-										// Refusal, timeout and transport failure all land here; every
-										// one of them must deny.
-										if (!performMFA(user_ip, connection_ip, user, db_name, authtoken,thread_session_id)) {
-											syslog(LOG_ERR, "MFA Failed - denying session for user '%s' db '%s'", user.c_str(), db_name.c_str());
-											mfa_deny_msg = "Access denied: multi-factor authentication was not approved";
-											break;
-										}
-										std::vector<std::string>& databases = user_database_access[user+"+"+db_name+"+"+std::to_string(thread_session_id)];
-										auto it = std::find(databases.begin(), databases.end(), db_name);
-										if (it == databases.end()) {
-											// NOTE: this branch used to generate its own ERR packet and
-											// l_free(pkt) a second time (pkt is already freed before this
-											// switch), then fall through to the free_users<=0 path which
-											// generated a second ERR packet. Both are fixed by deferring
-											// to the shared denial path below.
-											syslog(LOG_ERR, "MFA approved but no access to db '%s' for user '%s' - denying session", db_name.c_str(), user.c_str());
-											mfa_deny_msg = "Access denied: User does not have access to this database";
-											break; 
-										}
-										syslog(LOG_INFO, "Connection token for %s: %s", key.c_str(), authnullTokenHint(session_extra_data_map[key]).c_str());
-										unsigned long thread_session_id = client_myds->sess->thread_session_id;
-										syslog(LOG_DEBUG, "[DEBUG] User %s connected to DB %s with session ID %lu", user.c_str(), db_name.c_str(), thread_session_id);
-										syslog(LOG_INFO, "Mapped username '%s' to session ID %d", user.c_str(), thread_session_id);
-									} catch (const std::exception &e) {
-										// Deny this session. This used to exit(1), which killed the
-										// whole proxy - and every other client's session with it -
-										// on any exception raised while authenticating one login.
-										syslog(LOG_ERR, "Error during MFA for user '%s': %s - denying session", user.c_str(), e.what());
+								if (!authnull_mfa_resume) {
+									if (!authnull_api_url_problem.empty()) {
+										syslog(LOG_ERR, "[authnull] %s; login denied", authnull_api_url_problem.c_str());
 										mfa_deny_msg = "Access denied: multi-factor authentication could not be completed";
 										break;
 									}
+									std::string body = authnullLoginRequest("mysql", authnull_org_id, authnull_tenant_id, user,
+										connection_ip, user_ip, db_name, authnull_mfa_token, thread_session_id, (long long)time(nullptr));
+									std::string url = authnull_api_url;
+									AuthnullCurlTls tls = authnullCurlTls(authnull_api_url, authnull_tls);
+									authnull_mfa_call = AuthnullMfaCall::start([url, tls, body]() { return authnullMysqlLoginCall(url, tls, body); });
+									if (!authnull_mfa_call) {
+										syslog(LOG_ERR, "[authnull] too many logins waiting on MFA; denying user '%s' db '%s'", user.c_str(), db_name.c_str());
+										mfa_deny_msg = "Access denied: too many logins waiting on multi-factor authentication; try again";
+										break;
+									}
+									return; // waiting on the push
 								}
+								AuthnullMfaAnswer reply = authnull_mfa_call ? authnull_mfa_call->take() : AuthnullMfaAnswer{};
+								authnull_mfa_call.reset();
+								authnull_mfa_token.clear();
+								authnullCallerTokenRefused(reply.caller_token, reply.http_code);
+								syslog(LOG_DEBUG, "[DEBUG] Full API response: %s", reply.body.c_str());
+								AuthnullLoginAnswer answer = authnullJudgeLoginAnswer(reply.curl_code, reply.http_code, reply.body);
+								if (!answer.approved) {
+									syslog(LOG_WARNING, "MFA not approved for user '%s' db '%s': %s", user.c_str(), db_name.c_str(), answer.why.c_str());
+									authnull_refusal = answer.refusal;
+									mfa_deny_msg = "Access denied: multi-factor authentication was not approved";
+									break;
+								}
+								if (answer.database != db_name) {
+									syslog(LOG_ERR, "MFA approved for db '%s', not the requested '%s', for user '%s' - denying session",
+										answer.database.c_str(), db_name.c_str(), user.c_str());
+									mfa_deny_msg = "Access denied: User does not have access to this database";
+									break;
+								}
+								// Publish the session's mapping only once it is complete.
+								std::string sid = std::to_string(thread_session_id);
+								std::string key = user + "+" + db_name + "+" + sid;
+								{
+									std::lock_guard<std::mutex> maps_lock(authnull_mysql_maps_mu);
+									user_database_access[key] = {answer.database};
+									user_database_privileges[user][answer.database + "+" + sid] = answer.privileges;
+									usertype_masking_policies[key] = answer.masking;
+									session_to_usertype[sid] = key;
+								}
+								authnull_map_user = user;
+								authnull_map_db = answer.database;
+								// The policy's session controls (authnull_session_limits.h) and whether to
+								// record the session (authnull_recording.h). Set on every login, so a reused
+								// id never inherits another's.
+								if (answer.has_limits) {
+									AuthnullSessionLimit limit;
+									limit.started_s = (long long)time(nullptr);
+									limit.max_minutes = answer.max_minutes;
+									limit.idle_minutes = answer.idle_minutes;
+									limit.ends_s = answer.ends_s;
+									authnullMySQLSessionLimits().set(thread_session_id, limit);
+								} else {
+									authnullMySQLSessionLimits().erase(thread_session_id);
+								}
+								authnull_record = answer.record;
+								syslog(LOG_INFO, "MFA approved for user '%s' db '%s' (MySQL session %u; privileges %s%s)", user.c_str(), db_name.c_str(),
+									thread_session_id, json(answer.privileges).dump().c_str(), answer.record ? "; recorded" : "");
 							}
 							free_users = GloMyAuth->increase_frontend_user_connections(
 								client_myds->myconn->userinfo->username,
@@ -7160,8 +7128,10 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 				uint8_t _pid = client_myds->pkt_sid; _pid++;
 				if (mfa_deny_msg != NULL) {
 					proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session=%p , DS=%p , MFA denied: %s\n", this, client_myds, mfa_deny_msg);
-					client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,_pid,1045,(char *)"28000", (char *)mfa_deny_msg, true);
-					GloMyLogger->log_audit_entry(PROXYSQL_MYSQL_AUTH_ERR, this, NULL, (char *)mfa_deny_msg);
+					// The reason authn-service gave, when it refused the login (authnull_refusal.h).
+					std::string denied = authnullDeniedMessage(mfa_deny_msg, authnull_refusal);
+					client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,_pid,1045,(char *)"28000", (char *)denied.c_str(), true);
+					GloMyLogger->log_audit_entry(PROXYSQL_MYSQL_AUTH_ERR, this, NULL, (char *)denied.c_str());
 					__sync_fetch_and_add(&MyHGM->status.access_denied_wrong_password, 1);
 				} else if (max_connections_reached==true) {
 					proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session=%p , DS=%p , Too many connections\n", this, client_myds);
@@ -9085,10 +9055,59 @@ unsigned long long MySQL_Session::IdleTime() {
 
 // this is called either from RequestEnd(), or at the end of executing
 // prepared statements
+// authnullRecordQuery writes the statement now ending to the recording spool (authnull_recording.h):
+// its text (masked there), whether it ran, rows, duration and error -- never result data.
+void MySQL_Session::authnullRecordQuery() {
+	AuthnullRecordedStatement st;
+	st.session_id = thread_session_id;
+	const char* q = NULL;
+	size_t ql = 0;
+	if (status == PROCESSING_STMT_EXECUTE && CurrentQuery.stmt_info) {
+		q = (const char*)CurrentQuery.stmt_info->query;
+		ql = CurrentQuery.stmt_info->query_length;
+	} else {
+		q = (const char*)CurrentQuery.QueryPointer;
+		ql = CurrentQuery.QueryLength > 0 ? (size_t)CurrentQuery.QueryLength : 0;
+	}
+	if (q == NULL || ql == 0) return;
+	while (ql > 0 && q[ql - 1] == '\0') ql--;
+	st.statement.assign(q, ql);
+	uint64_t real = realtime_time();
+	uint64_t mono = thread->curtime;
+	if (CurrentQuery.start_time) {
+		st.at_ms = (long long)((CurrentQuery.start_time + real - mono) / 1000);
+		if (CurrentQuery.end_time > CurrentQuery.start_time) {
+			st.duration_ms = (long long)((CurrentQuery.end_time - CurrentQuery.start_time) / 1000);
+		}
+	} else {
+		st.at_ms = (long long)(real / 1000);
+	}
+	if (client_myds && client_myds->myconn && client_myds->myconn->userinfo) {
+		if (client_myds->myconn->userinfo->username) st.user = client_myds->myconn->userinfo->username;
+		if (client_myds->myconn->userinfo->schemaname) st.database = client_myds->myconn->userinfo->schemaname;
+	}
+	if (client_myds && client_myds->addr.addr) {
+		st.client = std::string(client_myds->addr.addr) + ":" + std::to_string(client_myds->addr.port);
+	}
+	st.hostgroup = current_hostgroup >= 0 ? current_hostgroup : default_hostgroup;
+	st.allowed = !authnull_refused;
+	st.rows = CurrentQuery.rows_sent;
+	if (CurrentQuery.have_affected_rows) st.affected = CurrentQuery.affected_rows;
+	st.error = authnull_query_error;
+	if (!authnullRecorder().append(authnullRecordLine(st))) {
+		proxy_warning("[authnull] could not write the recording of MySQL session %u\n", thread_session_id);
+	}
+}
+
 void MySQL_Session::LogQuery(MySQL_Data_Stream *myds) {
 	// we need to access statistics before calling CurrentQuery.end()
 	// so we track the time here
 	CurrentQuery.end_time=thread->curtime;
+	if (authnull_record) {
+		authnullRecordQuery();
+	}
+	authnull_refused = false;
+	authnull_query_error.clear();
 
 	if (qpo) {
 		if (qpo->log==1) {

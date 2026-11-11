@@ -73,6 +73,21 @@ int main() {
 		expect(authnullSessionLimitReason(l, 1794310600, 0).find("maximum session") != std::string::npos, "the earlier limit");
 	}
 
+	// MySQL and PostgreSQL number their sessions separately: one id is two sessions, so each engine
+	// keeps its own registry.
+	{
+		AuthnullSessionLimit pg, my, got;
+		pg.max_minutes = 1;
+		my.max_minutes = 2;
+		authnullSessionLimits().set(777001, pg);
+		authnullMySQLSessionLimits().set(777001, my);
+		expect(authnullSessionLimits().get(777001, got) && got.max_minutes == 1, "the PostgreSQL entry");
+		expect(authnullMySQLSessionLimits().get(777001, got) && got.max_minutes == 2, "the MySQL entry");
+		authnullMySQLSessionLimits().erase(777001);
+		expect(authnullSessionLimits().get(777001, got), "erasing MySQL's leaves PostgreSQL's");
+		authnullSessionLimits().erase(777001);
+	}
+
 	if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
 	std::puts("ok");
 	return 0;

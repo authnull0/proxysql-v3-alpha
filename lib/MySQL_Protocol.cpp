@@ -2389,27 +2389,35 @@ bool MySQL_Protocol::process_pkt_handshake_response(unsigned char *pkt, unsigned
         std::string full_username = std::string(reinterpret_cast<char*>(vars1.user));
         size_t comma_pos = full_username.find(',');
 
+        // A client session must carry its connection token ("<user>,<token>"); the admin and stats
+        // interfaces may (the agent logs in as "<user>,agent") but need not.
+        bool client_session = (session_type == PROXYSQL_SESSION_MYSQL);
         if (comma_pos == std::string::npos || comma_pos == full_username.length() - 1) {
-            syslog(LOG_ERR, "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.");
-            ret = false;  // Reject authentication
-            goto __exit_process_pkt_handshake_response;
+            if (client_session) {
+                syslog(LOG_ERR, "[ERROR] Invalid username format! Expected '<username>,<extra_data>'. Closing connection.");
+                ret = false;  // Reject authentication
+                goto __exit_process_pkt_handshake_response;
+            }
+            comma_pos = full_username.length();
         }
 
         // Extract the username and extra data
         std::string clean_user = full_username.substr(0, comma_pos);
-        std::string extra_data = full_username.substr(comma_pos + 1);
+        std::string extra_data = comma_pos < full_username.length() ? full_username.substr(comma_pos + 1) : "";
 
-        // Generate a session ID
-        session_idp = generateSessionIDnew();
-        {
-            session_extra_data_map[clean_user + "_" + session_idp] = extra_data;
+        // The token stays with this session (MySQL_Session::authnull_mfa_token). It went through a
+        // global session id and map every worker thread wrote, so a login on one thread could pick
+        // up a token another thread had just stored -- and the map, bearer tokens included, was
+        // never emptied.
+        if (client_session) {
+            (*myds)->sess->authnull_mfa_token = extra_data;
         }
 
         // Modify the original packet (pkt) directly
         strncpy(reinterpret_cast<char*>(vars1.user), clean_user.c_str(), clean_user.length());
         vars1.user[clean_user.length()] = '\0';  // Null-terminate safely
 
-        syslog(LOG_DEBUG, "[DEBUG] Updated user: %s Session: %s Token: %s", clean_user.c_str(), session_idp.c_str(), authnullTokenHint(extra_data).c_str());
+        syslog(LOG_DEBUG, "[DEBUG] Updated user: %s Token: %s", clean_user.c_str(), authnullTokenHint(extra_data).c_str());
     }
 
     if (hdr.pkt_id == 0 && *pkt == 2) {

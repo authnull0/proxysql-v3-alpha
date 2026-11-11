@@ -1,3 +1,4 @@
+#include "authnull_session_limits.h"
 #include "../deps/json/json.hpp"
 using json = nlohmann::json;
 #define PROXYJSON
@@ -3390,7 +3391,22 @@ void MySQL_Thread::idle_thread_to_kill_idle_sessions() {
 	for (i=0;i<SESS_TO_SCAN && mysess_idx < mysql_sessions->len; i++) {
 		uint32_t sess_pos=mysess_idx;
 		MySQL_Session *mysess=(MySQL_Session *)mysql_sessions->index(sess_pos);
-		if (mysess->idle_since < min_idle || mysess->killed==true) {
+		// AuthNull session controls for a session parked on this idle thread: the worker's maintenance
+		// pass never sees it while it is here, so its limits are checked now, and it is ended the way
+		// wait_timeout ends it (authnull_session_limits.h).
+		bool authnull_end = false;
+		if (mysess->killed == false) {
+			AuthnullSessionLimit limit;
+			if (authnullMySQLSessionLimits().get(mysess->thread_session_id, limit)) {
+				unsigned long long idle_ms = curtime > mysess->idle_since ? (curtime - mysess->idle_since) / 1000 : 0;
+				std::string why = authnullSessionLimitReason(limit, (long long)time(nullptr), idle_ms);
+				if (!why.empty()) {
+					proxy_warning("[authnull] closing idle MySQL session %u: %s\n", mysess->thread_session_id, why.c_str());
+					authnull_end = true;
+				}
+			}
+		}
+		if (mysess->idle_since < min_idle || mysess->killed==true || authnull_end) {
 			mysess->killed=true;
 			MySQL_Data_Stream *tmp_myds=mysess->client_myds;
 			int dsidx=tmp_myds->poll_fds_idx;
@@ -3750,6 +3766,18 @@ void MySQL_Thread::ProcessAllSessions_CompletedMirrorSession(unsigned int& n, My
  */
 void MySQL_Thread::ProcessAllSessions_MaintenanceLoop(MySQL_Session *sess, unsigned long long sess_time, unsigned int& total_active_transactions_) {
 	unsigned int numTrx=0;
+	// AuthNull session controls: a session past its policy's maximum length, idle timeout or access
+	// grant is closed here, whether or not the client sends anything (authnull_session_limits.h).
+	if (sess->killed == false) {
+		AuthnullSessionLimit limit;
+		if (authnullMySQLSessionLimits().get(sess->thread_session_id, limit)) {
+			std::string why = authnullSessionLimitReason(limit, (long long)time(nullptr), sess_time / 1000);
+			if (!why.empty()) {
+				sess->killed = true;
+				proxy_warning("[authnull] closing MySQL session %u: %s\n", sess->thread_session_id, why.c_str());
+			}
+		}
+	}
 	total_active_transactions_ += sess->active_transactions;
 	sess->to_process=1;
 	/**
@@ -3948,7 +3976,8 @@ void MySQL_Thread::process_all_sessions() {
 				continue;
 			}
 		}
-		if (sess->status == CONNECTING_CLIENT) {
+		// A login waiting on its MFA push is not a stalled handshake: the push call bounds it (90 s).
+		if (sess->status == CONNECTING_CLIENT && !sess->authnull_mfa_call) {
 			unsigned long long sess_time = sess->IdleTime();
 			if (sess_time/1000 > (unsigned long long)mysql_thread___connect_timeout_client) {
 				proxy_warning("Closing not established client connection %s:%d after %llums\n",sess->client_myds->addr.addr,sess->client_myds->addr.port, sess_time/1000);
@@ -3984,6 +4013,13 @@ void MySQL_Thread::process_all_sessions() {
 		if (unlikely(sess->healthy==0)) {
 			ProcessAllSessions_Healthy0(sess, n);
 		} else {
+			if (sess->authnull_mfa_call) {
+				// Waiting on its MFA push, off this thread: look again soon, without a client event.
+				sess->to_process = 1;
+				if (mypolls.poll_timeout == 0 || mypolls.poll_timeout > kAuthnullMfaPollMicros) {
+					mypolls.poll_timeout = kAuthnullMfaPollMicros;
+				}
+			}
 			if (sess->to_process==1) {
 				if (sess->pause_until <= curtime) {
 					rc=sess->handler();

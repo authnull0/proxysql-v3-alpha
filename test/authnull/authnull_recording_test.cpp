@@ -69,6 +69,18 @@ int main() {
 	std::string m = authnullMaskSecrets(big);
 	expect(m.size() <= kAuthnullRecordMaxStatement + 3 && m.substr(m.size() - 3) == "...", "a long statement is cut");
 
+	// --- MySQL error messages quote values; recordings keep the message, not the values ---
+	expect(authnullMaskErrorValues("[1062] Duplicate entry 'jane@acme.com' for key 'users.email'") ==
+		"[1062] Duplicate entry '***' for key '***'", "duplicate entry masked");
+	expect(authnullMaskErrorValues("[1406] Data too long for column 'note' at row 1") == "[1406] Data too long for column '***' at row 1",
+		"column name masked too");
+	expect(authnullMaskErrorValues("[1146] Table shop.nosuch doesn't exist") == "[1146] Table shop.nosuch doesn't exist",
+		"an apostrophe inside a word is not a quote");
+	expect(authnullMaskErrorValues("[1064] near 'it''s' at line 1") == "[1064] near '***' at line 1", "doubled quote inside a value");
+	expect(authnullMaskErrorValues("[1366] Incorrect integer value: 'abc' for column 'n'") == "[1366] Incorrect integer value: '***' for column '***'",
+		"several values");
+	expect(authnullMaskErrorValues("[1105] unterminated 'secret") == "[1105] unterminated '***'", "unterminated");
+
 	// --- one JSON line per statement ---
 	AuthnullRecordedStatement st;
 	st.session_id = 195; st.at_ms = 1794296684123; st.duration_ms = 12; st.user = "dbmfa_writer"; st.database = "dbmfa_test";
