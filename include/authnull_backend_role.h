@@ -97,11 +97,14 @@ inline bool sha256Hex(const std::string& in, std::string& out) {
 } // namespace authnull_backend_role_detail
 
 // authnullBackendRoleName sets out to the restricted role's name and returns true, or returns false
-// when the session keeps the policy's own role (EXECUTE granted, an unknown privilege, none at all).
+// when the session keeps the policy's own role (EXECUTE granted, an unknown privilege, none at all)
+// -- or logs in as a just-in-time account (jit_..., authnull-service docs/DB-JIT-ACCOUNTS.md), which
+// the backend created with exactly the policy's privileges and is its own restricted role.
 inline bool authnullBackendRoleName(const std::string& database, const std::string& role,
 	const std::vector<std::string>& privileges, const std::vector<std::string>& tables, std::string& out) {
 	// Qualified, not a using-directive: ProxySQL has a global d::trim() that would make calls ambiguous.
 	namespace d = authnull_backend_role_detail;
+	if (d::lower(d::trim(role)).rfind("jit_", 0) == 0) return false;
 	std::set<std::string> verbs;
 	for (const auto& p : privileges) {
 		std::string u = d::upper(d::trim(p));
