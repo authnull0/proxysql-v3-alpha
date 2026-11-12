@@ -77,6 +77,21 @@ Lab, 11 Nov 2026, 1 MySQL thread, 4 victims:
   `Duplicate entry '***' for key '***'`. 0 syslog lines held a value.
 - **Session limits:** the session was ended about 12 s after login.
 
+## Just-in-time accounts (`jitrole.sh`)
+
+`./jitrole.sh [proxysql binary]` runs ProxySQL with `backend_roles = "enforce"` and two logins, both
+approved by the stub:
+- `jit_tester_3f9a2c1e` stands for an account authnull-service created for one approved request
+  (docs/DB-JIT-ACCOUNTS.md there). It already holds exactly the policy's privileges, so it must run
+  as itself.
+- `stall_fast` is a policy role with no restricted `an_` role provisioned. Enforce must still refuse it.
+
+Lab, 12 Nov 2026:
+- **Before** (`/usr/bin/proxysql`, on-prem): the `jit_` login was refused with "Access denied for
+  user 'jit_tester_3f9a2c1e'". Its restricted role was looked up and not found.
+- **After:** `PASS jit_ account runs as itself under enforce`. `stall_fast` was still refused.
+  `./run.sh 2 4`: 0/4 stalled, a fresh login took 0.15 s.
+
 ## Admin errors on the PgSQL admin port (`admin_err.sh`)
 
 `./admin_err.sh [proxysql binary]` starts a throwaway ProxySQL (no database needed) and sends the

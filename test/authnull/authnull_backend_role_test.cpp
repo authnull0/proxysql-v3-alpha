@@ -60,6 +60,22 @@ int main() {
 	name("d", "r", {}, {"t"}, &ok); expect(!ok, "no privileges");
 	name("d", "r", {"READ", "ADMIN"}, {"t"}, &ok); expect(!ok, "unknown privilege");
 
+	// A just-in-time account (authnull-service docs/DB-JIT-ACCOUNTS.md) already holds exactly the
+	// policy's privileges: it gets no restricted role, so the session runs as the account itself --
+	// whatever backend_roles says (enforce would otherwise refuse every such login).
+	ok = true;
+	name("dbmfa_test", "jit_sathyam_e2e0a11c", {"READ"}, four, &ok);
+	expect(!ok, "a jit_ account gets no restricted role");
+	name("dbmfa_test", "JIT_Dev_3f9a2c1e", {"SELECT", "INSERT"}, {}, &ok);
+	expect(!ok, "jit_ in any case gets no restricted role");
+	name("dbmfa_test", " jit_dev_3f9a2c1e", {"READ"}, {}, &ok);
+	expect(!ok, "a jit_ account with surrounding space gets no restricted role");
+	// Only the prefix: other names are unchanged.
+	name("dbmfa_test", "jitter", {"READ"}, {}, &ok);
+	expect(ok, "jitter is not a jit_ account");
+	name("dbmfa_test", "app_jit_rw", {"READ"}, {}, &ok);
+	expect(ok, "a role with jit_ inside is not a jit_ account");
+
 	// Mode setting: prefer unless it says otherwise.
 	expect(authnullParseBackendRoleMode("") == AuthnullBackendRoleMode::Prefer, "empty is prefer");
 	expect(authnullParseBackendRoleMode("prefer") == AuthnullBackendRoleMode::Prefer, "prefer");
