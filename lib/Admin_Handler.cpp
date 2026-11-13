@@ -1,4 +1,5 @@
 #include "authnull_kill.h"
+#include "authnull_session_ends.h"
 #include "../deps/json/json.hpp"
 using json = nlohmann::json;
 #define PROXYJSON
@@ -352,6 +353,32 @@ bool admin_handler_command_pgsql_kill_connection(char *query_no_space, unsigned 
 		answer = buf;
 	} else {
 		snprintf(buf, sizeof(buf), "SELECT 0 AS killed, 'no PgSQL session %u' AS detail", id);
+		answer = buf;
+	}
+	l_free(*ql, *q);
+	*q = l_strdup(answer);
+	*ql = strlen(*q) + 1;
+	return true;
+}
+
+// PGSQL|MYSQL SET SESSION ENDS <id> <unix> moves an open session's access-grant end (an extended
+// grant; authnull_session_ends.h). Answers with a row -- updated 1 or 0, and why -- which the
+// database agent reads.
+template <typename S>
+bool admin_handler_command_set_session_ends(char *query_no_space, unsigned int query_no_space_length, S* sess, ProxySQL_Admin *pa, char **q, unsigned int *ql) {
+	AuthnullSessionEnds e;
+	const char* answer;
+	char buf[160];
+	if (!authnullParseSetSessionEnds(query_no_space, e)) {
+		answer = "SELECT 0 AS updated, 'usage: PGSQL|MYSQL SET SESSION ENDS <session id> <unix seconds>' AS detail";
+	} else {
+		AuthnullSessionLimits& limits = e.pgsql ? authnullSessionLimits() : authnullMySQLSessionLimits();
+		if (limits.set_ends(e.id, e.ends_s)) {
+			snprintf(buf, sizeof(buf), "SELECT 1 AS updated, 'session %u ends at %lld' AS detail", e.id, e.ends_s);
+		} else {
+			snprintf(buf, sizeof(buf), "SELECT 0 AS updated, 'no %s session %u on an access grant' AS detail",
+				e.pgsql ? "PgSQL" : "MySQL", e.id);
+		}
 		answer = buf;
 	}
 	l_free(*ql, *q);
@@ -2732,6 +2759,12 @@ void admin_session_handler(S* sess, void *_pa, PtrSize_t *pkt) {
 		if ((query_no_space_length>5) && ( (!strncasecmp("SAVE ", query_no_space, 5)) || (!strncasecmp("LOAD ", query_no_space, 5))) ) {
 			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Received LOAD or SAVE command\n");
 			run_query=admin_handler_command_load_or_save(query_no_space, query_no_space_length, sess, pa, &query, &query_length);
+			goto __run_query;
+		}
+		if ((query_no_space_length>23) && (!strncasecmp(kAuthnullPgsqlSetEnds, query_no_space, 23) ||
+				!strncasecmp(kAuthnullMysqlSetEnds, query_no_space, 23))) {
+			proxy_debug(PROXY_DEBUG_ADMIN, 4, "Received SET SESSION ENDS command\n");
+			run_query=admin_handler_command_set_session_ends(query_no_space, query_no_space_length, sess, pa, &query, &query_length);
 			goto __run_query;
 		}
 		if ((query_no_space_length>22) && !strncasecmp(kAuthnullPgsqlKill, query_no_space, 22)) {
