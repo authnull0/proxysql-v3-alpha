@@ -90,6 +90,15 @@ public:
 		out = it->second;
 		return true;
 	}
+	// set_ends moves the access-grant end of a session that has limits (authnull_session_ends.h);
+	// false, and nothing added, for one that has none.
+	bool set_ends(unsigned long long id, long long ends_s) {
+		std::lock_guard<std::mutex> lock(mu_);
+		auto it = m_.find(id);
+		if (it == m_.end()) return false;
+		it->second.ends_s = ends_s;
+		return true;
+	}
 	void erase(unsigned long long id) {
 		std::lock_guard<std::mutex> lock(mu_);
 		m_.erase(id);

@@ -92,6 +92,23 @@ Lab, 12 Nov 2026:
 - **After:** `PASS jit_ account runs as itself under enforce`. `stall_fast` was still refused.
   `./run.sh 2 4`: 0/4 stalled, a fresh login took 0.15 s.
 
+## Extended grant (`extendtest.sh`)
+
+`./extendtest.sh 2 1 [proxysql binary]` runs `extend.py` with the stub's grant ending `ENDS_IN=15`
+seconds after login. At 5 seconds it sends `PGSQL SET SESSION ENDS <id> <login + 35 s>`, as the
+database agent does when the grant is extended (authnull-service docs/DB-ACCESS-REQUESTS.md). The
+session must go on past 15 s and end at about 35 s.
+
+Lab, 13 Nov 2026:
+- **Before** (`/usr/bin/proxysql`, on-prem): the command was unknown and the session ended at 14.3 s.
+- **After:**
+  - a bad command and an unknown session each answer with a row (`0|usage: …`, `0|no PgSQL session 99999 on an access grant`);
+  - the extend answers `1|session 4 ends at …`;
+  - the session answered until 32.3 s and ended at 35.3 s.
+- Regressions:
+  - `run.sh 2 4`: 0/4 stalled;
+  - `jitrole.sh`: both PASS.
+
 ## Admin errors on the PgSQL admin port (`admin_err.sh`)
 
 `./admin_err.sh [proxysql binary]` starts a throwaway ProxySQL (no database needed) and sends the
