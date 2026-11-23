@@ -35,9 +35,20 @@
 //   LOAD, COPY ... FROM                                                              INSERT
 //   COPY ... TO STDOUT is an export, SELECT; any other COPY                          EXECUTE
 //   TRUNCATE                                                                         TRUNCATE
-//   anything else (DDL, GRANT, SET, DO, CALL, BEGIN, ...)                            EXECUTE
+//   client housekeeping (below)                                                      nothing
+//   anything else (DDL, GRANT, DO, CALL, SET ROLE, ...)                              EXECUTE
 // plus, wherever they are called, functions with side effects: setval, nextval, lo_* (UPDATE);
 // set_config, dblink_exec, lo_import, pg_terminate_backend, load_file, ... (EXECUTE).
+//
+// Client housekeeping needs no privilege: what pgAdmin, DBeaver and the drivers send on their own
+// to set up a connection. Transactions (BEGIN / START TRANSACTION, COMMIT, END, ROLLBACK, ABORT,
+// SAVEPOINT, RELEASE -- not their PREPARED forms); on Postgres, SET / RESET of the settings clients
+// use (clientSettings: DateStyle, TimeZone, search_path, ...) and set_config of one written out,
+// SET TRANSACTION, SET SESSION CHARACTERISTICS, SET CONSTRAINTS, DISCARD; on MySQL, SET of session
+// and user variables, SET NAMES, SET TRANSACTION, USE. Still EXECUTE: what changes who the session
+// is or reaches past it -- SET ROLE, SESSION AUTHORIZATION, any other Postgres setting (e.g.
+// default_transaction_read_only), MySQL SET GLOBAL / PERSIST / PASSWORD / ROLE / DEFAULT ROLE /
+// RESOURCE GROUP. Whatever a SET reads or calls still counts (SET @n = (SELECT ...): SELECT).
 //
 // LIMITS. This is a gate in front of the database, not the database's own permission system: a
 // user-defined function with side effects reads as a call to an unknown function, which is READ.
@@ -57,11 +68,11 @@ enum class AuthnullDialect { Postgres, MySQL };
 
 namespace authnull_query_detail {
 
-enum class TokKind { Word, QuotedIdent, LParen, RParen };
+enum class TokKind { Word, QuotedIdent, LParen, RParen, Str };
 
 struct Tok {
 	TokKind kind;
-	std::string text; // Word: upper case; QuotedIdent: lower case
+	std::string text; // Word: upper case; QuotedIdent and Str: lower case
 };
 
 inline bool isWordChar(char c) {
@@ -162,19 +173,21 @@ inline bool lex(const std::string& sql, AuthnullDialect d, std::vector<std::vect
 				if (!cur.empty() && cur.back().kind == TokKind::Word && cur.back().text == "E") cur.pop_back();
 			}
 			char q = c;
+			std::string text;
 			i++;
 			bool closed = false;
 			while (i < n) {
-				if (backslash && sql[i] == '\\') { i += 2; continue; }
+				if (backslash && sql[i] == '\\') { if (i + 1 < n) text += sql[i + 1]; i += 2; continue; }
 				if (sql[i] == q) {
-					if (i + 1 < n && sql[i + 1] == q) { i += 2; continue; }
+					if (i + 1 < n && sql[i + 1] == q) { text += q; i += 2; continue; }
 					i++;
 					closed = true;
 					break;
 				}
-				i++;
+				text += sql[i++];
 			}
 			if (!closed) return false;
+			cur.push_back({TokKind::Str, lower(text)});
 			continue;
 		}
 
@@ -247,17 +260,35 @@ inline const std::set<std::string>& executeFunctions() {
 	return s;
 }
 
+// Postgres settings clients set up a connection with: SET / RESET of these, and set_config of one
+// written out, need no privilege. Any other setting stays EXECUTE (role, session_authorization,
+// default_transaction_read_only, ...): it is not housekeeping.
+inline const std::set<std::string>& clientSettings() {
+	static const std::set<std::string> s = {
+		"datestyle", "intervalstyle", "timezone", "client_encoding", "client_min_messages",
+		"application_name", "search_path", "extra_float_digits", "bytea_output",
+		"statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout", "idle_session_timeout",
+		"standard_conforming_strings", "escape_string_warning", "transaction_isolation",
+		"default_transaction_isolation", "lc_monetary", "lc_numeric", "lc_time", "timezone_abbreviations",
+		"xmloption", "xmlbinary", "names",
+	};
+	return s;
+}
+
 inline void addCalls(const std::vector<Tok>& t, std::set<std::string>& need) {
 	for (size_t i = 0; i < t.size(); i++) {
 		if (!calledAt(t, i)) continue;
 		if (t[i].kind != TokKind::Word && t[i].kind != TokKind::QuotedIdent) continue;
 		std::string fn = lower(t[i].text);
+		// set_config('DateStyle', ...): housekeeping when the setting is written out and a client one.
+		if (fn == "set_config" && i + 2 < t.size() && t[i + 2].kind == TokKind::Str &&
+			clientSettings().count(t[i + 2].text)) continue;
 		if (executeFunctions().count(fn)) need.insert("EXECUTE");
 		else if (writeFunctions().count(fn)) need.insert("UPDATE");
 	}
 }
 
-inline void classify(const std::vector<Tok>& t, std::set<std::string>& need);
+inline void classify(const std::vector<Tok>& t, AuthnullDialect d, std::set<std::string>& need);
 
 // addWrites: the verbs the writes anywhere in t need -- INSERT, UPDATE, DELETE, and MERGE's and
 // REPLACE's -- and row locks.
@@ -289,7 +320,26 @@ inline void classifyQuery(const std::vector<Tok>& t, std::set<std::string>& need
 	}
 }
 
-inline void classify(const std::vector<Tok>& t, std::set<std::string>& need) {
+inline bool anyWord(const std::vector<Tok>& t, size_t from, const std::set<std::string>& words) {
+	for (size_t i = from; i < t.size(); i++) {
+		if (t[i].kind == TokKind::Word && words.count(t[i].text)) return true;
+	}
+	return false;
+}
+
+inline bool onlyWords(const std::vector<Tok>& t, size_t from, const std::set<std::string>& words) {
+	for (size_t i = from; i < t.size(); i++) {
+		if (t[i].kind != TokKind::Word || !words.count(t[i].text)) return false;
+	}
+	return true;
+}
+
+// classifyHousekeeping: when t is client housekeeping (the header), adds what it needs -- nothing,
+// or what a SET reads or calls -- and returns true. Anything else returns false and is classified
+// as before.
+inline bool classifyHousekeeping(const std::vector<Tok>& t, size_t first, AuthnullDialect d, std::set<std::string>& need);
+
+inline void classify(const std::vector<Tok>& t, AuthnullDialect d, std::set<std::string>& need) {
 	size_t first = 0;
 	while (first < t.size() && t[first].kind == TokKind::LParen) first++; // "(select ...)"
 	if (first >= t.size()) return; // empty statement
@@ -324,7 +374,7 @@ inline void classify(const std::vector<Tok>& t, std::set<std::string>& need) {
 			i++;
 		}
 		if (!analyze) { need.insert("SELECT"); return; }
-		classify(std::vector<Tok>(t.begin() + static_cast<long>(i), t.end()), need);
+		classify(std::vector<Tok>(t.begin() + static_cast<long>(i), t.end()), d, need);
 		return;
 	}
 	if (k == "COPY") {
@@ -354,10 +404,63 @@ inline void classify(const std::vector<Tok>& t, std::set<std::string>& need) {
 		addWrites(t, need); // the statement's own verb, an upsert's UPDATE, writes in its CTEs
 		return;
 	}
+	if (classifyHousekeeping(t, first, d, need)) return;
 	if (k == "UPSERT") { need.insert("INSERT"); need.insert("UPDATE"); return; }
 	if (k == "LOAD") { need.insert("INSERT"); return; }
 	if (k == "TRUNCATE") { need.insert("TRUNCATE"); return; }
 	need.insert("EXECUTE");
+}
+
+inline bool classifyHousekeeping(const std::vector<Tok>& t, size_t first, AuthnullDialect d, std::set<std::string>& need) {
+	const bool pg = d == AuthnullDialect::Postgres;
+	const std::string& k = t[first].text;
+	const size_t rest = first + 1;
+	static const std::set<std::string> txModes = {
+		"WORK", "TRANSACTION", "ISOLATION", "LEVEL", "READ", "WRITE", "ONLY", "COMMITTED", "UNCOMMITTED",
+		"REPEATABLE", "SERIALIZABLE", "DEFERRABLE", "NOT", "WITH", "CONSISTENT", "SNAPSHOT",
+	};
+
+	// Transactions. BEGIN and START only with transaction modes after them: BEGIN ATOMIC / NOT
+	// ATOMIC opens a block of statements, not a transaction.
+	if (k == "BEGIN") return onlyWords(t, rest, txModes);
+	if (k == "START") return isWord(t, rest, "TRANSACTION") && onlyWords(t, rest + 1, txModes);
+	if (k == "COMMIT" || k == "END" || k == "ROLLBACK" || k == "ABORT") {
+		return !anyWord(t, rest, {"PREPARED"}); // ... PREPARED finishes a two-phase transaction
+	}
+	if (k == "SAVEPOINT" || k == "RELEASE") return true;
+	if (!pg && k == "USE") return true;
+	if (pg && k == "DISCARD") return true;
+	if (pg && k == "RESET") {
+		if (isWord(t, rest, "ALL")) return true;
+		if (rest < t.size() && t[rest].kind == TokKind::Word && clientSettings().count(lower(t[rest].text))) return true;
+		return false;
+	}
+	if (k != "SET") return false;
+
+	size_t i = rest;
+	if (pg) {
+		if (isWord(t, i, "SESSION") || isWord(t, i, "LOCAL")) {
+			if (isWord(t, i, "SESSION") && isWord(t, i + 1, "CHARACTERISTICS")) return true;
+			i++;
+		}
+		if (isWord(t, i, "TRANSACTION") || isWord(t, i, "CONSTRAINTS")) return true;
+		if (isWord(t, i, "TIME") && isWord(t, i + 1, "ZONE")) return true;
+		// SET <setting> = / TO ...: only the settings clients use. ROLE, SESSION AUTHORIZATION and
+		// everything else fall through to EXECUTE.
+		if (i < t.size() && (t[i].kind == TokKind::Word || t[i].kind == TokKind::QuotedIdent) &&
+			clientSettings().count(lower(t[i].text))) return true;
+		return false;
+	}
+
+	// MySQL. Server-wide, persistent, or about who the session is: EXECUTE, as before.
+	if (anyWord(t, rest, {"GLOBAL", "PERSIST", "PERSIST_ONLY"})) return false;
+	if (isWord(t, i, "PASSWORD") || isWord(t, i, "ROLE") || isWord(t, i, "RESOURCE") ||
+		(isWord(t, i, "DEFAULT") && isWord(t, i + 1, "ROLE"))) return false;
+	// Session and user variables, NAMES, TRANSACTION: nothing of their own; a read or a lock
+	// inside (SET @n = (SELECT ...)) counts as it would anywhere.
+	if (anyWord(t, rest, {"SELECT", "WITH", "VALUES", "TABLE"})) classifyQuery(t, need);
+	else addWrites(t, need);
+	return true;
 }
 
 } // namespace authnull_query_detail
@@ -370,7 +473,7 @@ inline std::set<std::string> authnullRequiredPrivileges(const std::string& sql, 
 	std::vector<std::vector<Tok>> statements;
 	ok = lex(sql, d, statements);
 	if (!ok) return need;
-	for (const auto& s : statements) classify(s, need);
+	for (const auto& s : statements) classify(s, d, need);
 	return need;
 }
 
