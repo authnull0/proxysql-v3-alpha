@@ -551,6 +551,10 @@ private:
 	unsigned long long pkt_count;
 	unsigned long long affected_rows;
 	unsigned int num_fields;
+	// Field masking (authnull_masking.h): per column of the current result set, whether to mask it
+	// and whether it is in binary format. Decided in add_row_description.
+	std::vector<bool> authnull_mask;
+	std::vector<bool> authnull_mask_binary;
 	unsigned int buffer_used;
 	unsigned char* buffer;
 	PgSQL_Protocol* proto;

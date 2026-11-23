@@ -301,6 +301,10 @@ public:
 	bool authnull_record = false;
 	bool authnull_refused = false;
 	std::string authnull_query_error;
+	// Field masking (authnull_masking.h): the policy's masked columns and the query now running,
+	// for PgSQL_Query_Result to decide which result columns to mask.
+	std::map<std::string, std::vector<std::string>> authnull_mask_policy;
+	std::string authnull_mask_query;
 #if 0
 	/*
 	 * @brief Store the hostgroups that hold connections that have been flagged as 'expired' by the

@@ -4188,6 +4188,8 @@ __get_pkts_from_client:
 								}
 								unsigned long session_id = this->thread_session_id;
 								extractTableAndFieldsFromQuery2(query, session_id, user, db_name);
+								authnull_mask_policy = getMaskingPolicyForSession2(user, db_name, std::to_string(session_id));
+								authnull_mask_query = query;
 								syslog(LOG_DEBUG, "[DEBUG] process_query using session ID: %lu", session_id);
 								qpo = GloPgQPro->process_query(this, pkt.ptr, pkt.size, &CurrentQuery);
 								if (thread->variables.stats_time_query_processor) {
