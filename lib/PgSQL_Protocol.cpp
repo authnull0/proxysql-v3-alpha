@@ -795,6 +795,7 @@ const char* get_auth_method_string(AUTHENTICATION_METHOD method) {
 #include <cstdlib>
 #include <climits>
 #include <cerrno>
+#include "authnull_masking.h"
 // authnullEnvOrConf reads a setting from the environment first, falling back to proxysql.cnf.
 //
 // WHY THE ENVIRONMENT WINS
@@ -2085,7 +2086,14 @@ unsigned int PgSQL_Protocol::copy_row_to_PgSQL_Query_Result(bool send, PgSQL_Que
             }
             pgpkt.put_uint32(column_value_len);
             if (column_value_len > 0) {
-                pgpkt.put_bytes(PQgetvalue(result, i, j), column_value_len);
+                if (j < pg_query_result->authnull_mask.size() && pg_query_result->authnull_mask[j]) {
+                    // Field masking: same length, '*' (zeros for a binary value).
+                    const bool bin = j < pg_query_result->authnull_mask_binary.size() && pg_query_result->authnull_mask_binary[j];
+                    const std::string masked = authnullMaskedValue(NULL, column_value_len, bin);
+                    pgpkt.put_bytes(masked.data(), column_value_len);
+                } else {
+                    pgpkt.put_bytes(PQgetvalue(result, i, j), column_value_len);
+                }
             }
         }
         
@@ -2398,6 +2406,10 @@ unsigned int PgSQL_Protocol::copy_buffer_to_PgSQL_Query_Result(bool send, PgSQL_
 	}
 
 	memcpy(_ptr, result->data, size);
+	// Field masking, in place: the row keeps its length (authnull_masking.h).
+	if (!pg_query_result->authnull_mask.empty()) {
+		authnullMaskDataRow(_ptr, size, pg_query_result->authnull_mask, pg_query_result->authnull_mask_binary);
+	}
 
 	if (send == true) {
 		// not supported
@@ -2473,6 +2485,22 @@ unsigned int PgSQL_Query_Result::add_row_description(const PGresult* result) {
 	syslog(LOG_INFO, "EPFFFFFFFFFFF : 3");
 	const unsigned int res = proto->copy_row_description_to_PgSQL_Query_Result(false, this, result);
 	result_packet_type |= PGSQL_QUERY_RESULT_TUPLE;
+
+	// Which columns of this result set the session's field masking covers (authnull_masking.h).
+	authnull_mask.clear();
+	authnull_mask_binary.clear();
+	PgSQL_Session* sess = myds ? myds->sess : NULL;
+	if (sess && result && !sess->authnull_mask_policy.empty()) {
+		const int n = PQnfields(result);
+		std::vector<AuthnullResultColumn> cols;
+		cols.reserve(n > 0 ? n : 0);
+		for (int i = 0; i < n; i++) {
+			const char* name = PQfname(result, i);
+			cols.push_back({name ? name : "", PQftable(result, i) != InvalidOid, PQfformat(result, i) == 1});
+			authnull_mask_binary.push_back(PQfformat(result, i) == 1);
+		}
+		authnull_mask = authnullMaskColumns(sess->authnull_mask_policy, cols, sess->authnull_mask_query);
+	}
 	return res;
 }
 
@@ -2685,6 +2713,8 @@ unsigned char* PgSQL_Query_Result::buffer_reserve_space(unsigned int size) {
 }
 
 void PgSQL_Query_Result::reset() {
+	authnull_mask.clear();
+	authnull_mask_binary.clear();
 	resultset_size = 0;
 	num_fields = 0;
 	num_rows = 0;
