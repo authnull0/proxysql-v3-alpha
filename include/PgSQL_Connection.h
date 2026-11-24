@@ -222,8 +222,12 @@ public:
 		return false;
 	}
 
+	// false for a key outside the table: a client may send any server setting at startup
+	// (pgjdbc sends DateStyle, TimeZone, extra_float_digits), and none of it is ProxySQL's to abort on.
 	bool set_value(const char* key, const char* val) {
-		return set_value((PgSQL_Param_Name)get_param_name(key), val);
+		int idx = get_param_name(key);
+		if (idx == -1) return false;
+		return set_value((PgSQL_Param_Name)idx, val);
 	}
 
 	void reset_value(PgSQL_Param_Name key) {
@@ -240,6 +244,7 @@ public:
 		return param_value[key];
 	}
 
+	// -1 when name is not in PgSQL_Param_Name_Str
 	int get_param_name(const char* name) {
 		int key = -1;
 
@@ -250,7 +255,6 @@ public:
 			}
 		}
 
-		assert(key != -1);
 		return key;
 	}
 

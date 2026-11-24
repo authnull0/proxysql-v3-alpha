@@ -649,7 +649,11 @@ void PgSQL_Protocol::load_conn_parameters(pgsql_hdr* pkt, bool startup)
 		read_pos += pos;
 
 		//slog_debug(server, "S: param: %s = %s", key, val);
-		(*myds)->myconn->conn_params.set_value(key, val);
+		if (!(*myds)->myconn->conn_params.set_value(key, val)) {
+			// Not kept: ProxySQL does not forward startup settings to the backend (its connections
+			// are opened from its own conninfo), so an unknown one is dropped. The value is not logged.
+			proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session=%p , DS=%p. startup parameter '%s' ignored\n", (*myds)->sess, (*myds), key);
+		}
 	}
 }
 
