@@ -2509,7 +2509,43 @@ unsigned int PgSQL_Query_Result::add_row_description(const PGresult* result) {
 		}
 		authnull_mask = authnullMaskColumns(sess->authnull_mask_policy, cols, sess->authnull_mask_query);
 	}
+	if (authnull_pgx::Extended* ext = authnull_ext()) {
+		authnull_put(ext->onRowDescription(authnull_take_last(res)));
+	}
 	return res;
+}
+
+authnull_pgx::Extended* PgSQL_Query_Result::authnull_ext() {
+	PgSQL_Session* sess = (proto && myds) ? myds->sess : NULL;
+	return (sess && sess->authnull_ext.running()) ? &sess->authnull_ext : NULL;
+}
+
+// authnull_take_last takes back the message of size bytes just written: the end of the buffer, or,
+// when it did not fit there, the last packet.
+std::string PgSQL_Query_Result::authnull_take_last(unsigned int size) {
+	std::string m;
+	if (buffer_used >= size) {
+		m.assign((const char*)buffer + buffer_used - size, size);
+		buffer_used -= size;
+	} else if (PSarrayOUT.len) {
+		PtrSize_t pkt;
+		PSarrayOUT.remove_index(PSarrayOUT.len - 1, &pkt);
+		m.assign((const char*)pkt.ptr, pkt.size);
+		l_free(pkt.size, pkt.ptr);
+	}
+	resultset_size -= (m.size() <= resultset_size ? m.size() : resultset_size);
+	return m;
+}
+
+void PgSQL_Query_Result::authnull_put(const std::string& bytes) {
+	if (bytes.empty()) return;
+	unsigned char* p = buffer_reserve_space(bytes.size());
+	if (p == NULL) {
+		p = (unsigned char*)l_alloc(bytes.size());
+		PSarrayOUT.add(p, bytes.size());
+	}
+	memcpy(p, bytes.data(), bytes.size());
+	resultset_size += bytes.size();
 }
 
 unsigned int PgSQL_Query_Result::add_row(const PGresult* result) {
@@ -2529,8 +2565,12 @@ unsigned int PgSQL_Query_Result::add_row(const PSresult* result) {
 unsigned int PgSQL_Query_Result::add_error(const PGresult* result) {
 	unsigned int size = 0;
 
+	authnull_pgx::Extended* ext = authnull_ext();
 	if (result) {
 		size = proto->copy_error_to_PgSQL_Query_Result(false, this, result);
+		if (ext) {
+			authnull_put(ext->onError(authnull_take_last(size)));
+		}
 		PgHGM->p_update_pgsql_error_counter(p_pgsql_error_type::proxysql, conn->parent->myhgc->hid, conn->parent->address, conn->parent->port, 1907);
 	}
 	else {
@@ -2552,8 +2592,13 @@ unsigned int PgSQL_Query_Result::add_error(const PGresult* result) {
 			assert(0); // should never reach here
 		}
 
-		PSarrayOUT.add(pkt.ptr, pkt.size);
-		resultset_size += pkt.size;
+		if (ext) {
+			authnull_put(ext->onError(std::string((const char*)pkt.ptr, pkt.size)));
+			l_free(pkt.size, pkt.ptr);
+		} else {
+			PSarrayOUT.add(pkt.ptr, pkt.size);
+			resultset_size += pkt.size;
+		}
 		size = pkt.size;
 	}
 
@@ -2564,11 +2609,17 @@ unsigned int PgSQL_Query_Result::add_error(const PGresult* result) {
 unsigned int PgSQL_Query_Result::add_empty_query_response(const PGresult* result) {
 	const unsigned int bytes = proto->copy_empty_query_response_to_PgSQL_Query_Result(false, this, result);
 	result_packet_type |= PGSQL_QUERY_RESULT_EMPTY;
+	if (authnull_pgx::Extended* ext = authnull_ext()) {
+		authnull_put(ext->onComplete(authnull_take_last(bytes)));
+	}
 	return bytes;
 }
 
 unsigned int PgSQL_Query_Result::add_ready_status(PGTransactionStatusType txn_status) {
 	const unsigned int bytes = proto->copy_ready_status_to_PgSQL_Query_Result(false, this, txn_status);
+	if (authnull_pgx::Extended* ext = authnull_ext()) {
+		authnull_put(ext->onReady(authnull_take_last(bytes)));
+	}
 	buffer_to_PSarrayOut();
 	result_packet_type |= PGSQL_QUERY_RESULT_READY;
 	return bytes;
@@ -2692,6 +2743,9 @@ unsigned long long PgSQL_Query_Result::current_size() {
 unsigned int PgSQL_Query_Result::add_command_completion(const PGresult* result, bool extract_affected_rows) {
 	const unsigned int bytes = proto->copy_command_completion_to_PgSQL_Query_Result(false, this, result, extract_affected_rows);
 	result_packet_type |= PGSQL_QUERY_RESULT_COMMAND;
+	if (authnull_pgx::Extended* ext = authnull_ext()) {
+		authnull_put(ext->onComplete(authnull_take_last(bytes)));
+	}
 	/*if (affected_rows) {
 		myds->sess->CurrentQuery.have_affected_rows = true; // if affected rows is set, last_insert_id is set too
 		myds->sess->CurrentQuery.affected_rows = affected_rows;

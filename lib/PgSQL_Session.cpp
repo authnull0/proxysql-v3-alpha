@@ -2849,6 +2849,14 @@ __get_pkts_from_client:
 	// if client_myds == NULL , it is a mirror
 	//     process mirror only status==WAITING_CLIENT_DATA
 	for (unsigned int j = 0; j < (client_myds->PSarrayIN ? client_myds->PSarrayIN->len : 0) || (mirror == true && status == WAITING_CLIENT_DATA);) {
+		// A client that sends its next message before the answer to the last (the extended protocol
+		// lets it) waits for that answer here, rather than being disconnected: the messages stay
+		// queued until the session is back to WAITING_CLIENT_DATA.
+		if (mirror == false && status != WAITING_CLIENT_DATA && status != CONNECTING_CLIENT && status != FAST_FORWARD &&
+			status != session_status___NONE &&
+			!(status == CONNECTING_SERVER && !previous_status.empty() && previous_status.top() == FAST_FORWARD)) {
+			break;
+		}
 		if (mirror == false) {
 			client_myds->PSarrayIN->remove_index(0, &pkt);
 		}
@@ -2984,240 +2992,25 @@ __get_pkts_from_client:
 					}
 					else {
 						char command = c = *((unsigned char*)pkt.ptr + 0);
+						// An extended-protocol run ends with its query; one cut short (a lost backend) ends here.
+						if (authnull_ext.running()) {
+							authnull_ext.abandon();
+						}
 						switch (command) {
 						case 'Q':
-						{
-							__sync_add_and_fetch(&thread->status_variables.stvar[st_var_queries], 1);
-							if (session_type == PROXYSQL_SESSION_PGSQL) {
-								bool rc_break = false;
-								bool lock_hostgroup = false;
-								if (session_fast_forward == false) {
-									// Note: CurrentQuery sees the query as sent by the client.
-									// shortly after, the packets it used to contain the query will be deallocated
-									CurrentQuery.begin((unsigned char*)pkt.ptr, pkt.size, true);
-								}
-								rc_break = handler_special_queries(&pkt);
-								if (rc_break == true) {
-									if (mirror == false) {
-										// track also special queries
-										//RequestEnd(NULL);
-										// we moved this inside handler_special_queries()
-										// because a pointer was becoming invalid
-										break;
-									}
-									else {
-										handler_ret = -1;
-										return handler_ret;
-									}
-								}
-								timespec begint;
-								timespec endt;
-								if (thread->variables.stats_time_query_processor) {
-									clock_gettime(CLOCK_THREAD_CPUTIME_ID, &begint);
-								}
-								std::string query;
-								if (pkt.ptr && pkt.size > sizeof(mysql_hdr) + 1) {
-									query = std::string((char*)pkt.ptr + sizeof(mysql_hdr) + 1, pkt.size - sizeof(mysql_hdr) - 1);
-								} else {
-									query = "unknown";
-								}
-								std::string db_name = "unknown";
-								std::string user = "unknown";
-								if (client_myds) {
-									if (client_myds->myconn) {
-										if (client_myds->myconn->userinfo) {
-											db_name = client_myds->myconn->userinfo->schemaname;
-											user = client_myds->myconn->userinfo->username;
-										}
-									}
-								}
-								std::string seid = std::to_string(this->thread_session_id); 
-								// A session past the policy's maximum length runs nothing more, even between
-								// two maintenance passes (authnull_session_limits.h).
-								{
-									AuthnullSessionLimit limit;
-									if (authnullSessionLimits().get(this->thread_session_id, limit)) {
-										std::string why = authnullSessionLimitReason(limit, (long long)time(nullptr), 0);
-										if (!why.empty()) {
-											syslog(LOG_WARNING, "[authnull] ending session %u of %s on %s: %s", this->thread_session_id, user.c_str(), db_name.c_str(), why.c_str());
-											client_myds->DSS=STATE_QUERY_SENT_NET;
-											std::string msg = "Session ended: " + why;
-											authnull_refused = true;
-											authnull_query_error = msg;
-											client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"57P01", (char *)msg.c_str(), true);
-											RequestEnd(NULL);
-											l_free(pkt.size, pkt.ptr);
-											killed = true;
-											break;
-										}
-									}
-								}
-								// Field masking: the result set decides the masked columns from these, and a query
-								// that would test a masked value without returning it is refused like one the
-								// policy does not permit (authnull_masking.h).
-								authnull_mask_policy = getMaskingPolicyForSession2(user, db_name, seid);
-								authnull_mask_query = query;
-								bool result = checkPermission2(user, query, db_name,seid) &&
-									!authnullMaskRefused(authnull_mask_policy, query, AuthnullDialect::Postgres);
-								if (result == false){
-									syslog(LOG_INFO, "[DEBUG] Query Not OK");
-									client_myds->DSS=STATE_QUERY_SENT_NET;
-									char *err_msg = (char *)"Access denied: Query not permitted for this user";
-									authnull_refused = true;
-									authnull_query_error = err_msg;
-									client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
-									RequestEnd(NULL);
-									l_free(pkt.size, pkt.ptr);
-									break; 
-								}
-								unsigned long session_id = this->thread_session_id;
-								syslog(LOG_DEBUG, "[DEBUG] process_query using session ID: %lu", session_id);
-								qpo = GloPgQPro->process_query(this, pkt.ptr, pkt.size, &CurrentQuery);
-								if (thread->variables.stats_time_query_processor) {
-									clock_gettime(CLOCK_THREAD_CPUTIME_ID, &endt);
-									thread->status_variables.stvar[st_var_query_processor_time] = thread->status_variables.stvar[st_var_query_processor_time] +
-										(endt.tv_sec * 1000000000 + endt.tv_nsec) -
-										(begint.tv_sec * 1000000000 + begint.tv_nsec);
-								}
-								assert(qpo);	// GloPgQPro->process_mysql_query() should always return a qpo
-								// This block was moved from 'handler_special_queries' to support
-								// handling of 'USE' statements which are preceded by a comment.
-								// For more context check issue: #3493.
-								// ===================================================
-								if (session_type != PROXYSQL_SESSION_CLICKHOUSE) {
-									const char* qd = CurrentQuery.get_digest_text();
-									bool use_db_query = false;
-
-									if (qd != NULL) {
-										if (
-											(strncasecmp((char*)"USE", qd, 3) == 0)
-											&&
-											(
-												(strncasecmp((char*)"USE ", qd, 4) == 0)
-												||
-												(strncasecmp((char*)"USE`", qd, 4) == 0)
-												)
-											) {
-											use_db_query = true;
-										}
-									}
-									else {
-										if (pkt.size > (5 + 4) && strncasecmp((char*)"USE ", (char*)pkt.ptr + 5, 4) == 0) {
-											use_db_query = true;
-										}
-									}
-
-									if (use_db_query) {
-										handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_USE_DB(&pkt);
-
-										if (mirror == false) {
-											break;
-										}
-										else {
-											handler_ret = -1;
-											return handler_ret;
-										}
-									}
-								}
-								// ===================================================
-								if (qpo->max_lag_ms >= 0) {
-									thread->status_variables.stvar[st_var_queries_with_max_lag_ms]++;
-								}
-								rc_break = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_qpo(&pkt, &lock_hostgroup);
-								if (mirror == false && rc_break == false) {
-									if (pgsql_thread___automatic_detect_sqli) {
-										if (handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_detect_SQLi()) {
-											handler_ret = -1;
-											return handler_ret;
-										}
-									}
-								}
-								if (rc_break == true) {
-									if (mirror == false) {
-										break;
-									}
-									else {
-										handler_ret = -1;
-										return handler_ret;
-									}
-								}
-								if (mirror == false) {
-									handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY___create_mirror_session();
-								}
-
-								if (autocommit_on_hostgroup >= 0) {
-								}
-								if (pgsql_thread___set_query_lock_on_hostgroup == 1) { // algorithm introduced in 2.0.6
-									if (locked_on_hostgroup < 0) {
-										if (lock_hostgroup) {
-											// we are locking on hostgroup now
-											if (qpo->destination_hostgroup >= 0) {
-												if (transaction_persistent_hostgroup == -1) {
-													current_hostgroup = qpo->destination_hostgroup;
-												}
-											}
-											locked_on_hostgroup = current_hostgroup;
-											thread->status_variables.stvar[st_var_hostgroup_locked]++;
-											thread->status_variables.stvar[st_var_hostgroup_locked_set_cmds]++;
-										}
-									}
-									if (locked_on_hostgroup >= 0) {
-										if (current_hostgroup != locked_on_hostgroup) {
-											client_myds->DSS = STATE_QUERY_SENT_NET;
-											int l = CurrentQuery.QueryLength;
-											char* end = (char*)"";
-											if (l > 256) {
-												l = 253;
-												end = (char*)"...";
-											}
-											string nqn = string((char*)CurrentQuery.QueryPointer, l);
-											char* err_msg = (char*)"Session trying to reach HG %d while locked on HG %d . Rejecting query: %s";
-											char* buf = (char*)malloc(strlen(err_msg) + strlen(nqn.c_str()) + strlen(end) + 64);
-											sprintf(buf, err_msg, current_hostgroup, locked_on_hostgroup, nqn.c_str(), end);
-											client_myds->myprot.generate_error_packet(true, true, buf, PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION,
-												false, true);
-											thread->status_variables.stvar[st_var_hostgroup_locked_queries]++;
-											RequestEnd(NULL);
-											free(buf);
-											l_free(pkt.size, pkt.ptr);
-											break;
-										}
-									}
-								}
-								mybe = find_or_create_backend(current_hostgroup);
-								status = PROCESSING_QUERY;
-								// set query retries
-								mybe->server_myds->query_retries_on_failure = pgsql_thread___query_retries_on_failure;
-								// if a number of retries is set in mysql_query_rules, that takes priority
-								if (qpo) {
-									if (qpo->retries >= 0) {
-										mybe->server_myds->query_retries_on_failure = qpo->retries;
-									}
-								}
-								mybe->server_myds->connect_retries_on_failure = pgsql_thread___connect_retries_on_failure;
-								mybe->server_myds->wait_until = 0;
-								pause_until = 0;
-								if (pgsql_thread___default_query_delay) {
-									pause_until = thread->curtime + pgsql_thread___default_query_delay * 1000;
-								}
-								if (qpo) {
-									if (qpo->delay > 0) {
-										if (pause_until == 0)
-											pause_until = thread->curtime;
-										pause_until += qpo->delay * 1000;
-									}
-								}
-
-
-								proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Received query to be processed with MariaDB Client library\n");
-								mybe->server_myds->killed_at = 0;
-								mybe->server_myds->kill_type = 0;
-								mybe->server_myds->mysql_real_query.init(&pkt);
-								mybe->server_myds->statuses.questions++;
-								client_myds->setDSS_STATE_QUERY_SENT_NET();
+							// DEALLOCATE of a statement the extended protocol prepared is answered here
+							// (authnull_pg_extended.h): the server never saw it.
+							if (authnull_ext.deallocate(std::string((char*)pkt.ptr + 5, pkt.size > 5 ? pkt.size - 5 : 0))) {
+								std::string done = authnull_pgx::message('C', std::string("DEALLOCATE", 11));
+								authnull_send(done + authnull_pgx::message('Z', std::string(1, authnull_txn_state())));
+								l_free(pkt.size, pkt.ptr);
+								break;
 							}
-						}
-						break;
+							if (handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY(pkt) == -1) {
+								handler_ret = -1;
+								return handler_ret;
+							}
+							break;
 						case 'X':
 							proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Got QUIT packet\n");
 							if (GloPgSQL_Logger) { GloPgSQL_Logger->log_audit_entry(PROXYSQL_MYSQL_AUTH_QUIT, this, NULL); }
@@ -3229,10 +3022,15 @@ __get_pkts_from_client:
 						case 'B':
 						case 'D':
 						case 'E':
-							//ignore
-							l_free(pkt.size, pkt.ptr);
-							continue;
+						case 'C':
+						case 'H':
 						case 'S':
+							// The extended query protocol (authnull_pg_extended.h).
+							if (authnull_extended_message(pkt) == -1) {
+								handler_ret = -1;
+								return handler_ret;
+							}
+							break;
 						default:
 							proxy_error("Not implemented yet. Message type:'%c'\n", c);
 							client_myds->setDSS_STATE_QUERY_SENT_NET();
@@ -3507,6 +3305,293 @@ __get_pkts_from_client:
 	return handler_ret;
 }
 // end of PgSQL_Session::get_pkts_from_client()
+
+// handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY runs a query ('Q', or the SQL an
+// extended-protocol Sync runs, authnull_pg_extended.h): the AuthNull checks, then the backend.
+// Returns -1 to close the session.
+int PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY(PtrSize_t& pkt) {
+	int handler_ret = 0;
+	__sync_add_and_fetch(&thread->status_variables.stvar[st_var_queries], 1);
+	if (session_type == PROXYSQL_SESSION_PGSQL) {
+		bool rc_break = false;
+		bool lock_hostgroup = false;
+		if (session_fast_forward == false) {
+			// Note: CurrentQuery sees the query as sent by the client.
+			// shortly after, the packets it used to contain the query will be deallocated
+			CurrentQuery.begin((unsigned char*)pkt.ptr, pkt.size, true);
+		}
+		rc_break = handler_special_queries(&pkt);
+		if (rc_break == true) {
+			if (mirror == false) {
+				// track also special queries
+				//RequestEnd(NULL);
+				// we moved this inside handler_special_queries()
+				// because a pointer was becoming invalid
+				return 0;
+			}
+			else {
+				handler_ret = -1;
+				return handler_ret;
+			}
+		}
+		timespec begint;
+		timespec endt;
+		if (thread->variables.stats_time_query_processor) {
+			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &begint);
+		}
+		std::string query;
+		if (pkt.ptr && pkt.size > sizeof(mysql_hdr) + 1) {
+			query = std::string((char*)pkt.ptr + sizeof(mysql_hdr) + 1, pkt.size - sizeof(mysql_hdr) - 1);
+		} else {
+			query = "unknown";
+		}
+		std::string db_name = "unknown";
+		std::string user = "unknown";
+		if (client_myds) {
+			if (client_myds->myconn) {
+				if (client_myds->myconn->userinfo) {
+					db_name = client_myds->myconn->userinfo->schemaname;
+					user = client_myds->myconn->userinfo->username;
+				}
+			}
+		}
+		std::string seid = std::to_string(this->thread_session_id); 
+		// A session past the policy's maximum length runs nothing more, even between
+		// two maintenance passes (authnull_session_limits.h).
+		{
+			AuthnullSessionLimit limit;
+			if (authnullSessionLimits().get(this->thread_session_id, limit)) {
+				std::string why = authnullSessionLimitReason(limit, (long long)time(nullptr), 0);
+				if (!why.empty()) {
+					syslog(LOG_WARNING, "[authnull] ending session %u of %s on %s: %s", this->thread_session_id, user.c_str(), db_name.c_str(), why.c_str());
+					client_myds->DSS=STATE_QUERY_SENT_NET;
+					std::string msg = "Session ended: " + why;
+					authnull_refused = true;
+					authnull_query_error = msg;
+					client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"57P01", (char *)msg.c_str(), true);
+					RequestEnd(NULL);
+					l_free(pkt.size, pkt.ptr);
+					killed = true;
+					return 0;
+				}
+			}
+		}
+		// Field masking: the result set decides the masked columns from these, and a query
+		// that would test a masked value without returning it is refused like one the
+		// policy does not permit (authnull_masking.h).
+		authnull_mask_policy = getMaskingPolicyForSession2(user, db_name, seid);
+		authnull_mask_query = query;
+		bool result = checkPermission2(user, query, db_name,seid) &&
+			!authnullMaskRefused(authnull_mask_policy, query, AuthnullDialect::Postgres);
+		if (result == false){
+			syslog(LOG_INFO, "[DEBUG] Query Not OK");
+			client_myds->DSS=STATE_QUERY_SENT_NET;
+			char *err_msg = (char *)"Access denied: Query not permitted for this user";
+			authnull_refused = true;
+			authnull_query_error = err_msg;
+			client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
+			RequestEnd(NULL);
+			l_free(pkt.size, pkt.ptr);
+			return 0; 
+		}
+		unsigned long session_id = this->thread_session_id;
+		syslog(LOG_DEBUG, "[DEBUG] process_query using session ID: %lu", session_id);
+		qpo = GloPgQPro->process_query(this, pkt.ptr, pkt.size, &CurrentQuery);
+		if (thread->variables.stats_time_query_processor) {
+			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &endt);
+			thread->status_variables.stvar[st_var_query_processor_time] = thread->status_variables.stvar[st_var_query_processor_time] +
+				(endt.tv_sec * 1000000000 + endt.tv_nsec) -
+				(begint.tv_sec * 1000000000 + begint.tv_nsec);
+		}
+		assert(qpo);	// GloPgQPro->process_mysql_query() should always return a qpo
+		// This block was moved from 'handler_special_queries' to support
+		// handling of 'USE' statements which are preceded by a comment.
+		// For more context check issue: #3493.
+		// ===================================================
+		if (session_type != PROXYSQL_SESSION_CLICKHOUSE) {
+			const char* qd = CurrentQuery.get_digest_text();
+			bool use_db_query = false;
+
+			if (qd != NULL) {
+				if (
+					(strncasecmp((char*)"USE", qd, 3) == 0)
+					&&
+					(
+						(strncasecmp((char*)"USE ", qd, 4) == 0)
+						||
+						(strncasecmp((char*)"USE`", qd, 4) == 0)
+						)
+					) {
+					use_db_query = true;
+				}
+			}
+			else {
+				if (pkt.size > (5 + 4) && strncasecmp((char*)"USE ", (char*)pkt.ptr + 5, 4) == 0) {
+					use_db_query = true;
+				}
+			}
+
+			if (use_db_query) {
+				handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_USE_DB(&pkt);
+
+				if (mirror == false) {
+					return 0;
+				}
+				else {
+					handler_ret = -1;
+					return handler_ret;
+				}
+			}
+		}
+		// ===================================================
+		if (qpo->max_lag_ms >= 0) {
+			thread->status_variables.stvar[st_var_queries_with_max_lag_ms]++;
+		}
+		rc_break = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_qpo(&pkt, &lock_hostgroup);
+		if (mirror == false && rc_break == false) {
+			if (pgsql_thread___automatic_detect_sqli) {
+				if (handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_detect_SQLi()) {
+					handler_ret = -1;
+					return handler_ret;
+				}
+			}
+		}
+		if (rc_break == true) {
+			if (mirror == false) {
+				return 0;
+			}
+			else {
+				handler_ret = -1;
+				return handler_ret;
+			}
+		}
+		if (mirror == false) {
+			handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY___create_mirror_session();
+		}
+
+		if (autocommit_on_hostgroup >= 0) {
+		}
+		if (pgsql_thread___set_query_lock_on_hostgroup == 1) { // algorithm introduced in 2.0.6
+			if (locked_on_hostgroup < 0) {
+				if (lock_hostgroup) {
+					// we are locking on hostgroup now
+					if (qpo->destination_hostgroup >= 0) {
+						if (transaction_persistent_hostgroup == -1) {
+							current_hostgroup = qpo->destination_hostgroup;
+						}
+					}
+					locked_on_hostgroup = current_hostgroup;
+					thread->status_variables.stvar[st_var_hostgroup_locked]++;
+					thread->status_variables.stvar[st_var_hostgroup_locked_set_cmds]++;
+				}
+			}
+			if (locked_on_hostgroup >= 0) {
+				if (current_hostgroup != locked_on_hostgroup) {
+					client_myds->DSS = STATE_QUERY_SENT_NET;
+					int l = CurrentQuery.QueryLength;
+					char* end = (char*)"";
+					if (l > 256) {
+						l = 253;
+						end = (char*)"...";
+					}
+					string nqn = string((char*)CurrentQuery.QueryPointer, l);
+					char* err_msg = (char*)"Session trying to reach HG %d while locked on HG %d . Rejecting query: %s";
+					char* buf = (char*)malloc(strlen(err_msg) + strlen(nqn.c_str()) + strlen(end) + 64);
+					sprintf(buf, err_msg, current_hostgroup, locked_on_hostgroup, nqn.c_str(), end);
+					client_myds->myprot.generate_error_packet(true, true, buf, PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION,
+						false, true);
+					thread->status_variables.stvar[st_var_hostgroup_locked_queries]++;
+					RequestEnd(NULL);
+					free(buf);
+					l_free(pkt.size, pkt.ptr);
+					return 0;
+				}
+			}
+		}
+		mybe = find_or_create_backend(current_hostgroup);
+		status = PROCESSING_QUERY;
+		// set query retries
+		mybe->server_myds->query_retries_on_failure = pgsql_thread___query_retries_on_failure;
+		// if a number of retries is set in mysql_query_rules, that takes priority
+		if (qpo) {
+			if (qpo->retries >= 0) {
+				mybe->server_myds->query_retries_on_failure = qpo->retries;
+			}
+		}
+		mybe->server_myds->connect_retries_on_failure = pgsql_thread___connect_retries_on_failure;
+		mybe->server_myds->wait_until = 0;
+		pause_until = 0;
+		if (pgsql_thread___default_query_delay) {
+			pause_until = thread->curtime + pgsql_thread___default_query_delay * 1000;
+		}
+		if (qpo) {
+			if (qpo->delay > 0) {
+				if (pause_until == 0)
+					pause_until = thread->curtime;
+				pause_until += qpo->delay * 1000;
+			}
+		}
+
+
+		proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Received query to be processed with MariaDB Client library\n");
+		mybe->server_myds->killed_at = 0;
+		mybe->server_myds->kill_type = 0;
+		mybe->server_myds->mysql_real_query.init(&pkt);
+		mybe->server_myds->statuses.questions++;
+		client_myds->setDSS_STATE_QUERY_SENT_NET();
+	}
+	return 0;
+}
+
+// authnull_extended_message answers one message of the extended query protocol, and at Sync runs
+// the Executes as a simple query (authnull_pg_extended.h). Returns -1 to close the session.
+int PgSQL_Session::authnull_extended_message(PtrSize_t& pkt) {
+	const unsigned char* p = (const unsigned char*)pkt.ptr;
+	const bool queued = client_myds->PSarrayIN && client_myds->PSarrayIN->len > 0;
+	const AuthnullPgExtended::Action a = authnull_ext.on((char)p[0], p + 5, pkt.size > 5 ? pkt.size - 5 : 0, queued);
+	l_free(pkt.size, pkt.ptr);
+	std::string out = authnull_ext.takeAnswer();
+	if (a == AuthnullPgExtended::Answer && authnull_ext.wantsReady()) {
+		out += authnull_pgx::message('Z', std::string(1, authnull_txn_state()));
+	}
+	authnull_send(out);
+	if (a != AuthnullPgExtended::Run) return 0;
+	const std::string sql = authnull_ext.sql();
+	PtrSize_t q;
+	q.size = 5 + sql.size() + 1;
+	q.ptr = l_alloc(q.size);
+	unsigned char* b = (unsigned char*)q.ptr;
+	const uint32_t len = htonl(q.size - 1);
+	b[0] = 'Q';
+	memcpy(b + 1, &len, 4);
+	memcpy(b + 5, sql.data(), sql.size());
+	b[q.size - 1] = '\0';
+	const int rc = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY(q);
+	if (status != PROCESSING_QUERY) {
+		authnull_ext.abandon(); // answered without the backend: refused, or by the proxy
+	}
+	return rc;
+}
+
+// authnull_txn_state: the transaction status a ReadyForQuery the proxy writes itself reports.
+char PgSQL_Session::authnull_txn_state() {
+	for (unsigned int i = 0; mybes && i < mybes->len; i++) {
+		PgSQL_Backend* be = (PgSQL_Backend*)mybes->index(i);
+		if (be->server_myds && be->server_myds->myconn && be->server_myds->myconn->pgsql_conn) {
+			const PGTransactionStatusType s = be->server_myds->myconn->get_pg_transaction_status();
+			if (s == PQTRANS_INERROR) return 'E';
+			if (s == PQTRANS_INTRANS) return 'T';
+		}
+	}
+	return 'I';
+}
+
+void PgSQL_Session::authnull_send(const std::string& bytes) {
+	if (bytes.empty()) return;
+	void* p = l_alloc(bytes.size());
+	memcpy(p, bytes.data(), bytes.size());
+	client_myds->PSarrayOUT->add(p, bytes.size());
+}
 
 
 // this function returns:

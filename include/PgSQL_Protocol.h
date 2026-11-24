@@ -291,6 +291,7 @@ private:
 };
 
 class PgSQL_Protocol;
+namespace authnull_pgx { class Extended; }
 
 #define PGSQL_QUERY_RESULT_NO_DATA	0x00
 #define PGSQL_QUERY_RESULT_TUPLE	0x01
@@ -540,6 +541,12 @@ private:
 	 *       sent to the client and the object is ready to handle a new query.
 	 */
 	void reset();
+
+	// The extended query protocol (authnull_pg_extended.h): while the session runs a Sync's
+	// Executes, each backend message but DataRow goes through it, for the client's answer.
+	authnull_pgx::Extended* authnull_ext();
+	std::string authnull_take_last(unsigned int size);
+	void authnull_put(const std::string& bytes);
 
 	PtrSizeArray PSarrayOUT;
 	unsigned long long resultset_size;
