@@ -6,10 +6,6 @@
 #include "MySQL_Protocol.h"
 
 
-extern std::map<std::string, std::string> alias_to_table2;
-extern std::map<std::string, std::vector<std::string>> query_tables_fields2;
-extern std::string current_query_table2;
-extern std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map2;
 
 extern std::unordered_map<std::string, std::vector<std::string>> user_database_access2;
 extern std::unordered_map<std::string, std::string> session_to_usertype2;

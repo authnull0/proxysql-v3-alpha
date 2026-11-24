@@ -73,6 +73,7 @@ enum class TokKind { Word, QuotedIdent, LParen, RParen, Str, Punct };
 struct Tok {
 	TokKind kind;
 	std::string text; // Word: upper case; QuotedIdent and Str: lower case
+	bool dquoted = false; // a MySQL Str written "..." (a column name under ANSI_QUOTES)
 };
 
 inline bool isWordChar(char c) {
@@ -188,7 +189,7 @@ inline bool lex(const std::string& sql, AuthnullDialect d, std::vector<std::vect
 				text += sql[i++];
 			}
 			if (!closed) return false;
-			cur.push_back({TokKind::Str, lower(text)});
+			cur.push_back({TokKind::Str, lower(text), q == '"'});
 			continue;
 		}
 

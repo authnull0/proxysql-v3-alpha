@@ -1,6 +1,7 @@
 #include "../deps/json/json.hpp"
 #include "authnull_query.h"
 #include "authnull_tables.h"
+#include "authnull_masking.h"
 #include "authnull_log.h"
 #include "authnull_tls.h"
 #include "authnull_login_answer.h"
@@ -3488,7 +3489,9 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 			}
 			std::string user = client_myds->myconn->userinfo->username;
 			std::string db_name = client_myds->myconn->userinfo->schemaname ? client_myds->myconn->userinfo->schemaname : "";
-			if (!checkPermission(user, query, db_name, std::to_string(thread_session_id))) {
+			// Nor may it test a masked value without returning it (WHERE item = ?): authnull_masking.h.
+			if (!checkPermission(user, query, db_name, std::to_string(thread_session_id)) ||
+				authnullMaskRefused(getMaskingPolicyForSession(user, db_name, std::to_string(thread_session_id)), query, AuthnullDialect::MySQL)) {
 				syslog(LOG_INFO, "[authnull] prepared statement refused for %s on %s", user.c_str(), db_name.c_str());
 				l_free(pkt.size,pkt.ptr);
 				client_myds->setDSS_STATE_QUERY_SENT_NET();
@@ -3653,6 +3656,13 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		}
 		CurrentQuery.stmt_info=stmt_info;
 		CurrentQuery.start_time=thread->curtime;
+		// Field masking: MySQL_ResultSet decides the masked columns of the binary rows from the
+		// statement's own text, not the last COM_QUERY's (authnull_masking.h).
+		if (client_myds->myconn && client_myds->myconn->userinfo && client_myds->myconn->userinfo->username) {
+			const char *schema = client_myds->myconn->userinfo->schemaname;
+			authnull_mask_policy = getMaskingPolicyForSession(client_myds->myconn->userinfo->username, schema ? schema : "", std::to_string(thread_session_id));
+			authnull_mask_query = std::string(stmt_info->query, stmt_info->query_length);
+		}
 
 		timespec begint;
 		timespec endt;
@@ -4454,7 +4464,13 @@ __get_pkts_from_client:
 											}
 										}
 									}
-									bool result = checkPermission(user, query, db_name,seid);
+									// Field masking: MySQL_ResultSet decides the masked columns from these, and a query
+									// that would test a masked value without returning it is refused like one the
+									// policy does not permit (authnull_masking.h).
+									authnull_mask_policy = getMaskingPolicyForSession(user, db_name, seid);
+									authnull_mask_query = query;
+									bool result = checkPermission(user, query, db_name,seid) &&
+										!authnullMaskRefused(authnull_mask_policy, query, AuthnullDialect::MySQL);
 									if (result == false){
 										syslog(LOG_INFO, "[DEBUG] Query Not OK");
 										client_myds->DSS=STATE_QUERY_SENT_NET;
@@ -4464,12 +4480,9 @@ __get_pkts_from_client:
 										client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
 										RequestEnd(NULL);
 										l_free(pkt.size, pkt.ptr);
-										break; 
+										break;
 									}
 									unsigned long session_id = this->thread_session_id;
-									// Field masking: MySQL_ResultSet decides the masked columns from these (authnull_masking.h).
-									authnull_mask_policy = getMaskingPolicyForSession(user, db_name, std::to_string(session_id));
-									authnull_mask_query = query;
 									syslog(LOG_DEBUG, "[DEBUG] process_query using session ID: %lu", session_id);
 									qpo= GloMyQPro->process_query(this,pkt.ptr,pkt.size,&CurrentQuery);
 									if (thread->variables.stats_time_query_processor) {

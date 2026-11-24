@@ -88,12 +88,14 @@ void MySQL_ResultSet::init(MySQL_Protocol *_myprot, MYSQL_RES *_res, MYSQL *_my,
 	// Field masking: which columns of this result set the session's policy covers, decided once from
 	// the column metadata and the query text (authnull_masking.h); add_row() applies it.
 	authnull_mask.clear();
+	authnull_mask_types.clear();
 	if (myds && myds->sess && !myds->sess->authnull_mask_policy.empty()) {
 		MYSQL_FIELD *fields = mysql_fetch_fields(result);
 		std::vector<AuthnullResultColumn> cols;
 		for (unsigned int i = 0; fields && i < num_fields; i++) {
 			const bool fromTable = fields[i].org_table && fields[i].org_table[0];
 			cols.push_back({fields[i].name ? fields[i].name : "", fromTable, false, fields[i].org_name ? fields[i].org_name : ""});
+			authnull_mask_types.push_back(fields[i].type);
 		}
 		authnull_mask = authnullMaskColumns(myds->sess->authnull_mask_policy, cols, myds->sess->authnull_mask_query, AuthnullDialect::MySQL);
 	}
@@ -184,6 +186,10 @@ void MySQL_ResultSet::init_with_stmt(MySQL_Connection *myconn) {
 	MySQL_Data_Stream * c_myds = *(myprot->myds);
 		buffer_to_PSarrayOut();
 		unsigned long long total_size=0;
+		// Field masking first: a masked row can shrink, and the sizes below are taken from the rows.
+		for (MYSQL_ROWS *m = _stmt->result.data; m; m = m->next) {
+			authnull_mask_binary_row(m);
+		}
 		MYSQL_ROWS *r=_stmt->result.data;
 		if (r) {
 			total_size+=r->length;
@@ -335,9 +341,16 @@ MySQL_ResultSet::~MySQL_ResultSet() {
 	//if (myds) myds->pkt_sid=sid-1;
 }
 
+// Field masking of a binary-protocol row (prepared statements), in place: authnull_masking.h.
+void MySQL_ResultSet::authnull_mask_binary_row(MYSQL_ROWS *r) {
+	if (authnull_mask.empty() || !r || !r->data) return;
+	r->length = authnullMaskBinaryRow((uint8_t *)r->data, r->length, authnull_mask, authnull_mask_types);
+}
+
 // this function is used for binary protocol
 // maybe later on can be adapted for text protocol too
 unsigned int MySQL_ResultSet::add_row(MYSQL_ROWS *rows) {
+	authnull_mask_binary_row(rows);
 	unsigned int pkt_length=0;
 	MYSQL_ROW row = rows->data;
 	unsigned long row_length = rows->length;
