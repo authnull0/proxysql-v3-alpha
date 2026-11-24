@@ -2626,8 +2626,6 @@ unsigned int PgSQL_Query_Result::add_ready_status(PGTransactionStatusType txn_st
 }
 
 bool PgSQL_Query_Result::get_resultset(PtrSizeArray* PSarrayFinal) {
-    syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Starting get_resultset");
-
     transfer_started = true;
 
     // Ready packet confirms that the result is complete
@@ -2640,49 +2638,7 @@ bool PgSQL_Query_Result::get_resultset(PtrSizeArray* PSarrayFinal) {
     }
 
     if (proto) {
-        syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Dumping PSarrayOUT Contents Before Copying to PSarrayFinal (PSarrayOUT.len = %u)", PSarrayOUT.len);
-        for (unsigned int i = 0; i < PSarrayOUT.len; ++i) {
-            PtrSize_t* pkt = PSarrayOUT.index(i);
-            if (pkt && pkt->ptr && pkt->size > 0) {
-                std::string data_str;
-                // Try to interpret the packet as a data row ('D')
-                if (((char*)pkt->ptr)[0] == 'D' && pkt->size > 6) {
-                    unsigned short num_fields = ntohs(*(unsigned short*)((char*)pkt->ptr + 5));
-                    unsigned char* data_ptr = (unsigned char*)pkt->ptr + 7;
-                    data_str += "Data Row: ";
-                    for (int f = 0; f < num_fields; ++f) {
-                        int len = ntohl(*(int*)data_ptr);
-                        data_ptr += 4;
-                        if (len > 0) {
-                            data_str += std::string((char*)data_ptr, len) + "\t";
-                            data_ptr += len;
-                        } else if (len == -1) {
-                            data_str += "NULL\t";
-                        }
-                    }
-                    syslog(LOG_INFO, "%s (Size: %u)", data_str.c_str(), pkt->size);
-                } else if (((char*)pkt->ptr)[0] == 'T') {
-                    syslog(LOG_INFO, "Row Description Packet (Size: %u)", pkt->size);
-                } else if (((char*)pkt->ptr)[0] == 'C') {
-                    syslog(LOG_INFO, "Command Completion Packet (Size: %u)", pkt->size);
-                } else if (((char*)pkt->ptr)[0] == 'E') {
-                    syslog(LOG_INFO, "Error Packet (Size: %u)", pkt->size);
-                } else if (((char*)pkt->ptr)[0] == 'Z') {
-                    syslog(LOG_INFO, "Ready Status Packet (Size: %u)", pkt->size);
-                } else {
-                    syslog(LOG_INFO, "Unknown Packet Type (First Char: %c, Size: %u)", ((char*)pkt->ptr)[0], pkt->size);
-                    // You might want to dump the raw bytes if it's not a known type
-                    // for (unsigned int k = 0; k < pkt->size; ++k) {
-                    //     syslog(LOG_INFO, "Byte [%u]: %02X", k, ((unsigned char*)pkt->ptr)[k]);
-                    // }
-                }
-            } else {
-                syslog(LOG_INFO, "Empty or invalid packet in PSarrayOUT at index %u", i);
-            }
-        }
-
         PSarrayFinal->copy_add(&PSarrayOUT, 0, PSarrayOUT.len);
-        syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Copied to PSarrayFinal (PSarrayFinal->len = %u)", PSarrayFinal->len); // CRITICAL LOG
         while (PSarrayOUT.len)
             PSarrayOUT.remove_index(PSarrayOUT.len - 1, NULL);
     }
@@ -2690,7 +2646,6 @@ bool PgSQL_Query_Result::get_resultset(PtrSizeArray* PSarrayFinal) {
     if (result_complete)
         reset(); // reset only if result is complete
 
-    syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Returning, PSarrayFinal->len = %u", PSarrayFinal->len);
     return result_complete;
 }
 
