@@ -68,7 +68,7 @@ enum class AuthnullDialect { Postgres, MySQL };
 
 namespace authnull_query_detail {
 
-enum class TokKind { Word, QuotedIdent, LParen, RParen, Str };
+enum class TokKind { Word, QuotedIdent, LParen, RParen, Str, Punct };
 
 struct Tok {
 	TokKind kind;
@@ -90,8 +90,9 @@ inline std::string lower(std::string s) {
 }
 
 // lex splits sql into statements of tokens. Returns false when a string, identifier or comment is
-// not terminated -- the caller refuses such a query.
-inline bool lex(const std::string& sql, AuthnullDialect d, std::vector<std::vector<Tok>>& out) {
+// not terminated -- the caller refuses such a query. Other punctuation (, . = * ...) is dropped,
+// or kept as Punct tokens when punct is set (field masking: "amount, status" is not an alias).
+inline bool lex(const std::string& sql, AuthnullDialect d, std::vector<std::vector<Tok>>& out, bool punct = false) {
 	const bool pg = d == AuthnullDialect::Postgres;
 	const size_t n = sql.size();
 	std::vector<Tok> cur;
@@ -223,6 +224,7 @@ inline bool lex(const std::string& sql, AuthnullDialect d, std::vector<std::vect
 			continue;
 		}
 
+		if (punct) cur.push_back({TokKind::Punct, std::string(1, c)});
 		i++; // operators and other punctuation
 	}
 	if (inExecComment) return false;

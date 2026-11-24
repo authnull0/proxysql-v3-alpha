@@ -1,23 +1,29 @@
-// Field masking for PostgreSQL results: which columns a policy's masking covers, and masking them.
+// Field masking for PostgreSQL and MySQL results: which columns a policy's masking covers, and
+// masking them.
 //
 // A database policy can name columns to mask per table (field_masking: {"orders": ["amount"]}).
 // authn-service sends it with the login answer; the session keeps it with the query it is running
-// (PgSQL_Session), and PgSQL_Query_Result masks the rows on their way to the client: a text value
-// becomes '*' of the same length, so the row keeps its size; NULL stays NULL; a binary-format value
-// is zeroed. The row description is read once per result set to decide the columns.
+// (PgSQL_Session, MySQL_Session), and the result set masks the rows on their way to the client
+// (PgSQL_Query_Result, MySQL_ResultSet): a text value becomes '*' of the same length, so the row
+// keeps its size; NULL stays NULL; a binary-format value is zeroed. The column metadata is read once
+// per result set to decide the columns.
 //
 // Which columns (authnullMaskColumns), for a policy naming column c:
 //   - a result column named c, whatever its table or expression (amount, amount::text, "AMOUNT");
 //   - an alias of c in the query text (amount AS a, o.amount a, a subquery's alias);
+//   - MySQL: a column whose source column (org_name) is c, whatever it is called (amount 'a');
 //   - an expression (no source table: amount * 1, sum(amount), concat(...)) when the query mentions
-//     c anywhere -- conservative: such a column may carry c's value under any name.
+//     c anywhere -- conservative: such a column may carry c's value under any name. On MySQL a
+//     string that spells c counts as a mention too: with ANSI_QUOTES, "amount" is the column.
 // A table column whose name the policy does not mask is left alone, even when c appears elsewhere in
 // the query (WHERE amount > 10). Names compare in any case; the policy is not split by table, so a
 // masked name masks that name from any table (it never shows less than asked).
 //
 // LIMITS. A view or function that returns c under another name is not followed: name the view's
-// columns in the policy too. This reads result names and query text; the database's own column
-// privileges are the stronger control where columns must never leave the server.
+// columns in the policy too. Nor is a value carried between statements (a user variable, a
+// PREPARE/EXECUTE by name), and a query may still test c without returning it (WHERE c = 'x'). This
+// reads result names and query text; the database's own column privileges are the stronger control
+// where columns must never leave the server.
 #ifndef AUTHNULL_MASKING_H
 #define AUTHNULL_MASKING_H
 
@@ -35,6 +41,7 @@ struct AuthnullResultColumn {
 	std::string name;  // as the row description gives it
 	bool fromTable;    // the row description names a source table (OID != 0)
 	bool binary;       // binary format (1) rather than text (0)
+	std::string orgName = {}; // MySQL: the source column (org_name) when there is one
 };
 
 namespace authnull_masking_detail {
@@ -63,31 +70,36 @@ inline std::set<std::string> authnullMaskedNames(const std::map<std::string, std
 	return out;
 }
 
-// authnullMaskColumns: for each result column, whether to mask it (the header's rules).
+// authnullMaskColumns: for each result column, whether to mask it (the header's rules). d is how
+// the query text reads: Postgres, or MySQL (backticks, '#' comments, "..." strings).
 inline std::vector<bool> authnullMaskColumns(const std::map<std::string, std::vector<std::string>>& policy,
-	const std::vector<AuthnullResultColumn>& cols, const std::string& sql) {
+	const std::vector<AuthnullResultColumn>& cols, const std::string& sql, AuthnullDialect d = AuthnullDialect::Postgres) {
 	using namespace authnull_masking_detail;
 	std::vector<bool> out(cols.size(), false);
 	const std::set<std::string> masked = authnullMaskedNames(policy);
 	if (masked.empty()) return out;
 
 	// The query's mentions of masked names, and the aliases given to them. A query that cannot be
-	// read to the end mentions everything: expressions are then masked.
+	// read to the end mentions everything: expressions are then masked. Punctuation is kept so that
+	// "amount, status" does not read as an alias.
 	std::set<std::string> aliases;
 	bool mentioned = false;
 	std::vector<std::vector<authnull_query_detail::Tok>> statements;
-	if (!authnull_query_detail::lex(sql, AuthnullDialect::Postgres, statements)) {
+	if (!authnull_query_detail::lex(sql, d, statements, true)) {
 		mentioned = true;
 	} else {
 		for (const auto& t : statements) {
 			for (size_t i = 0; i < t.size(); i++) {
+				if (d == AuthnullDialect::MySQL && t[i].kind == authnull_query_detail::TokKind::Str && masked.count(t[i].text)) {
+					mentioned = true; // "amount" under ANSI_QUOTES
+				}
 				if (!isName(t[i]) || !masked.count(lowerCopy(t[i].text))) continue;
 				mentioned = true;
 				size_t j = i + 1;
 				if (j < t.size() && t[j].kind == authnull_query_detail::TokKind::Word && t[j].text == "AS") j++;
 				if (j < t.size() && isName(t[j])) {
 					const std::string next = lowerCopy(t[j].text);
-					// "amount FROM", "amount, ..." are not aliases: keywords that follow a column.
+					// "amount FROM" is not an alias: keywords that follow a column.
 					static const std::set<std::string> notAlias = {
 						"from", "where", "group", "order", "having", "limit", "offset", "union", "intersect",
 						"except", "and", "or", "not", "is", "in", "like", "ilike", "between", "asc", "desc",
@@ -102,7 +114,7 @@ inline std::vector<bool> authnullMaskColumns(const std::map<std::string, std::ve
 
 	for (size_t i = 0; i < cols.size(); i++) {
 		const std::string name = lowerCopy(cols[i].name);
-		if (masked.count(name) || aliases.count(name)) out[i] = true;
+		if (masked.count(name) || aliases.count(name) || masked.count(lowerCopy(cols[i].orgName))) out[i] = true;
 		else if (!cols[i].fromTable && mentioned) out[i] = true;
 	}
 	return out;

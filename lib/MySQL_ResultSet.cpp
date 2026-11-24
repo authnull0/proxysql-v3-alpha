@@ -10,6 +10,7 @@
 #include "MySQL_LDAP_Authentication.hpp"
 #include "MySQL_Variables.h"
 #include "MySQL_Session.h"
+#include "authnull_masking.h"
 #include <sstream>
 #include <syslog.h>
 //#include <ma_global.h>
@@ -84,6 +85,18 @@ void MySQL_ResultSet::init(MySQL_Protocol *_myprot, MYSQL_RES *_res, MYSQL *_my,
 	resultset_size=0;
 	num_rows=0;
 	num_fields=mysql_field_count(mysql);
+	// Field masking: which columns of this result set the session's policy covers, decided once from
+	// the column metadata and the query text (authnull_masking.h); add_row() applies it.
+	authnull_mask.clear();
+	if (myds && myds->sess && !myds->sess->authnull_mask_policy.empty()) {
+		MYSQL_FIELD *fields = mysql_fetch_fields(result);
+		std::vector<AuthnullResultColumn> cols;
+		for (unsigned int i = 0; fields && i < num_fields; i++) {
+			const bool fromTable = fields[i].org_table && fields[i].org_table[0];
+			cols.push_back({fields[i].name ? fields[i].name : "", fromTable, false, fields[i].org_name ? fields[i].org_name : ""});
+		}
+		authnull_mask = authnullMaskColumns(myds->sess->authnull_mask_policy, cols, myds->sess->authnull_mask_query, AuthnullDialect::MySQL);
+	}
 	PtrSize_t pkt;
 	// immediately generate the first set of packets
 	// columns count
@@ -337,292 +350,33 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROWS *rows) {
 }
 
 
-std::string normalizeColumnName(const std::string& columnName) {
-    std::string normalized;
-    // Remove all whitespace
-    for (char c : columnName) {
-        if (!std::isspace(c)) {
-            normalized += c;
-        }
-    }
-    return normalized;
-}
-std::map<std::string, std::vector<std::string>> lowerCasePolicy;
 unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
-	lowerCasePolicy.clear();
-	alias_to_table.clear(); // Clear the map of alias to table
-    query_tables_fields.clear(); // Clear the map of query tables fields
-    current_query_table.clear(); // Clear the current query table string
-	field_alias_map.clear();
-	openlog("AuthSQL", LOG_PID, LOG_DAEMON);
-	std::string user = myds->myconn->userinfo->username;
-	std::string db_name = myds->myconn->userinfo->schemaname;
-	std::string session_id = std::to_string(myds->sess->thread_session_id);
-	syslog(LOG_DEBUG, "[DEBUG] ROW session key: %s", session_id.c_str());
-    auto fieldMaskingPolicy = getMaskingPolicyForSession(user,db_name,session_id);
-
-	for (const auto& [table, fields] : fieldMaskingPolicy) {
-		std::string lowerTable = table;
-		std::transform(lowerTable.begin(), lowerTable.end(), lowerTable.begin(), ::tolower);
-		
-		std::vector<std::string> lowerFields;
-		for (const auto& field : fields) {
-			std::string lowerField = field;
-			std::transform(lowerField.begin(), lowerField.end(), lowerField.begin(), ::tolower);
-			lowerFields.push_back(lowerField);
+	unsigned long *lengths=mysql_fetch_lengths(result);
+	unsigned int pkt_length=0;
+	if (myprot) {
+		if (authnull_mask.empty()) {
+			sid=myprot->generate_pkt_row3(this, &pkt_length, sid, num_fields, lengths, row, 0);
+		} else {
+			// Field masking (authnull_masking.h): a masked value goes out as '*' of its length; NULL
+			// stays NULL; the other values go out as they came.
+			std::vector<std::string> masked(num_fields);
+			std::vector<char *> cells(row, row + num_fields);
+			for (unsigned int i = 0; i < num_fields && i < authnull_mask.size(); i++) {
+				if (!authnull_mask[i] || !row[i]) continue;
+				masked[i] = authnullMaskedValue(row[i], lengths[i], false);
+				cells[i] = masked[i].data();
+			}
+			sid=myprot->generate_pkt_row3(this, &pkt_length, sid, num_fields, lengths, cells.data(), 0);
 		}
-		
-		lowerCasePolicy[lowerTable] = lowerFields;
+	} else {
+		for (unsigned int col=0; col<num_fields; col++) {
+			pkt_length+=( row[col] ? lengths[col]+mysql_encode_length(lengths[col],NULL) : 1 );
+		}
 	}
-	fieldMaskingPolicy = lowerCasePolicy;
-    syslog(LOG_DEBUG, "Row Data: Processing");
-    unsigned long *lengths = mysql_fetch_lengths(result);
-    unsigned int pkt_length = 0;
-
-    if (myprot) {
-        std::vector<std::string> modifiedRow(num_fields);
-        std::vector<char*> modifiedRowPtrs(num_fields);
-
-        MYSQL_FIELD *fields = mysql_fetch_fields(result);
-        
-        // Define aggregate function patterns to match
-        std::unordered_set<std::string> aggregatePrefixes = {"sum", "count", "avg", "min", "max", "abs", "upper",
-		"lower", "length", "trim", "ceil", "floor", "date",
-		"year", "month", "day", "stddev", "variance", "cast",
-		"convert"};
-        std::unordered_set<std::string> aggregateExactNames = {"sum", "count", "avg", "min", "max", "abs", "upper",
-		"lower", "length", "trim", "ceil", "floor", "date",
-		"year", "month", "day", "stddev", "variance", "cast",
-		"convert"};
-        
-        std::unordered_map<std::string, std::pair<std::string, std::string>> subqueryFieldCache;
-        
-        for (unsigned int i = 0; i < num_fields; i++) {
-            modifiedRow[i] = row[i] ? row[i] : "NULL";
-            
-            std::string fieldName = std::string(fields[i].name);
-            std::transform(fieldName.begin(), fieldName.end(), fieldName.begin(), ::tolower);
-			std::string normalizedFieldName = normalizeColumnName(fieldName);
-            std::string tableName = "";
-            if (fields[i].table && fields[i].table[0] != '\0') {
-                tableName = std::string(fields[i].table);
-                std::transform(tableName.begin(), tableName.end(), tableName.begin(), ::tolower);
-            }
-
-            std::string origTableName = "";
-            if (fields[i].org_table && fields[i].org_table[0] != '\0') {
-                origTableName = std::string(fields[i].org_table);
-                std::transform(origTableName.begin(), origTableName.end(), origTableName.begin(), ::tolower);
-            }
-            
-            std::string origFieldName = "";
-            if (fields[i].org_name && fields[i].org_name[0] != '\0') {
-                origFieldName = std::string(fields[i].org_name);
-                std::transform(origFieldName.begin(), origFieldName.end(), origFieldName.begin(), ::tolower);
-            }
-            
-            syslog(LOG_DEBUG, "Field metadata: name=%s, table=%s, org_table=%s, org_name=%s", fieldName.c_str(), tableName.c_str(), origTableName.c_str(), origFieldName.c_str());
-            
-            bool masked = false;
-
-            // Check original metadata
-            if (!origTableName.empty() && !origFieldName.empty()) {
-                if (fieldMaskingPolicy.count(origTableName) &&
-                    std::find(fieldMaskingPolicy[origTableName].begin(),
-                             fieldMaskingPolicy[origTableName].end(), 
-                             origFieldName) != fieldMaskingPolicy[origTableName].end()) {
-                    modifiedRow[i] = std::string(lengths[i], '*');
-                    masked = true;
-                    syslog(LOG_DEBUG, "Masked using original metadata: %s.%s", origTableName.c_str(), origFieldName.c_str());
-                }
-            }
-
-            // Check current metadata
-            if (!masked && !tableName.empty()) {
-                if (fieldMaskingPolicy.count(tableName) &&
-                    std::find(fieldMaskingPolicy[tableName].begin(),
-                             fieldMaskingPolicy[tableName].end(), 
-                             fieldName) != fieldMaskingPolicy[tableName].end()) {
-                    modifiedRow[i] = std::string(lengths[i], '*');
-                    masked = true;
-                    syslog(LOG_DEBUG, "Masked using metadata: %s.%s", tableName.c_str(), fieldName.c_str());
-                }
-            }
-			// Check field alias map
-			if (!masked && (field_alias_map.count(fieldName) || field_alias_map.count(normalizedFieldName))) {
-				std::string originalTable;
-				std::string originalField;
-				
-				if (field_alias_map.count(fieldName)) {
-					originalTable = field_alias_map[fieldName].first;
-					originalField = field_alias_map[fieldName].second;
-				} else {
-					originalTable = field_alias_map[normalizedFieldName].first;
-					originalField = field_alias_map[normalizedFieldName].second;
-				}
-				
-				if (!originalTable.empty() && fieldMaskingPolicy.count(originalTable) &&
-					std::find(fieldMaskingPolicy[originalTable].begin(),
-							fieldMaskingPolicy[originalTable].end(), 
-							originalField) != fieldMaskingPolicy[originalTable].end()) {
-					modifiedRow[i] = std::string(lengths[i], '*');
-					masked = true;
-					syslog(LOG_DEBUG, "Masked aliased field: %s (maps to %s.%s)", fieldName.c_str(), originalTable.c_str(), originalField.c_str());
-				}
-			}
-            // Check field alias map
-            if (!masked && field_alias_map.count(fieldName)) {
-                std::string originalTable = field_alias_map[fieldName].first;
-                std::string originalField = field_alias_map[fieldName].second;
-                
-                if (!originalTable.empty() && fieldMaskingPolicy.count(originalTable) &&
-                    std::find(fieldMaskingPolicy[originalTable].begin(),
-                             fieldMaskingPolicy[originalTable].end(), 
-                             originalField) != fieldMaskingPolicy[originalTable].end()) {
-                    modifiedRow[i] = std::string(lengths[i], '*');
-                    masked = true;
-                    syslog(LOG_DEBUG, "Masked aliased field: %s (maps to %s.%s)", fieldName.c_str(), originalTable.c_str(), originalField.c_str());
-                }
-            }
-            
-            // Check subquery field cache
-            if (!masked && !fieldName.empty()) {
-                if (subqueryFieldCache.count(fieldName)) {
-                    auto& [cachedTable, cachedField] = subqueryFieldCache[fieldName];
-                    if (fieldMaskingPolicy.count(cachedTable) &&
-                        std::find(fieldMaskingPolicy[cachedTable].begin(),
-                                 fieldMaskingPolicy[cachedTable].end(), 
-                                 cachedField) != fieldMaskingPolicy[cachedTable].end()) {
-                        modifiedRow[i] = std::string(lengths[i], '*');
-                        masked = true;
-                        syslog(LOG_DEBUG, "Masked cached subquery field: %s (maps to %s.%s)", fieldName.c_str(), cachedTable.c_str(), cachedField.c_str());
-                    }
-                } else {
-                    // Check potential subquery patterns
-                    for (const auto& [table, maskedFields] : fieldMaskingPolicy) {
-                        for (const auto& field : maskedFields) {
-                            std::string tablePrefix = table.substr(0, table.length() - 1); 
-                            if (fieldName.find(tablePrefix) != std::string::npos && 
-                                fieldName.find(field) != std::string::npos) {
-                                modifiedRow[i] = std::string(lengths[i], '*');
-                                masked = true;
-                                subqueryFieldCache[fieldName] = std::make_pair(table, field);
-                                syslog(LOG_DEBUG, "Masked subquery field (pattern 1): %s (maps to %s.%s)", fieldName.c_str(), table.c_str(), field.c_str());
-                                break;
-                            }
-
-                            if (fieldName == field) {
-                                for (const auto& [queryTable, queryFields] : query_tables_fields) {
-                                    if (queryTable != table && 
-                                        std::find(queryFields.begin(), queryFields.end(), field) != queryFields.end()) {
-                                        modifiedRow[i] = std::string(lengths[i], '*');
-                                        masked = true;
-                                        subqueryFieldCache[fieldName] = std::make_pair(table, field);
-                                        syslog(LOG_DEBUG, "Masked subquery field (pattern 2): %s (maps to %s.%s)", fieldName.c_str(), table.c_str(), field.c_str());
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (masked) break;
-                    }
-                }
-            }
-
-			if (!masked && !tableName.empty()) {
-				if (fieldMaskingPolicy.count(tableName) && 
-					std::find(fieldMaskingPolicy[tableName].begin(),
-							fieldMaskingPolicy[tableName].end(), 
-							fieldName) != fieldMaskingPolicy[tableName].end()) {
-					modifiedRow[i] = std::string(lengths[i], '*');
-					masked = true;
-					syslog(LOG_DEBUG, "Masked field by name match: %s (in table %s)",fieldName.c_str(), tableName.c_str());
-				}
-			}
-
-            // Improved aggregate field detection and masking
-            if (!masked) {
-                bool isAggregate = false;
-                std::string baseFieldName = fieldName;
-                
-                // Check if field name starts with any aggregate prefix
-                for (const auto& prefix : aggregatePrefixes) {
-                    if (fieldName.find(prefix) == 0) {
-                        isAggregate = true;
-                        baseFieldName = fieldName.substr(prefix.length());
-                        syslog(LOG_DEBUG, "Detected aggregate prefix: %s, base field: %s", prefix.c_str(), baseFieldName.c_str());
-                        break;
-                    }
-                }
-
-                // Check if field name matches an exact aggregate name
-                if (!isAggregate && aggregateExactNames.count(fieldName) > 0) {
-                    isAggregate = true;
-                    syslog(LOG_DEBUG, "Detected exact aggregate name: %s", fieldName.c_str());
-                }
-                
-                // If this is an aggregate field, check all tables and fields from the query
-                if (isAggregate) {
-                    for (const auto& [table, fields] : query_tables_fields) {
-                        // Skip if this table doesn't have masking policy
-                        if (fieldMaskingPolicy.count(table) == 0) continue;
-                        
-                        for (const auto& queryField : fields) {
-                            // If this field is masked and is either the base field or mentioned in the field name
-                            if (std::find(fieldMaskingPolicy[table].begin(),
-                                         fieldMaskingPolicy[table].end(), 
-                                         queryField) != fieldMaskingPolicy[table].end()) {
-                                
-                                // Check if baseFieldName contains this field or is empty (general aggregate)
-                                if (baseFieldName.empty() || baseFieldName == queryField || 
-                                    baseFieldName.find(queryField) != std::string::npos) {
-                                    modifiedRow[i] = std::string(lengths[i], '*');
-                                    masked = true;
-                                    syslog(LOG_DEBUG, "Masked aggregate result of sensitive field: %s (derived from %s.%s)", fieldName.c_str(), table.c_str(), queryField.c_str());
-                                    break;
-                                }
-                            }
-                        }
-                        if (masked) break;
-                    }
-                }
-            }
-
-            // Final check with query tables and fields
-            if (!masked) {
-                for (const auto& [table, fields] : query_tables_fields) {
-                    if (fieldMaskingPolicy.count(table)) {
-                        for (const auto& field : fields) {
-                            if (field == origFieldName || field == fieldName) {
-                                if (std::find(fieldMaskingPolicy[table].begin(),
-                                           fieldMaskingPolicy[table].end(), 
-                                           field) != fieldMaskingPolicy[table].end()) {
-                                    modifiedRow[i] = std::string(lengths[i], '*');
-                                    masked = true;
-                                    syslog(LOG_DEBUG, "Masked field from query tables: %s.%s", table.c_str(), field.c_str());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if (masked) break;
-                }
-            }
-            
-            modifiedRowPtrs[i] = modifiedRow[i].data();
-        }
-
-        sid = myprot->generate_pkt_row3(this, &pkt_length, sid, num_fields, lengths, modifiedRowPtrs.data(), 0);
-    } else {
-        for (unsigned int col = 0; col < num_fields; col++) {
-            pkt_length += (row[col] ? lengths[col] + mysql_encode_length(lengths[col], NULL) : 1);
-        }
-    }
-
-    sid++;
-    resultset_size += pkt_length;
-    num_rows++;
-    return pkt_length;
+	sid++;
+	resultset_size+=pkt_length;
+	num_rows++;
+	return pkt_length;
 }
 
 
@@ -765,14 +519,9 @@ bool MySQL_ResultSet::get_resultset(PtrSizeArray *PSarrayFinal) {
     transfer_started = true;
 	current_field_names.clear();
     // current_query_fields.clear();
-	query_tables_fields.clear();
     // The rows used to be printed here, every one, to ProxySQL's log: customers' query results, and
     // -- since the admin interface speaks this protocol -- every managed role's password whenever the
     // agent read pgsql_users. Never print a result set (test/authnull/authnull_no_data_in_logs_test.cpp).
-	alias_to_table.clear(); // Clear the map of alias to table
-    query_tables_fields.clear(); // Clear the map of query tables fields
-    current_query_table.clear(); // Clear the current query table string
-	field_alias_map.clear();
     PSarrayFinal->copy_add(&PSarrayOUT, 0, PSarrayOUT.len);
     while (PSarrayOUT.len)
         PSarrayOUT.remove_index(PSarrayOUT.len - 1, NULL);
@@ -781,10 +530,6 @@ bool MySQL_ResultSet::get_resultset(PtrSizeArray *PSarrayFinal) {
 }
 
 void MySQL_ResultSet::buffer_to_PSarrayOut(bool _last) {
-	alias_to_table.clear(); // Clear the map of alias to table
-    query_tables_fields.clear(); // Clear the map of query tables fields
-    current_query_table.clear(); // Clear the current query table string
-	field_alias_map.clear();
 	if (buffer_used==0)
 		return;	// exit immediately if the buffer is empty
 	if (buffer_used < RESULTSET_BUFLEN/2) {

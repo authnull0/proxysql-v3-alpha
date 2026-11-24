@@ -78,6 +78,48 @@ int main() {
 	columns(orders, {{"amount_note", true, false}}, "select amount_note from orders", ".", "a longer name that only starts the same");
 	columns(orders, {{"label", false, false}}, "select 'amount' as label", ".", "the word only inside a string");
 	columns(orders, {id, amount}, "select id, amount from orders; select 1", ".M", "several statements");
+	columns(orders, {amount, status}, "select amount, status from orders", "M.", "the column after a masked one is not its alias");
+	columns(orders, {id, amount, status}, "select o.id, o.amount, o.status from orders o", ".M.", "qualified columns in a list");
+
+	// --- MySQL: the field metadata gives each column's source table and column (org_table, org_name) ---
+	{
+		const Policy items = {{"orders", {"item"}}};
+		auto my = [&](const Cols& cols, const std::string& sql, const std::string& want, const char* why) {
+			std::string got = maskString(authnullMaskColumns(items, cols, sql, AuthnullDialect::MySQL));
+			if (got != want) {
+				std::fprintf(stderr, "FAIL mysql: %s\n  sql: %s\n  got %s, want %s\n", why, sql.c_str(), got.c_str(), want.c_str());
+				failures++;
+			}
+		};
+		auto col = [](const char* name, const char* orgName) { return AuthnullResultColumn{name, true, false, orgName}; };
+		auto expr = [](const char* name) { return AuthnullResultColumn{name, false, false, ""}; };
+		const AuthnullResultColumn myId = col("id", "id"), myItem = col("item", "item"), myStatus = col("status", "status");
+
+		my({myId, myItem, myStatus}, "SELECT id, item, status FROM orders", ".M.", "a plain column");
+		my({myId, myItem}, "SELECT * FROM orders", ".M", "SELECT *");
+		my({col("a", "item")}, "SELECT item AS a FROM orders", "M", "an alias");
+		my({col("a", "item")}, "SELECT o.item a FROM orders o JOIN customers c ON c.id = o.customer_id", "M", "an alias in a join");
+		my({col("a", "item")}, "SELECT item 'a' FROM orders", "M", "a string alias: the source column says it");
+		my({col("a", "item")}, "SELECT (item) AS a FROM orders", "M", "a parenthesised column: the source column says it");
+		// Metadata as MySQL 8.0 sends it: a derived table's column names its base table but gives the
+		// alias as org_name; a derived expression and a UNION have no org_table.
+		my({col("x", "x")}, "SELECT x FROM (SELECT item AS x FROM orders) s", "M", "a derived table's alias");
+		my({expr("x")}, "SELECT x FROM (SELECT CONCAT(item,'') AS x FROM orders) s", "M", "a derived table's expression");
+		my({expr("id")}, "SELECT id FROM t UNION SELECT item FROM orders", "M", "a UNION");
+		my({expr("CONCAT(item,'')")}, "SELECT CONCAT(item,'') FROM orders", "M", "CONCAT");
+		my({expr("UPPER(item)")}, "SELECT UPPER(item) FROM orders", "M", "UPPER");
+		my({expr("HEX(item)")}, "SELECT HEX(item) FROM orders", "M", "HEX");
+		my({expr("GROUP_CONCAT(item)")}, "SELECT GROUP_CONCAT(item) FROM orders", "M", "GROUP_CONCAT");
+		my({expr("LENGTH(item)")}, "SELECT LENGTH(item) FROM orders", "M", "LENGTH");
+		my({expr("x"), myId}, "SELECT CONCAT(o.`item`, '') AS x, id FROM orders o", "M.", "an expression over a backticked column, renamed");
+		my({expr("CONCAT(\"item\", '')")}, "SELECT CONCAT(\"item\", '') FROM orders", "M", "a double-quoted name (ANSI_QUOTES)");
+		my({expr("UPPER(/*!item*/)")}, "SELECT UPPER(/*!item*/) FROM orders", "M", "inside an executable comment");
+		my({expr("COUNT(*)")}, "SELECT COUNT(*) FROM orders", ".", "COUNT(*) that mentions no masked column");
+		my({expr("UPPER(status)")}, "SELECT UPPER(status) FROM orders # item", ".", "a mention only in a comment");
+		my({expr("COUNT(*)")}, "SELECT COUNT(*) FROM orders WHERE item = 'x'", "M", "an expression when the query mentions the column");
+		my({myId}, "SELECT id FROM orders WHERE item = 'x'", ".", "a table column is not masked for a mention in WHERE");
+		my({expr("LENGTH(status)")}, "SELECT LENGTH(status) FROM orders WHERE note = 'unterminated", "M", "a query that cannot be read masks expressions");
+	}
 
 	// --- masking a DataRow in place ---
 	{

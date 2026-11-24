@@ -39,6 +39,9 @@ class MySQL_ResultSet {
 	bool deprecate_eof_active;
 	public:
 	std::vector<std::string> current_field_names;
+	// Field masking (authnull_masking.h): per column of this result set, whether to mask it.
+	// Decided once in init(); empty when nothing is masked.
+	std::vector<bool> authnull_mask;
 	bool transfer_started;
 	bool resultset_completed;
 	//bool reset_pid;
