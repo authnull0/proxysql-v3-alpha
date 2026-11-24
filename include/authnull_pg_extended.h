@@ -47,6 +47,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -508,8 +509,44 @@ inline bool fromBinary(uint32_t oid, const std::string& b, std::string& out) {
 		out = b.substr(1);
 		return true;
 	default:
-		return false;
+		break;
 	}
+	// An array of one of those (psycopg sends a list of numbers so): its text form, {..,..}.
+	if (b.size() < 12) return false;
+	const uint32_t ndim = static_cast<uint32_t>(be(0, 4)), elem = static_cast<uint32_t>(be(8, 4));
+	const char* arrayType = typeName(oid);
+	if (!arrayType || std::strstr(arrayType, "[]") == nullptr) return false;
+	if (ndim < 1 || ndim > 6 || b.size() < 12 + 8 * static_cast<size_t>(ndim)) return false;
+	std::vector<uint32_t> dims;
+	for (uint32_t k = 0; k < ndim; k++) {
+		dims.push_back(static_cast<uint32_t>(be(12 + 8 * k, 4)));
+		if (be(16 + 8 * k, 4) != 1 || dims.back() > b.size()) return false; // lower bounds other than 1: not read
+	}
+	size_t at = 12 + 8 * static_cast<size_t>(ndim);
+	bool ok = true;
+	std::function<std::string(uint32_t)> level = [&](uint32_t d) {
+		std::string s = "{";
+		for (uint32_t k = 0; ok && k < dims[d]; k++) {
+			if (k) s += ',';
+			if (d + 1 < ndim) { s += level(d + 1); continue; }
+			if (b.size() - at < 4) { ok = false; break; }
+			const int32_t len = static_cast<int32_t>(be(at, 4));
+			at += 4;
+			if (len == -1) { s += "NULL"; continue; }
+			std::string v;
+			if (len < 0 || b.size() - at < static_cast<size_t>(len) || !fromBinary(elem, b.substr(at, len), v)) { ok = false; break; }
+			at += len;
+			s += '"';
+			for (const char c : v) {
+				if (c == '"' || c == '\\') s += '\\';
+				s += c;
+			}
+			s += '"';
+		}
+		return s + "}";
+	};
+	out = level(0);
+	return ok && at == b.size();
 }
 
 // literal quotes a text value (see the header).

@@ -3550,6 +3550,9 @@ int PgSQL_Session::authnull_extended_message(PtrSize_t& pkt) {
 	const bool queued = client_myds->PSarrayIN && client_myds->PSarrayIN->len > 0;
 	const AuthnullPgExtended::Action a = authnull_ext.on((char)p[0], p + 5, pkt.size > 5 ? pkt.size - 5 : 0, queued);
 	l_free(pkt.size, pkt.ptr);
+	// Like the server, nothing goes out before a Flush or Sync: a pipelining client (libpq's
+	// pipeline mode) reads the answers of a batch together.
+	if (a == AuthnullPgExtended::Wait) return 0;
 	std::string out = authnull_ext.takeAnswer();
 	if (a == AuthnullPgExtended::Answer && authnull_ext.wantsReady()) {
 		out += authnull_pgx::message('Z', std::string(1, authnull_txn_state()));

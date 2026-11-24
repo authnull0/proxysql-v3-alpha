@@ -134,7 +134,11 @@ int main() {
 			out == "00112233-4455-6677-8899-aabbccddeeff", "uuid");
 		expect(fromBinary(17, bin({0, 0x27, 0x5c}), out) && out == "\\x00275c", "bytea as hex");
 		expect(!fromBinary(23, bin({0, 1}), out), "wrong size refused");
-		expect(!fromBinary(1007, bin({0}), out), "arrays not read");
+		expect(!fromBinary(1007, bin({0}), out), "a short array refused");
+		// int2[] {1,NULL,3}: ndim 1, has nulls, int2; dim 3 from 1; then the elements
+		expect(fromBinary(1005, bin({0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 21, 0, 0, 0, 3, 0, 0, 0, 1,
+			0, 0, 0, 2, 0, 1, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 2, 0, 3}), out) && out == "{\"1\",NULL,\"3\"}", "int2[]: " + out);
+		expect(!fromBinary(1186, bin({0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 0, 0}), out), "interval is not read as an array");
 		Extended x;
 		send(x, 'P', Parse("", "select $1 + $2", {23, 0}));
 		send(x, 'B', Bind("", "", {{false, bin({0, 0, 0, 7})}, {false, "1"}}, {1, 0}));
