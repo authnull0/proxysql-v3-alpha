@@ -113,6 +113,35 @@ int main() {
 		injectionProof(v, 25);
 	}
 
+	// ---- binary parameters
+	{
+		auto bin = [](std::initializer_list<int> bytes) { std::string s; for (int b : bytes) s += static_cast<char>(b); return s; };
+		std::string out;
+		expect(fromBinary(23, bin({0xff, 0xff, 0xff, 0xfe}), out) && out == "-2", "int4");
+		expect(fromBinary(20, bin({0, 0, 0, 0, 0xb2, 0xd0, 0x5e, 0}), out) && out == "3000000000", "int8");
+		expect(fromBinary(21, bin({0, 5}), out) && out == "5", "int2");
+		expect(fromBinary(16, bin({1}), out) && out == "t", "bool");
+		expect(fromBinary(701, bin({0x3f, 0xf8, 0, 0, 0, 0, 0, 0}), out) && out == "1.5", "float8: " + out);
+		expect(fromBinary(1700, bin({0, 2, 0, 0, 0, 0, 0, 2, 0, 12, 0x13, 0x88}), out) && out == "12.50", "numeric 12.50: " + out);
+		expect(fromBinary(1700, bin({0, 1, 0xff, 0xff, 0x40, 0, 0, 4, 0, 12}), out) && out == "-0.0012", "numeric -0.0012: " + out);
+		expect(fromBinary(1700, bin({0, 3, 0, 2, 0, 0, 0, 0, 0, 1, 0x09, 0x29, 0x1a, 0x85}), out) && out == "123456789", "numeric 123456789: " + out);
+		expect(fromBinary(1082, bin({0, 0, 0x22, 0x79}), out) && out == "2024-02-29", "date: " + out);
+		std::string ts;
+		const uint64_t t = 8767ULL * 86400000000ULL + 11045000000ULL;
+		for (int k = 7; k >= 0; k--) ts += static_cast<char>((t >> (8 * k)) & 0xff);
+		expect(fromBinary(1184, ts, out) && out == "2024-01-02 03:04:05.000000+00", "timestamptz: " + out);
+		expect(fromBinary(2950, bin({0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}), out) &&
+			out == "00112233-4455-6677-8899-aabbccddeeff", "uuid");
+		expect(fromBinary(17, bin({0, 0x27, 0x5c}), out) && out == "\\x00275c", "bytea as hex");
+		expect(!fromBinary(23, bin({0, 1}), out), "wrong size refused");
+		expect(!fromBinary(1007, bin({0}), out), "arrays not read");
+		Extended x;
+		send(x, 'P', Parse("", "select $1 + $2", {23, 0}));
+		send(x, 'B', Bind("", "", {{false, bin({0, 0, 0, 7})}, {false, "1"}}, {1, 0}));
+		send(x, 'E', Execute(""));
+		expect(send(x, 'S') == Extended::Run && x.sql() == "select ('7'::int4) + '1'", "binary int4 parameter: " + x.sql());
+	}
+
 	// ---- scan
 	{
 		Scan s = scan("select * from t where a = $1 and b = $2");

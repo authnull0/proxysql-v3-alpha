@@ -10,7 +10,9 @@
 // ParseComplete, BindComplete, CloseComplete, ParameterDescription, RowDescription or NoData where
 // the client asked for a description, DataRows, CommandComplete, ReadyForQuery.
 //
-// Values. Text format only: binary parameters or results are refused (0A000). A value becomes
+// Values. Text format, and binary for the common built-in types (psycopg 3 sends numbers,
+// booleans, dates and UUIDs in binary), read into their text form; other binary parameters, and
+// binary results, are refused (0A000). A value becomes
 // '...' with ' doubled, which reads the same with standard_conforming_strings on or off and in every
 // client encoding (no multibyte character has a ' byte); a value holding a backslash is
 // dollar-quoted instead, $an$...$an$, with a tag that cannot end it early, so nothing in it is an
@@ -43,6 +45,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <string>
@@ -365,6 +368,147 @@ inline const char* typeName(uint32_t oid) {
 	case 2951: return "uuid[]";
 	case 3807: return "jsonb[]";
 	default: return nullptr;
+	}
+}
+
+// fromBinary turns a binary-format parameter of a common built-in type into its text form, which
+// is what the SQL carries (psycopg 3 sends numbers, booleans, dates and UUIDs in binary by
+// default). False for a type it does not read, or a value of the wrong size.
+inline bool fromBinary(uint32_t oid, const std::string& b, std::string& out) {
+	const unsigned char* p = reinterpret_cast<const unsigned char*>(b.data());
+	auto be = [&](size_t at, size_t n) {
+		uint64_t v = 0;
+		for (size_t k = 0; k < n; k++) v = (v << 8) | p[at + k];
+		return v;
+	};
+	auto two = [](long v) { return std::string(v < 10 ? "0" : "") + std::to_string(v); };
+	auto ymd = [&](long long days) { // days since 2000-01-01 -> YYYY-MM-DD[ BC]
+		long long z = days + 10957 + 719468; // to 1970, then the civil-from-days algorithm
+		const long long era = (z >= 0 ? z : z - 146096) / 146097;
+		const long long doe = z - era * 146097;
+		const long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+		const long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+		const long long mp = (5 * doy + 2) / 153;
+		const long long d = doy - (153 * mp + 2) / 5 + 1;
+		const long long m = mp < 10 ? mp + 3 : mp - 9;
+		long long y = yoe + era * 400 + (m <= 2);
+		const bool bc = y <= 0;
+		if (bc) y = 1 - y;
+		std::string ys = std::to_string(y);
+		while (ys.size() < 4) ys = "0" + ys;
+		return ys + "-" + two(m) + "-" + two(d) + (bc ? " BC" : "");
+	};
+	auto hms = [&](long long us) { // microseconds of a day -> HH:MM:SS.ffffff
+		std::string f = std::to_string(us % 1000000);
+		while (f.size() < 6) f = "0" + f;
+		return two(us / 3600000000LL) + ":" + two(us / 60000000 % 60) + ":" + two(us / 1000000 % 60) + "." + f;
+	};
+	switch (oid) {
+	case 16: // bool
+		if (b.size() != 1) return false;
+		out = p[0] ? "t" : "f";
+		return true;
+	case 21: if (b.size() != 2) return false; out = std::to_string(static_cast<int16_t>(be(0, 2))); return true;
+	case 23: if (b.size() != 4) return false; out = std::to_string(static_cast<int32_t>(be(0, 4))); return true;
+	case 20: if (b.size() != 8) return false; out = std::to_string(static_cast<int64_t>(be(0, 8))); return true;
+	case 26: if (b.size() != 4) return false; out = std::to_string(static_cast<uint32_t>(be(0, 4))); return true;
+	case 700:
+	case 701: {
+		char buf[64];
+		double d;
+		if (oid == 700 && b.size() == 4) {
+			const uint32_t u = static_cast<uint32_t>(be(0, 4));
+			float f;
+			std::memcpy(&f, &u, 4);
+			d = f;
+		} else if (oid == 701 && b.size() == 8) {
+			const uint64_t u = be(0, 8);
+			std::memcpy(&d, &u, 8);
+		} else {
+			return false;
+		}
+		if (d != d) out = "NaN";
+		else if (d > 1.7976931348623157e308) out = "Infinity";
+		else if (d < -1.7976931348623157e308) out = "-Infinity";
+		else { std::snprintf(buf, sizeof(buf), oid == 700 ? "%.9g" : "%.17g", d); out = buf; }
+		return true;
+	}
+	case 1700: { // numeric: ndigits, weight, sign, dscale, then base-10000 digits
+		if (b.size() < 8) return false;
+		const int nd = static_cast<int16_t>(be(0, 2)), weight = static_cast<int16_t>(be(2, 2));
+		const uint16_t sign = static_cast<uint16_t>(be(4, 2));
+		const int dscale = static_cast<int16_t>(be(6, 2));
+		if (nd < 0 || dscale < 0 || b.size() != 8 + 2 * static_cast<size_t>(nd)) return false;
+		if (sign == 0xC000) { out = "NaN"; return true; }
+		if (sign == 0xD000) { out = "Infinity"; return true; }
+		if (sign == 0xF000) { out = "-Infinity"; return true; }
+		if (sign != 0 && sign != 0x4000) return false;
+		auto digit = [&](int k) { return k >= 0 && k < nd ? static_cast<int>(be(8 + 2 * k, 2)) : 0; };
+		std::string s = sign == 0x4000 ? "-" : "";
+		if (weight < 0) s += "0";
+		for (int k = 0; k <= weight; k++) {
+			std::string g = std::to_string(digit(k));
+			if (k > 0) while (g.size() < 4) g = "0" + g;
+			s += g;
+		}
+		if (dscale > 0) {
+			std::string frac;
+			for (int k = weight + 1; static_cast<int>(frac.size()) < dscale; k++) {
+				std::string g = std::to_string(digit(k));
+				while (g.size() < 4) g = "0" + g;
+				frac += g;
+			}
+			s += "." + frac.substr(0, dscale);
+		}
+		out = s;
+		return true;
+	}
+	case 1082: { // date: days since 2000-01-01
+		if (b.size() != 4) return false;
+		const int32_t days = static_cast<int32_t>(be(0, 4));
+		out = days == INT32_MAX ? "infinity" : days == INT32_MIN ? "-infinity" : ymd(days);
+		return true;
+	}
+	case 1083: if (b.size() != 8) return false; out = hms(static_cast<int64_t>(be(0, 8))); return true;
+	case 1114:
+	case 1184: { // microseconds since 2000-01-01 00:00 (UTC for timestamptz)
+		if (b.size() != 8) return false;
+		const int64_t t = static_cast<int64_t>(be(0, 8));
+		if (t == INT64_MAX) { out = "infinity"; return true; }
+		if (t == INT64_MIN) { out = "-infinity"; return true; }
+		long long days = t / 86400000000LL, us = t % 86400000000LL;
+		if (us < 0) { us += 86400000000LL; days--; }
+		std::string d = ymd(days), bc;
+		if (d.size() > 3 && d.compare(d.size() - 3, 3, " BC") == 0) { bc = " BC"; d.resize(d.size() - 3); }
+		out = d + " " + hms(us) + (oid == 1184 ? "+00" : "") + bc;
+		return true;
+	}
+	case 2950: { // uuid
+		if (b.size() != 16) return false;
+		static const char* hex = "0123456789abcdef";
+		out.clear();
+		for (size_t k = 0; k < 16; k++) {
+			if (k == 4 || k == 6 || k == 8 || k == 10) out += '-';
+			out += hex[p[k] >> 4];
+			out += hex[p[k] & 15];
+		}
+		return true;
+	}
+	case 17: { // bytea: its hex text form
+		static const char* hex = "0123456789abcdef";
+		out = "\\x";
+		for (const unsigned char c : b) { out += hex[c >> 4]; out += hex[c & 15]; }
+		return true;
+	}
+	case 25: case 1043: case 1042: case 19: case 114: // the text is the value
+		out = b;
+		return true;
+	case 3802: // jsonb: a version byte, then the text
+		if (b.empty() || p[0] != 1) return false;
+		out = b.substr(1);
+		return true;
+	default:
+		return false;
 	}
 }
 
@@ -716,7 +860,14 @@ private:
 		for (uint16_t k = 0; k < np; k++) {
 			const uint16_t f = nf == 0 ? 0 : formats[nf == 1 ? 0 : k];
 			if (f > 1) return fail("08P01", "unsupported format code: " + std::to_string(f));
-			if (f == 1 && !values[k].null) return fail("0A000", "binary-format parameters are not supported through this proxy; send them as text");
+			if (f == 1 && !values[k].null) {
+				std::string text;
+				if (!fromBinary(st.types[k], values[k].text, text)) {
+					return fail("0A000", "binary-format parameters of type " + std::to_string(st.types[k]) +
+						" are not supported through this proxy; send them as text");
+				}
+				values[k].text = text;
+			}
 			if (values[k].text.find('\0') != std::string::npos) return fail("22021", "invalid byte sequence for encoding \"UTF8\": 0x00");
 		}
 		for (const uint16_t f : resultFormats) {
