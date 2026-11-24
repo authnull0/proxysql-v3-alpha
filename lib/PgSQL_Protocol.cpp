@@ -15,6 +15,7 @@
 #include "PgSQL_Protocol.h"
 #include <syslog.h>
 #include "authnull_caller_token_curl.h"
+#include "authnull_curl_cancel.h"
 extern "C" {
 #include "usual/time.h"
 }
@@ -1186,9 +1187,12 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						
 						CURL* h = curl;
 						struct curl_slist* hl = headers;
-						mfa_call = AuthnullMfaCall::start([h, hl, body, caller_token]() {
+						// The call gives up once the session cancels it: the client went away, so
+						// nobody will read the answer (authnull_curl_cancel.h).
+						mfa_call = AuthnullMfaCall::start_cancellable([h, hl, body, caller_token](const std::atomic<bool>& cancelled) {
 							AuthnullMfaAnswer a;
 							a.caller_token = caller_token;
+							authnullCurlCancelOn(h, &cancelled);
 							a.curl_code = (int)curl_easy_perform(h);
 							curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &a.http_code);
 							a.body = std::move(*body);

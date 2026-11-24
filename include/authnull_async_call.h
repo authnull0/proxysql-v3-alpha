@@ -14,6 +14,13 @@
 // worker loop, and polls done() until the answer is in. The call holds its own reference, so a
 // session that goes away (the client hung up) leaves it to finish and be freed.
 //
+// A session that goes away while its call runs cancel()s it. Nobody will read the answer, and the
+// HTTP request should not stay open: authn-service treats an approval given while the proxy is still
+// connected as a login that went through (lab, 24 Nov 2026: an access log row "allowed /
+// mfa_approved" for a psql that had given up 2 s before the push was approved). A function started
+// with start_cancellable() is handed the flag cancel() raises and stops early when it sees it
+// (authnullCurlCancelOn, authnull_curl_cancel.h); cancel() never waits for it.
+//
 // Calls in flight are capped (limit(), default 512): past the cap, start() refuses and the login is
 // denied, rather than making threads without bound. test/authnull/authnull_async_call_test.cpp.
 
@@ -30,6 +37,12 @@ public:
 
 	// start runs fn on its own thread. nullptr when the cap is reached or no thread can be made.
 	static std::shared_ptr<AuthnullAsyncCall> start(std::function<R()> fn) {
+		return start_cancellable([fn](const std::atomic<bool>&) { return fn(); });
+	}
+
+	// start_cancellable is start for a function that can stop early: it is handed the flag cancel()
+	// raises. The flag lives as long as the call does, which is at least until fn returns.
+	static std::shared_ptr<AuthnullAsyncCall> start_cancellable(std::function<R(const std::atomic<bool>& cancelled)> fn) {
 		int n = inFlight().fetch_add(1);
 		if (n >= limit()) {
 			inFlight().fetch_sub(1);
@@ -40,7 +53,7 @@ public:
 			std::thread([call, fn]() {
 				R r{};
 				try {
-					r = fn();
+					r = fn(call->cancelled_);
 				} catch (...) {
 					r = R{}; // a call that fails is a refusal
 				}
@@ -60,6 +73,11 @@ public:
 
 	bool done() const { return done_.load(); }
 
+	// cancel tells the running function nobody wants its answer any more. Safe from any thread, at
+	// any time, more than once; a call that already finished is left as it is.
+	void cancel() { cancelled_.store(true); }
+	bool cancelled() const { return cancelled_.load(); }
+
 	// take is the result; call it once done() is true.
 	R take() {
 		std::lock_guard<std::mutex> g(mu_);
@@ -77,6 +95,7 @@ private:
 	static std::atomic<int>& limitRef() { static std::atomic<int> n{0}; return n; }
 
 	std::atomic<bool> done_{false};
+	std::atomic<bool> cancelled_{false};
 	std::mutex mu_;
 	R result_{};
 };

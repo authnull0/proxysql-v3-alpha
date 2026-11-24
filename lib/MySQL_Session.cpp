@@ -41,6 +41,7 @@ using json = nlohmann::json;
 #include <regex>
 #include <syslog.h>
 #include "authnull_caller_token_curl.h"
+#include "authnull_curl_cancel.h"
 #include "libinjection.h"
 #include "libinjection_sqli.h"
 
@@ -764,8 +765,10 @@ int generateRandomSessionID() {
 // (authnull_mfa_call.h): do-authenticationV4 blocks while the person answers the push, up to the
 // challenge's 60 s TTL, so the timeout is 90 s. url and tls are copies taken when the login started;
 // the call reads no setting another thread could be rewriting. The body carries a bearer token and
-// is never logged; neither is the answer, except at LOG_DEBUG.
-static AuthnullMfaAnswer authnullMysqlLoginCall(const std::string& url, const AuthnullCurlTls& tls, const std::string& body) {
+// is never logged; neither is the answer, except at LOG_DEBUG. The call gives up once cancelled is
+// raised: the session went away, so nobody will read the answer (authnull_curl_cancel.h).
+static AuthnullMfaAnswer authnullMysqlLoginCall(const std::string& url, const AuthnullCurlTls& tls, const std::string& body,
+                                                const std::atomic<bool>& cancelled) {
     AuthnullMfaAnswer out;
     CURL *curl = curl_easy_init();
     if (!curl) {
@@ -795,6 +798,7 @@ static AuthnullMfaAnswer authnullMysqlLoginCall(const std::string& url, const Au
     }
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, tls.protocols);
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, tls.protocols);
+    authnullCurlCancelOn(curl, &cancelled);
     out.curl_code = (int)curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.http_code);
     curl_easy_cleanup(curl);
@@ -1004,6 +1008,23 @@ void MySQL_Session::reset() {
  */
 MySQL_Session::~MySQL_Session() {
 
+	// A login still waiting on its MFA push when the session ends (the client hung up, or it was
+	// killed): cancel the call, so the request to authn-service is dropped and an approval given
+	// after this is not taken for a login that went through (authnull_curl_cancel.h). The call
+	// finishes on its own thread and frees itself.
+	if (authnull_mfa_call) {
+		bool pending = !authnull_mfa_call->done();
+		authnull_mfa_call->cancel();
+		const char* u = (client_myds && client_myds->myconn && client_myds->myconn->userinfo && client_myds->myconn->userinfo->username)
+			? client_myds->myconn->userinfo->username : "";
+		const char* d = (client_myds && client_myds->myconn && client_myds->myconn->userinfo && client_myds->myconn->userinfo->schemaname)
+			? client_myds->myconn->userinfo->schemaname : "";
+		const char* what = pending ? "client disconnected while MFA was pending; the call to authn-service is cancelled"
+			: "client disconnected before its MFA answer was read; the answer is discarded";
+		syslog(LOG_WARNING, "[authnull] %s (user '%s' db '%s', MySQL session %u)", what, u, d, thread_session_id);
+		proxy_info("AuthNull: %s (user '%s' db '%s', MySQL session %u)\n", what, u, d, thread_session_id);
+	}
+
 	reset(); // we moved this out to allow CHANGE_USER
 
 	if (locked_on_hostgroup >= 0) {
@@ -1061,7 +1082,6 @@ MySQL_Session::~MySQL_Session() {
 		}
 	}
 	authnullMySQLSessionLimits().erase(thread_session_id);
-	// authnull_mfa_call, if still running, finishes on its own thread and frees itself.
 	if (default_schema) {
 		free(default_schema);
 	}
@@ -5912,7 +5932,9 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 										connection_ip, user_ip, db_name, authnull_mfa_token, thread_session_id, (long long)time(nullptr));
 									std::string url = authnull_api_url;
 									AuthnullCurlTls tls = authnullCurlTls(authnull_api_url, authnull_tls);
-									authnull_mfa_call = AuthnullMfaCall::start([url, tls, body]() { return authnullMysqlLoginCall(url, tls, body); });
+									authnull_mfa_call = AuthnullMfaCall::start_cancellable([url, tls, body](const std::atomic<bool>& cancelled) {
+										return authnullMysqlLoginCall(url, tls, body, cancelled);
+									});
 									if (!authnull_mfa_call) {
 										syslog(LOG_ERR, "[authnull] too many logins waiting on MFA; denying user '%s' db '%s'", user.c_str(), db_name.c_str());
 										mfa_deny_msg = "Access denied: too many logins waiting on multi-factor authentication; try again";

@@ -1856,7 +1856,21 @@ PgSQL_Session::~PgSQL_Session() {
 		l_free(authnull_mfa_pkt.size, authnull_mfa_pkt.ptr);
 		authnull_mfa_pkt.ptr = NULL;
 	}
-	// authnull_mfa_call, if still running, finishes on its own thread and frees itself.
+	// A login still waiting on its MFA push when the session ends (the client hung up, or it was
+	// killed): cancel the call, so the request to authn-service is dropped and an approval given
+	// after this is not taken for a login that went through (authnull_curl_cancel.h). The call
+	// finishes on its own thread and frees itself.
+	if (authnull_mfa_call) {
+		bool pending = !authnull_mfa_call->done();
+		authnull_mfa_call->cancel();
+		// authnull_mfa_username is "<user>,<token>": the token is a credential and is not logged.
+		std::string u = authnull_mfa_username.substr(0, authnull_mfa_username.find(','));
+		const char* d = (client_myds && client_myds->myconn) ? client_myds->myconn->conn_params.get_value(PG_DATABASE) : NULL;
+		const char* what = pending ? "client disconnected while MFA was pending; the call to authn-service is cancelled"
+			: "client disconnected before its MFA answer was read; the answer is discarded";
+		syslog(LOG_WARNING, "[authnull] %s (user '%s' db '%s', PgSQL session %u)", what, u.c_str(), d ? d : "", thread_session_id);
+		proxy_info("AuthNull: %s (user '%s' db '%s', PgSQL session %u)\n", what, u.c_str(), d ? d : "", thread_session_id);
+	}
 
 	// The session's AuthNull limits, if it had any (authnull_session_limits.h).
 	authnullSessionLimits().erase(thread_session_id);

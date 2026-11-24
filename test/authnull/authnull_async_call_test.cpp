@@ -59,6 +59,48 @@ int main() {
 		CHECK(waitIdle(milliseconds(1000)), "an abandoned call kept its slot");
 	}
 
+	// The session goes while the call runs and cancels it (the client hung up during the push): the
+	// function sees the flag and stops early, and the call still finishes and frees its slot although
+	// nobody holds it any more.
+	{
+		auto t = steady_clock::now();
+		auto c = Call::start_cancellable([](const std::atomic<bool>& cancelled) {
+			auto end = steady_clock::now() + milliseconds(5000);
+			while (!cancelled.load()) {
+				if (steady_clock::now() > end) return std::string("approved");
+				std::this_thread::sleep_for(milliseconds(5));
+			}
+			return std::string("cancelled");
+		});
+		CHECK(c != nullptr, "start refused");
+		CHECK(!c->cancelled(), "cancelled before cancel()");
+		std::this_thread::sleep_for(milliseconds(50));
+		c->cancel();
+		c->cancel(); // more than once is harmless
+		CHECK(c->cancelled(), "cancel() not seen");
+		CHECK(waitDone(c, milliseconds(3000)), "a cancelled call never finished");
+		CHECK(c->take() == "cancelled", "the function did not see the cancel");
+		// Uncancelled, the function would run for 5 s and answer "approved".
+		CHECK(steady_clock::now() - t < milliseconds(4000), "the cancel did not cut the call short");
+
+		auto d = Call::start_cancellable([](const std::atomic<bool>& cancelled) {
+			while (!cancelled.load()) std::this_thread::sleep_for(milliseconds(5));
+			return std::string("cancelled");
+		});
+		CHECK(d != nullptr, "start refused");
+		d->cancel();
+		d.reset(); // the session is gone: the call ends on its own
+		CHECK(waitIdle(milliseconds(1000)), "a cancelled, abandoned call kept its slot");
+	}
+
+	// Cancelling a call that already answered changes nothing: the answer is still there.
+	{
+		auto c = Call::start([] { return std::string("approved"); });
+		CHECK(c != nullptr && waitDone(c, milliseconds(1000)), "never done");
+		c->cancel();
+		CHECK(c->take() == "approved", "cancel after the answer lost it");
+	}
+
 	// A call that throws is done, with an empty result: a refusal, never an approval.
 	{
 		auto c = Call::start([]() -> std::string { throw std::runtime_error("boom"); });
