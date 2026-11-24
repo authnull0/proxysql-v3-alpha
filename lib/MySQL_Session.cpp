@@ -5951,7 +5951,10 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 								if (!answer.approved) {
 									syslog(LOG_WARNING, "MFA not approved for user '%s' db '%s': %s", user.c_str(), db_name.c_str(), answer.why.c_str());
 									authnull_refusal = answer.refusal;
-									mfa_deny_msg = "Access denied: multi-factor authentication was not approved";
+									// authn-service's reason is shown as-is, "Access denied: <reason>": it may
+									// refuse before any push (an expired connection token), so the MFA wording
+									// is only for a refusal that gives no reason.
+									mfa_deny_msg = answer.refusal.empty() ? "Access denied: multi-factor authentication was not approved" : "Access denied";
 									break;
 								}
 								if (answer.database != db_name) {
