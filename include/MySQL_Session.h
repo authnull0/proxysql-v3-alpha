@@ -8,11 +8,6 @@
 #define __CLASS_MYSQL_SESSION_H
 #include <string>
 
-// extern std::map<std::string, std::vector<std::string>> fieldMaskingPolicy;
-extern std::map<std::string, std::string> alias_to_table;
-extern std::map<std::string, std::vector<std::string>> query_tables_fields;
-extern std::string current_query_table;
-extern std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map;
 extern std::string latestDB;
 extern std::string latestUser;
 
@@ -301,6 +296,10 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	bool authnull_record = false;
 	bool authnull_refused = false;
 	std::string authnull_query_error;
+	// Field masking (authnull_masking.h): the policy's masked columns and the query now running,
+	// for MySQL_ResultSet to decide which result columns to mask.
+	std::map<std::string, std::vector<std::string>> authnull_mask_policy;
+	std::string authnull_mask_query;
 	void authnullRecordQuery();
 	bool handler_again___status_SETTING_GENERIC_VARIABLE(int *_rc, const char *var_name, const char *var_value, bool no_quote=false, bool set_transaction=false);
 	bool handler_again___status_SETTING_SQL_LOG_BIN(int *);

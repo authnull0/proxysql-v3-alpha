@@ -69,17 +69,36 @@ int main() {
 	std::string m = authnullMaskSecrets(big);
 	expect(m.size() <= kAuthnullRecordMaxStatement + 3 && m.substr(m.size() - 3) == "...", "a long statement is cut");
 
-	// --- MySQL error messages quote values; recordings keep the message, not the values ---
-	expect(authnullMaskErrorValues("[1062] Duplicate entry 'jane@acme.com' for key 'users.email'") ==
-		"[1062] Duplicate entry '***' for key '***'", "duplicate entry masked");
-	expect(authnullMaskErrorValues("[1406] Data too long for column 'note' at row 1") == "[1406] Data too long for column '***' at row 1",
-		"column name masked too");
-	expect(authnullMaskErrorValues("[1146] Table shop.nosuch doesn't exist") == "[1146] Table shop.nosuch doesn't exist",
-		"an apostrophe inside a word is not a quote");
-	expect(authnullMaskErrorValues("[1064] near 'it''s' at line 1") == "[1064] near '***' at line 1", "doubled quote inside a value");
-	expect(authnullMaskErrorValues("[1366] Incorrect integer value: 'abc' for column 'n'") == "[1366] Incorrect integer value: '***' for column '***'",
-		"several values");
-	expect(authnullMaskErrorValues("[1105] unterminated 'secret") == "[1105] unterminated '***'", "unterminated");
+	// --- MySQL error messages quote values and names; recordings keep the names, not the values ---
+	auto errors = [](int code, const std::string& msg, const std::string& want) {
+		std::string got = authnullMaskErrorValues(code, msg);
+		if (got != want) {
+			std::fprintf(stderr, "FAIL error %d\n  in:   %s\n  got:  %s\n  want: %s\n", code, msg.c_str(), got.c_str(), want.c_str());
+			failures++;
+		}
+	};
+	// Names only: kept as MySQL wrote them.
+	errors(1146, "Table 'shop.nosuch' doesn't exist", "Table 'shop.nosuch' doesn't exist");
+	errors(1054, "Unknown column 'nosuch' in 'field list'", "Unknown column 'nosuch' in 'field list'");
+	errors(1406, "Data too long for column 'note' at row 1", "Data too long for column 'note' at row 1");
+	errors(1045, "Access denied for user 'app'@'10.0.0.5' (using password: YES)", "Access denied for user 'app'@'10.0.0.5' (using password: YES)");
+	errors(1142, "SELECT command denied to user 'app'@'%' for table 'orders'", "SELECT command denied to user 'app'@'%' for table 'orders'");
+	errors(1049, "Unknown database 'nosuch'", "Unknown database 'nosuch'");
+	errors(1364, "Field 'email' doesn't have a default value", "Field 'email' doesn't have a default value");
+	// A value: masked; the key or column kept.
+	errors(1062, "Duplicate entry 'jane@acme.com' for key 'users.email'", "Duplicate entry '***' for key 'users.email'");
+	errors(1062, "Duplicate entry 'O'Brien' for key 'users.name'", "Duplicate entry '***' for key 'users.name'");
+	errors(1366, "Incorrect integer value: 'abc' for column 'n' at row 1", "Incorrect integer value: '***' for column 'n' at row 1");
+	errors(1292, "Incorrect datetime value: '2026-13-01' for column 'created' at row 1", "Incorrect datetime value: '***' for column 'created' at row 1");
+	errors(1292, "Truncated incorrect DOUBLE value: 'abc'", "Truncated incorrect DOUBLE value: '***'");
+	// A syntax error quotes the SQL, values and all.
+	errors(1064, "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'pw = 'x'' at line 1",
+		"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '***' at line 1");
+	// Unknown codes, and known ones in a shape not recognised: every quoted run.
+	errors(3819, "Check constraint 'chk_amount' is violated.", "Check constraint '***' is violated.");
+	errors(1105, "can't use 'it''s' here", "can't use '***' here");
+	errors(1105, "unterminated 'secret", "unterminated '***'");
+	errors(1062, "Duplicate entry 'x'", "Duplicate entry '***'");
 
 	// --- one JSON line per statement ---
 	AuthnullRecordedStatement st;

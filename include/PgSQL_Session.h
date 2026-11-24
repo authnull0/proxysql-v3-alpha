@@ -11,6 +11,7 @@
 #include "cpp.h"
 #include "PgSQL_Variables.h"
 #include "authnull_mfa_call.h"
+#include "authnull_pg_extended.h"
 #include "Base_Session.h"
 
 
@@ -144,6 +145,11 @@ private:
 	void handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_STATISTICS(PtrSize_t*);
 	void handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_PROCESS_KILL(PtrSize_t*);
 	bool handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_qpo(PtrSize_t*, bool* lock_hostgroup, PgSQL_ps_type prepare_stmt_type = PgSQL_ps_type_not_set);
+	int handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY(PtrSize_t& pkt);
+	// The extended query protocol (authnull_pg_extended.h).
+	int authnull_extended_message(PtrSize_t& pkt);
+	char authnull_txn_state();
+	void authnull_send(const std::string& bytes);
 
 	void handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED__get_connection();
 
@@ -446,6 +452,12 @@ public:
 	void generate_status_one_hostgroup(int hid, std::string& s);
 	void reset_warning_hostgroup_flag_and_release_connection();
 	void set_previous_status_mode3(bool allow_execute = true);
+
+public:
+	// The extended query protocol (authnull_pg_extended.h): this session's statements and portals,
+	// and the answer to the Sync now running, which PgSQL_Query_Result builds around the backend's.
+	// Last, so that no other member moves.
+	AuthnullPgExtended authnull_ext;
 };
 
 #define PgSQL_KILL_QUERY       1

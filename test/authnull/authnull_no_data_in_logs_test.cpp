@@ -51,7 +51,10 @@ int main() {
 	// Result sets: the rows, as sent.
 	forbid("lib/MySQL_ResultSet.cpp", {"packet_data", "[DEBUG] Row", "Result Set Before Sending"});
 	// PgSQL result sets: copy_row_to_PgSQL_Query_Result wrote every row it sent to syslog.
-	forbid("lib/PgSQL_Protocol.cpp", {"ROW[", "row_data", "PQgetvalue", "data='%.*s'"});
+	// get_resultset also dumped every DataRow it sent to syslog at LOG_INFO, values in clear.
+	forbid("lib/PgSQL_Protocol.cpp", {"ROW[", "row_data", "PQgetvalue", "data='%.*s'", "data_str", "Data Row"});
+	// PgSQL backend results: handler() printed each result's rows to stdout, values in clear.
+	forbid("lib/PgSQL_Connection.cpp", {"PQgetvalue", "Rows: ", "No result or query failed"});
 	// Sessions: the query text.
 	// syslog too: the query text belongs in a session recording, masked, only when the policy asks
 	// for one (authnull_recording.h), never in the system log.

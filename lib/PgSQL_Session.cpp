@@ -132,6 +132,7 @@ static const std::set<std::string> pgsql_variables_strings = {
 
 #include "proxysql_find_charset.h"
 #include "authnull_query.h"
+#include "authnull_masking.h"
 #include "authnull_log.h"
 #include "authnull_refusal.h"
 #include "authnull_session_limits.h"
@@ -398,11 +399,6 @@ void PgSQL_Query_Info::end() {
 	}
 }
 
-std::map<std::string, std::string> alias_to_table2;
-std::map<std::string, std::vector<std::string>> query_tables_fields2;
-std::string current_query_table2;
-std::unordered_map<std::string, std::pair<std::string, std::string>> field_alias_map2;
-
 
 
 bool contains2(const std::vector<std::string>& vec, const std::string& value) {
@@ -464,1138 +460,6 @@ std::map<std::string, std::vector<std::string>> getMaskingPolicyForSession2(cons
 	}
     return {};
 }
-
-
-std::vector<std::string> tokenizeSQL2(const std::string& sql) {
-    std::vector<std::string> tokens;
-    std::string currentToken;
-    bool inQuotes = false;
-    char quoteChar = '\0';
-    
-    for (size_t i = 0; i < sql.length(); i++) {
-        char c = sql[i];
-        
-        if (c == '\'' || c == '"' || c == '`') {
-            if (!inQuotes) {
-                if (!currentToken.empty()) {
-                    tokens.push_back(currentToken);
-                    currentToken.clear();
-                }
-                inQuotes = true;
-                quoteChar = c;
-                currentToken += c;
-            } else if (c == quoteChar) {
-                currentToken += c;
-                tokens.push_back(currentToken);
-                currentToken.clear();
-                inQuotes = false;
-            } else {
-                currentToken += c;
-            }
-            continue;
-        }
-        
-        if (inQuotes) {
-            currentToken += c;
-            continue;
-        }
-        
-        if (std::isspace(c)) {
-            if (!currentToken.empty()) {
-                tokens.push_back(currentToken);
-                currentToken.clear();
-            }
-            continue;
-        }
-
-        if (c == ',' || c == '(' || c == ')' || c == '=' || c == ';') {
-            if (!currentToken.empty()) {
-                tokens.push_back(currentToken);
-                currentToken.clear();
-            }
-            tokens.push_back(std::string(1, c));
-            continue;
-        }
-
-        currentToken += c;
-    }
-    
-    if (!currentToken.empty()) {
-        tokens.push_back(currentToken);
-    }
-    
-    return tokens;
-}
-
-
-
-
-std::string normalizeFunctionCall2(const std::string& functionName, const std::vector<std::string>& args) {
-    std::string normalized = functionName + "(";
-    for (size_t i = 0; i < args.size(); i++) {
-        if (i > 0) normalized += ",";
-        
-        // Extract only the core tokens, ignoring whitespace
-        std::string normalizedArg;
-        std::istringstream argStream(args[i]);
-        std::string token;
-        while (argStream >> token) {
-            normalizedArg += token;
-        }
-        normalized += normalizedArg;
-    }
-    normalized += ")";
-    return normalized;
-}
-
-void processFunctionCall2(size_t& i, const std::vector<std::string>& tokens, 
-                         std::map<std::string, std::vector<std::string>>& query_tables_fields2,
-                         const std::map<std::string, std::string>& alias_to_table2,
-                         const std::map<std::string, std::vector<std::string>>& fieldMaskingPolicy,
-                         std::unordered_map<std::string, std::pair<std::string, std::string>>& field_alias_map2) {
-    
-    std::string functionName = tokens[i];
-    std::transform(functionName.begin(), functionName.end(), functionName.begin(), ::tolower);
-    openlog("AuthSQL", LOG_PID, LOG_DAEMON);
-    // Verify it's actually a function call with parentheses
-    if (i + 1 >= tokens.size() || tokens[i + 1] != "(") {
-        return;
-    }
-    
-    // Track all arguments in the function call
-    std::vector<std::string> args;
-    int depth = 0;
-    std::string currentArg;
-    
-    // Parse all arguments inside the function call
-    for (size_t j = i + 2; j < tokens.size(); j++) {
-        if (tokens[j] == "(") {
-            depth++;
-            currentArg += tokens[j] + " ";
-        }
-        else if (tokens[j] == ")") {
-            if (depth == 0) {
-                // End of function call
-                if (!currentArg.empty()) {
-                    args.push_back(currentArg);
-                }
-                i = j; // Update the main loop counter
-                break;
-            }
-            depth--;
-            currentArg += tokens[j] + " ";
-        }
-        else if (tokens[j] == "," && depth == 0) {
-            // Argument separator at the main level
-            args.push_back(currentArg);
-            currentArg = "";
-        }
-        else {
-            currentArg += tokens[j] + " ";
-        }
-    }
-    
-    // Process each argument to find field references
-    for (const auto& arg : args) {
-        // Skip literals, constants, and function keywords
-        if (arg.empty() || 
-            (arg.front() == '\'' && arg.back() == '\'') || 
-            (arg.front() == '"' && arg.back() == '"') ||
-            std::all_of(arg.begin(), arg.end(), [](char c) { return std::isdigit(c) || c == '.'; })) {
-            continue;
-        }
-        
-        // Process argument tokens to extract potential field names
-        std::istringstream argStream(arg);
-        std::string token;
-        while (argStream >> token) {
-            // Skip SQL keywords and type casts
-            std::string lowerToken = token;
-            std::transform(lowerToken.begin(), lowerToken.end(), lowerToken.begin(), ::tolower);
-            
-            const std::unordered_set<std::string> skipTokens = {
-                "as", "from", "where", "char", "signed", "unsigned", "decimal", 
-                "interval", "day", "year", "month", "hour", "minute", "second"
-            };
-            
-            if (skipTokens.count(lowerToken)) {
-                continue;
-            }
-            
-            // Check if token is a qualified field reference (table.field)
-            size_t dotPos = token.find(".");
-            if (dotPos != std::string::npos) {
-                std::string tableAlias = token.substr(0, dotPos);
-                std::string fieldName = token.substr(dotPos + 1);
-                
-                // Remove quotes if present
-                if (fieldName.length() >= 2 && 
-                    ((fieldName.front() == '"' && fieldName.back() == '"') ||
-                     (fieldName.front() == '`' && fieldName.back() == '`'))) {
-                    fieldName = fieldName.substr(1, fieldName.length() - 2);
-                }
-                
-                if (alias_to_table2.count(tableAlias)) {
-                    std::string tableName = alias_to_table2.at(tableAlias);
-                    
-                    // Check if this field should be masked according to policy
-                    if (fieldMaskingPolicy.count(tableName) && 
-                        std::find(fieldMaskingPolicy.at(tableName).begin(), 
-                                 fieldMaskingPolicy.at(tableName).end(), 
-                                 fieldName) != fieldMaskingPolicy.at(tableName).end()) {
-                        
-                        // Add to query_tables_fields2 if not already there
-                        if (std::find(query_tables_fields2[tableName].begin(), 
-                                     query_tables_fields2[tableName].end(), 
-                                     fieldName) == query_tables_fields2[tableName].end()) {
-                            query_tables_fields2[tableName].push_back(fieldName);
-                            syslog(LOG_DEBUG, "Added field from function arg: %s.%s", tableName.c_str(), fieldName.c_str());
-                        }
-                    }
-                }
-            } 
-            else {
-                // Unqualified field name - check against all tables in masking policy
-                for (const auto& [tableName, fields] : fieldMaskingPolicy) {
-                    if (std::find(fields.begin(), fields.end(), token) != fields.end()) {
-                        // This is a sensitive field that needs masking
-                        if (std::find(query_tables_fields2[tableName].begin(), 
-                                     query_tables_fields2[tableName].end(), 
-                                     token) == query_tables_fields2[tableName].end()) {
-                            query_tables_fields2[tableName].push_back(token);
-                            syslog(LOG_DEBUG, "Added unqualified field from function: %s.%s", tableName.c_str(), token.c_str());
-                        }
-                        break;
-                    }
-                }
-                
-                // For tables already in the query, check if field exists in any table
-                for (const auto& [tableName, _] : query_tables_fields2) {
-                    if (fieldMaskingPolicy.count(tableName) && 
-                        std::find(fieldMaskingPolicy.at(tableName).begin(), 
-                                 fieldMaskingPolicy.at(tableName).end(), 
-                                 token) != fieldMaskingPolicy.at(tableName).end()) {
-                        
-                        if (std::find(query_tables_fields2[tableName].begin(), 
-                                     query_tables_fields2[tableName].end(), 
-                                     token) == query_tables_fields2[tableName].end()) {
-                            query_tables_fields2[tableName].push_back(token);
-                            syslog(LOG_DEBUG, "Added field to existing table: %s.%s", tableName.c_str(), token.c_str());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Handle function result alias
-    std::string functionAlias = "";
-    if (i + 2 < tokens.size() && tokens[i + 1] == "as") {
-        functionAlias = tokens[i + 2];
-        i += 2;
-    } else if (i + 1 < tokens.size() && tokens[i + 1] != "," && 
-              tokens[i + 1] != "from" && tokens[i + 1] != "where") {
-        functionAlias = tokens[i + 1];
-        i += 1;
-    }
-    
-    // Map the function alias to the fields used inside it
-    if (!functionAlias.empty()) {
-        // For simplicity, map to the first field found in args
-        for (const auto& arg : args) {
-            std::istringstream argStream(arg);
-            std::string token;
-            while (argStream >> token) {
-                // Try to find a matching field in any table
-                for (const auto& [tableName, fields] : query_tables_fields2) {
-                    if (std::find(fields.begin(), fields.end(), token) != fields.end()) {
-                        field_alias_map2[functionAlias] = std::make_pair(tableName, token);
-                        syslog(LOG_DEBUG, "Mapped function alias to field: %s -> %s.%s", functionAlias.c_str(), tableName.c_str(), token.c_str());
-                        return; // Stop after finding first match
-                    }
-                }
-                
-                // Check qualified references
-                size_t dotPos = token.find(".");
-                if (dotPos != std::string::npos) {
-                    std::string tableAlias = token.substr(0, dotPos);
-                    std::string fieldName = token.substr(dotPos + 1);
-                    
-                    if (alias_to_table2.count(tableAlias)) {
-                        std::string tableName = alias_to_table2.at(tableAlias);
-                        field_alias_map2[functionAlias] = std::make_pair(tableName, fieldName);
-                        syslog(LOG_DEBUG, "Mapped function alias to qualified field: %s -> %s.%s", functionAlias.c_str(), tableName.c_str(), fieldName.c_str());
-                        return;
-                    }
-                }
-            }
-        }
-    }
-	else { 
-		// NEW CODE: Handle case with no explicit alias 
-		// Create a default alias based on the function name and arguments 
-		std::string exactAlias = functionName + "("; 
-		for (size_t argIdx = 0; argIdx < args.size(); argIdx++) { 
-			if (argIdx > 0) exactAlias += ","; 
-			exactAlias += args[argIdx]; 
-		} 
-		exactAlias += ")"; 
-		
-		// Create normalized version without spaces 
-		std::string normalizedAlias = functionName + "("; 
-		for (size_t argIdx = 0; argIdx < args.size(); argIdx++) { 
-			if (argIdx > 0) normalizedAlias += ","; 
-			// Remove all spaces from argument 
-			std::string normalizedArg; 
-			for (char c : args[argIdx]) { 
-				if (!std::isspace(c)) { 
-					normalizedArg += c; 
-				} 
-			} 
-			normalizedAlias += normalizedArg; 
-		} 
-		normalizedAlias += ")"; 
-			
-		// Use these aliases to map to the fields 
-		for (const auto& arg : args) { 
-			// Process the same way as you do for explicit aliases 
-			std::istringstream argStream(arg); 
-			std::string token; 
-			while (argStream >> token) { 
-				// Try to find a matching field in any table 
-				for (const auto& [tableName, fields] : query_tables_fields2) { 
-					if (std::find(fields.begin(), fields.end(), token) != fields.end()) { 
-						field_alias_map2[exactAlias] = std::make_pair(tableName, token); 
-						field_alias_map2[normalizedAlias] = std::make_pair(tableName, token); 
-						syslog(LOG_DEBUG, "Mapped function aliases to field: %s and %s -> %s.%s", exactAlias.c_str(), normalizedAlias.c_str(), tableName.c_str(), token.c_str()); 
-						return; 
-					} 
-				} 
-				
-				// Check qualified references 
-				size_t dotPos = token.find("."); 
-				if (dotPos != std::string::npos) { 
-					std::string tableAlias = token.substr(0, dotPos); 
-					std::string fieldName = token.substr(dotPos + 1); 
-					
-					if (alias_to_table2.count(tableAlias)) { 
-						std::string tableName = alias_to_table2.at(tableAlias); 
-						field_alias_map2[exactAlias] = std::make_pair(tableName, fieldName); 
-						field_alias_map2[normalizedAlias] = std::make_pair(tableName, fieldName); 
-						syslog(LOG_DEBUG, "Mapped function aliases to qualified field: %s and %s -> %s.%s", exactAlias.c_str(), normalizedAlias.c_str(), tableName.c_str(), fieldName.c_str());
-						return; 
-					} 
-				} 
-			} 
-		} 
-	}
-}
-std::string normalizeColumnName3(const std::string& columnName) {
-    std::string normalized;
-    // Remove all whitespace
-    for (char c : columnName) {
-        if (!std::isspace(c)) {
-            normalized += c;
-        }
-    }
-    return normalized;
-}
-
-void extractTableAndFieldsFromQuery2(const std::string& query, const unsigned long& sessionI,const std::string& username,const std::string& db_name) {
-    alias_to_table2.clear();
-    std::string nm = std::to_string(sessionI);
-	std::string db = db_name;
-	std::string user = username;
-    auto fieldMaskingPolicy=getMaskingPolicyForSession2(user,db,std::to_string(sessionI));
-    query_tables_fields2.clear();
-    field_alias_map2.clear(); 
-    current_query_table2.clear();
-    
-    // Never print the query: its text can carry anything the client sent, secrets included
-    // (test/authnull/authnull_no_data_in_logs_test.cpp).
-
-    std::string normalizedQuery = query;
-    std::transform(normalizedQuery.begin(), normalizedQuery.end(), normalizedQuery.begin(), ::tolower);
-
-    std::vector<std::string> tokens = tokenizeSQL2(normalizedQuery);
-    
-    // Parser state
-    bool foundSelect = false;
-    bool foundFrom = false;
-    bool inSelectClause = false;
-    bool inFromClause = false;
-    bool expectingTableName = false;
-    bool expectingAlias = false;
-    bool isStarQuery = false;
-    int parenLevel = 0;
-    bool inSubquery = false;
-    bool hasAggregates = false;
-    
-    std::string lastTable = "";
-    std::string lastKeyword = "";
-    std::string lastField = "";
-    std::vector<std::pair<std::string, std::string>> selectFields;
-    std::unordered_map<std::string, std::vector<std::string>> subqueryTables;
-    std::string currentSubqueryAlias = "";
-
-    const std::unordered_set<std::string> sqlKeywords = {
-        "select", "from", "where", "join", "inner", "left", "right", "full", "cross", "outer", "on", 
-        "order", "by", "group", "having", "limit", "offset", "union", "as", "and", "or", "not",
-        "case", "when", "then", "else", "end", "distinct", "all", "any", "between", "in", "like", 
-    };
-    
-    const std::unordered_set<std::string> aggregateFunctions = {
-        "sum", "count", "avg", "min", "max", "abs", "upper",
-		"lower", "length", "trim", "ceil", "floor", "date",
-		"year", "month", "day", "stddev", "variance", "cast",
-		"convert"
-    };
-    
-    for (size_t i = 0; i < tokens.size(); i++) {
-        std::string token = tokens[i];
-        std::string lowerToken = token;
-        std::transform(lowerToken.begin(), lowerToken.end(), lowerToken.begin(), ::tolower);
-		if (i + 1 < tokens.size() && tokens[i + 1] == "(") {
-			// Process functions properly
-			processFunctionCall2(i, tokens, query_tables_fields2, alias_to_table2, fieldMaskingPolicy, field_alias_map2);
-			continue;
-		}
-        if (token == "(") {
-            parenLevel++;
-
-            // Enhanced subquery detection and handling
-            if (i + 1 < tokens.size() && tokens[i + 1] == "select") {
-                inSubquery = true;
-                
-                std::string subqueryAlias = "";
-                std::vector<std::pair<std::string, std::string>> subqueryFields;
-                std::vector<std::string> subqueryTablesList;
-                
-                int subqueryStart = i;
-                int subqueryParenLevel = 1;
-                int subquerySelectIndex = i + 1;
-                int subqueryFromIndex = -1;
-                int subqueryEndIndex = -1;
-
-                // First scan to find the boundaries of the subquery
-                for (size_t j = i + 1; j < tokens.size(); j++) {
-                    if (tokens[j] == "(") {
-                        subqueryParenLevel++;
-                    } else if (tokens[j] == ")") {
-                        subqueryParenLevel--;
-                        if (subqueryParenLevel == 0) {
-                            subqueryEndIndex = j;
-                            break;
-                        }
-                    } else if (tokens[j] == "from" && subqueryFromIndex == -1) {
-                        subqueryFromIndex = j;
-                    }
-                }
-
-                if (subqueryEndIndex > 0 && subqueryFromIndex > 0) {
-                    // Process the subquery's SELECT clause
-                    std::string subquerySelectedField = "";
-                    for (size_t j = subquerySelectIndex + 1; j < subqueryFromIndex; j++) {
-                        if (tokens[j] != "," && !sqlKeywords.count(tokens[j])) {
-                            size_t dotPos = tokens[j].find(".");
-                            if (dotPos != std::string::npos) {
-                                std::string tableAlias = tokens[j].substr(0, dotPos);
-                                std::string fieldName = tokens[j].substr(dotPos + 1);
-                                
-                                if (fieldName.length() >= 2 && 
-                                    ((fieldName.front() == '"' && fieldName.back() == '"') ||
-                                     (fieldName.front() == '`' && fieldName.back() == '`'))) {
-                                    fieldName = fieldName.substr(1, fieldName.length() - 2);
-                                }
-                                
-                                subquerySelectedField = fieldName;
-                                subqueryFields.push_back(std::make_pair(tableAlias, fieldName));
-                            } else {
-                                subquerySelectedField = tokens[j];
-                                subqueryFields.push_back(std::make_pair("", tokens[j]));
-                            }
-                        }
-                    }
-
-                    // Process the subquery's FROM clause
-                    std::string subqueryTable = "";
-                    for (size_t j = subqueryFromIndex + 1; j < subqueryEndIndex; j++) {
-                        if (tokens[j] != "where" && tokens[j] != "and" && tokens[j] != "or" && 
-                            tokens[j] != "," && !sqlKeywords.count(tokens[j]) && 
-                            tokens[j] != "(" && tokens[j] != ")") {
-                            
-                            if (subqueryTable.empty()) {
-                                subqueryTable = tokens[j];
-                                
-                                if (subqueryTable.length() >= 2 && 
-                                    ((subqueryTable.front() == '"' && subqueryTable.back() == '"') ||
-                                     (subqueryTable.front() == '`' && subqueryTable.back() == '`'))) {
-                                    subqueryTable = subqueryTable.substr(1, subqueryTable.length() - 2);
-                                }
-                                
-                                subqueryTablesList.push_back(subqueryTable);
-                                
-                                // Initialize tables in query_tables_fields2 if they don't exist
-                                if (query_tables_fields2.find(subqueryTable) == query_tables_fields2.end()) {
-                                    query_tables_fields2[subqueryTable] = {};
-                                }
-                                
-                                std::cout << "[DEBUG] Added subquery table: " << subqueryTable << std::endl;
-                            }
-                            
-                            // Check for table alias
-                            if (j + 1 < subqueryEndIndex) {
-                                if (tokens[j + 1] == "as" && j + 2 < subqueryEndIndex) {
-                                    alias_to_table2[tokens[j + 2]] = subqueryTable;
-                                    std::cout << "[DEBUG] Added subquery table alias: " << tokens[j + 2] 
-                                              << " -> " << subqueryTable << std::endl;
-                                    j += 2;
-                                } else if (!sqlKeywords.count(tokens[j + 1]) && 
-                                           tokens[j + 1] != "where" && tokens[j + 1] != "," && 
-                                           tokens[j + 1] != ")" && tokens[j + 1] != "(") {
-                                    alias_to_table2[tokens[j + 1]] = subqueryTable;
-                                    std::cout << "[DEBUG] Added subquery table alias: " << tokens[j + 1] 
-                                              << " -> " << subqueryTable << std::endl;
-                                    j += 1;
-                                }
-                            }
-                        }
-                    }
-
-                    // Check for AS clause after the closing parenthesis
-                    if (subqueryEndIndex + 2 < tokens.size() && tokens[subqueryEndIndex + 1] == "as") {
-                        subqueryAlias = tokens[subqueryEndIndex + 2];
-                        i = subqueryEndIndex + 2; // Skip to after the alias
-                    } else if (subqueryEndIndex + 1 < tokens.size() && 
-                               !sqlKeywords.count(tokens[subqueryEndIndex + 1]) && 
-                               tokens[subqueryEndIndex + 1] != "," && 
-                               tokens[subqueryEndIndex + 1] != ")") {
-                        subqueryAlias = tokens[subqueryEndIndex + 1];
-                        i = subqueryEndIndex + 1; // Skip to after the alias
-                    } else {
-                        i = subqueryEndIndex; // Skip to the closing parenthesis
-                    }
-
-                    // Map subquery alias to its source field
-                    if (!subqueryAlias.empty() && !subqueryTablesList.empty() && !subqueryFields.empty()) {
-                        for (const auto& fieldPair : subqueryFields) {
-                            std::string tableAlias = fieldPair.first;
-                            std::string fieldName = fieldPair.second;
-                            
-                            if (!tableAlias.empty() && alias_to_table2.count(tableAlias)) {
-                                std::string actualTable = alias_to_table2[tableAlias];
-                                
-                                // Add the field to the table's fields list
-                                if (std::find(query_tables_fields2[actualTable].begin(), 
-                                             query_tables_fields2[actualTable].end(), 
-                                             fieldName) == query_tables_fields2[actualTable].end()) {
-                                    query_tables_fields2[actualTable].push_back(fieldName);
-                                    std::cout << "[DEBUG] Added field from subquery: " << actualTable 
-                                              << "." << fieldName << std::endl;
-                                }
-                                
-                                // Map the subquery alias to this table and field
-                                field_alias_map2[subqueryAlias] = std::make_pair(actualTable, fieldName);
-                                std::cout << "[DEBUG] Added subquery alias mapping: " << subqueryAlias 
-                                          << " -> " << actualTable << "." << fieldName << std::endl;
-                            } else {
-                                // If we don't have a table alias, try to find the right table
-                                for (const auto& sqTable : subqueryTablesList) {
-                                    if (fieldMaskingPolicy.count(sqTable)) {
-                                        for (const auto& maskField : fieldMaskingPolicy[sqTable]) {
-                                            if (maskField == fieldName) {
-                                                // Add field to table's fields list
-                                                if (std::find(query_tables_fields2[sqTable].begin(), 
-                                                            query_tables_fields2[sqTable].end(), 
-                                                            fieldName) == query_tables_fields2[sqTable].end()) {
-                                                    query_tables_fields2[sqTable].push_back(fieldName);
-                                                    std::cout << "[DEBUG] Added field from subquery by mask policy match: " 
-                                                              << sqTable << "." << fieldName << std::endl;
-                                                }
-                                                
-                                                // Map the subquery alias
-                                                field_alias_map2[subqueryAlias] = std::make_pair(sqTable, fieldName);
-                                                std::cout << "[DEBUG] Added subquery alias mapping by mask policy: " 
-                                                          << subqueryAlias << " -> " << sqTable << "." << fieldName << std::endl;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                                // If we still don't have a mapping, use the first table
-                                if (field_alias_map2.find(subqueryAlias) == field_alias_map2.end() && 
-                                    !subqueryTablesList.empty()) {
-                                    std::string firstTable = subqueryTablesList[0];
-                                    if (std::find(query_tables_fields2[firstTable].begin(), 
-                                                query_tables_fields2[firstTable].end(), 
-                                                fieldName) == query_tables_fields2[firstTable].end()) {
-                                        query_tables_fields2[firstTable].push_back(fieldName);
-                                    }
-                                    
-                                    field_alias_map2[subqueryAlias] = std::make_pair(firstTable, fieldName);
-                                    std::cout << "[DEBUG] Added default subquery alias mapping: " << subqueryAlias 
-                                              << " -> " << firstTable << "." << fieldName << std::endl;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Store subquery tables for later reference
-                    if (!subqueryAlias.empty()) {
-                        subqueryTables[subqueryAlias] = subqueryTablesList;
-                    }
-                }
-            }
-            continue;
-        }
-        
-        if (token == ")") {
-            parenLevel--;
-            if (parenLevel < 0) parenLevel = 0; 
-            continue;
-        }
-
-        if (token == "," || token == ";" || token == "=") {
-            continue;
-        }
-        
-        // Process SQL keywords
-        if (sqlKeywords.count(lowerToken)) {
-            if (lowerToken == "select") {
-                foundSelect = true;
-                inSelectClause = true;
-                inFromClause = false;
-            }
-            else if (lowerToken == "from") {
-                foundFrom = true;
-                inSelectClause = false;
-                inFromClause = true;
-                expectingTableName = true;
-            }
-            else if (lowerToken == "join" || lowerToken == "inner" || lowerToken == "left" || 
-                     lowerToken == "right" || lowerToken == "full" || lowerToken == "cross") {
-                if (i + 1 < tokens.size() && tokens[i + 1] == "join") {
-                    continue;
-                }
-                expectingTableName = true;
-            }
-            else if (lowerToken == "as") {
-                expectingAlias = true;
-            }
-            
-            lastKeyword = lowerToken;
-            continue;
-        }
-        
-        // Process SELECT clause elements
-        if (inSelectClause) {
-            if (token == "*") {
-                isStarQuery = true;
-                continue;
-            }
-
-            bool isAggregate = false;
-            std::string aggregateField = "";
-			// In the SELECT clause processing section, where aggregate functions are handled
-			if (i + 1 < tokens.size() && tokens[i + 1] == "(") {
-				std::string funcName = lowerToken;
-				if (aggregateFunctions.count(funcName)) {
-					hasAggregates = true;
-					isAggregate = true;
-
-					// Keep track of the function name for later reference
-					std::string aggregateFunc = funcName;
-					
-					int nestedParens = 0;
-					std::string aggregateField = "";
-					std::string aggregateTable = "";
-					
-					// Process the content inside the aggregate function
-					for (size_t j = i + 2; j < tokens.size(); j++) {
-						if (tokens[j] == "(") nestedParens++;
-						else if (tokens[j] == ")") {
-							if (nestedParens == 0) {
-								i = j; 
-								break;
-							}
-							nestedParens--;
-						}
-						else if (nestedParens == 0 && tokens[j] != ",") {
-							aggregateField = tokens[j];
-							
-							size_t dotPos = aggregateField.find(".");
-							if (dotPos != std::string::npos) {
-								std::string tableAlias = aggregateField.substr(0, dotPos);
-								std::string fieldName = aggregateField.substr(dotPos + 1);
-								
-								if (fieldName.length() >= 2 && 
-									((fieldName.front() == '"' && fieldName.back() == '"') ||
-									(fieldName.front() == '`' && fieldName.back() == '`'))) {
-									fieldName = fieldName.substr(1, fieldName.length() - 2);
-								}
-								
-								if (alias_to_table2.count(tableAlias)) {
-									aggregateTable = alias_to_table2[tableAlias];
-									
-									// Check if this is a sensitive field that needs masking
-									if (fieldMaskingPolicy.count(aggregateTable) &&
-										std::find(fieldMaskingPolicy[aggregateTable].begin(),
-												fieldMaskingPolicy[aggregateTable].end(),
-												fieldName) != fieldMaskingPolicy[aggregateTable].end()) {
-										query_tables_fields2[aggregateTable].push_back(fieldName);
-										std::cout << "[DEBUG] Added sensitive aggregate field: " << aggregateTable 
-												<< "." << fieldName << std::endl;
-									} else {
-										// Add it regardless to ensure proper tracking
-										query_tables_fields2[aggregateTable].push_back(fieldName);
-										std::cout << "[DEBUG] Added aggregate field: " << aggregateTable 
-												<< "." << fieldName << std::endl;
-									}
-								}
-							} else {
-								// This is an unqualified field name, need to determine which table it belongs to
-								for (const auto& [tableName, fields] : fieldMaskingPolicy) {
-									if (std::find(fields.begin(), fields.end(), aggregateField) != fields.end()) {
-										// This is a sensitive field in this table
-										aggregateTable = tableName;
-										query_tables_fields2[tableName].push_back(aggregateField);
-										std::cout << "[DEBUG] Added unqualified sensitive aggregate field: " 
-												<< tableName << "." << aggregateField << std::endl;
-										break;
-									}
-								}
-								
-								// If we still don't know the table but have tables in the query
-								if (aggregateTable.empty() && !query_tables_fields2.empty()) {
-									// Assign to the first table in the query as a best guess
-									auto it = query_tables_fields2.begin();
-									aggregateTable = it->first;
-									query_tables_fields2[aggregateTable].push_back(aggregateField);
-									std::cout << "[DEBUG] Assigned unqualified aggregate field to first table: " 
-											<< aggregateTable << "." << aggregateField << std::endl;
-								}
-							}
-						}
-					}
-					
-					// Handle the alias for the aggregate expression
-					std::string alias = "";
-					if (i + 2 < tokens.size() && tokens[i + 1] == "as" && i + 2 < tokens.size()) {
-						alias = tokens[i + 2];
-						i += 2;
-					} else if (i + 1 < tokens.size() && tokens[i + 1] != "," && 
-							!sqlKeywords.count(tokens[i + 1]) && tokens[i + 1] != "from") {
-						alias = tokens[i + 1];
-						i += 1;
-					} else {
-						// No explicit alias - create an implicit one based on the function and field
-						alias = aggregateFunc + "_" + (!aggregateField.empty() ? aggregateField : "expr");
-						std::cout << "[DEBUG] Created implicit aggregate alias: " << alias << std::endl;
-					}
-					
-					// Map the alias to the table and field
-					if (!aggregateField.empty()) {
-						field_alias_map2[alias] = std::make_pair(aggregateTable, aggregateField);
-						std::cout << "[DEBUG] Added aggregate field alias mapping: " << alias << " -> " 
-								<< aggregateTable << "." << aggregateField << std::endl;
-						
-						// Check for sensitive aggregates by field name
-						const std::unordered_set<std::string> sensitiveFields = {
-							"balance", "amount", "salary", "ssn", "credit_card", "password", "enrollment_date"
-						};
-						
-						if (sensitiveFields.count(aggregateField) || 
-							(aggregateFunc == "sum" || aggregateFunc == "avg" || aggregateFunc == "max")) {
-							std::cout << "[DEBUG] Marked sensitive aggregate: " << alias << std::endl;
-						}
-					}
-					
-					continue;
-				}
-			}
-            
-            size_t dotPos = token.find(".");
-            if (dotPos != std::string::npos) {
-                std::string tableAlias = token.substr(0, dotPos);
-                std::string colName = token.substr(dotPos + 1);
-                
-                if (tableAlias.front() == '"' && tableAlias.back() == '"') {
-                    tableAlias = tableAlias.substr(1, tableAlias.length() - 2);
-                }
-                if (colName.front() == '"' && colName.back() == '"') {
-                    colName = colName.substr(1, colName.length() - 2);
-                }
-                
-                // Check if this is actually a table alias
-                if (alias_to_table2.count(tableAlias)) {
-                    if (colName == "*") {
-                        std::string realTable = alias_to_table2[tableAlias];
-                        if (fieldMaskingPolicy.count(realTable)) {
-                            query_tables_fields2[realTable] = fieldMaskingPolicy[realTable];
-                            std::cout << "[DEBUG] Added all masking fields for aliased table: " 
-                                      << realTable << std::endl;
-                        }
-                    } else {
-                        std::string realTable = alias_to_table2[tableAlias];
-                        query_tables_fields2[realTable].push_back(colName);
-                        lastTable = realTable;
-                        lastField = colName;
-                        std::cout << "[DEBUG] Added explicitly referenced field: " 
-                                  << realTable << "." << colName << std::endl;
-                    }
-                } else {
-                    // This might be a qualified name that's not using an alias
-                    std::cout << "[DEBUG] Unrecognized table alias: " << tableAlias << std::endl;
-                }
-                
-                std::string fieldAlias = "";
-                if (i + 2 < tokens.size() && tokens[i + 1] == "as") {
-                    fieldAlias = tokens[i + 2];
-                    i += 2;
-                } else if (i + 1 < tokens.size() && tokens[i + 1] != "," && !sqlKeywords.count(tokens[i + 1])) {
-                    fieldAlias = tokens[i + 1];
-                    i += 1; 
-                }
-                
-                if (!fieldAlias.empty() && alias_to_table2.count(tableAlias)) {
-                    field_alias_map2[fieldAlias] = std::make_pair(alias_to_table2[tableAlias], colName);
-                    std::cout << "[DEBUG] Added field alias mapping: " << fieldAlias << " -> " 
-                              << alias_to_table2[tableAlias] << "." << colName << std::endl;
-                }
-            } else {
-                std::string fieldName = token;
-                if (fieldName.length() >= 2 && 
-                    ((fieldName.front() == '"' && fieldName.back() == '"') ||
-                     (fieldName.front() == '`' && fieldName.back() == '`'))) {
-                    fieldName = fieldName.substr(1, fieldName.length() - 2);
-                }
-                
-                lastField = fieldName;
-                
-                std::string fieldAlias = "";
-                if (i + 2 < tokens.size() && tokens[i + 1] == "as") {
-                    fieldAlias = tokens[i + 2];
-                    i += 2; 
-                } else if (i + 1 < tokens.size() && tokens[i + 1] != "," && !sqlKeywords.count(tokens[i + 1])) {
-                    fieldAlias = tokens[i + 1];
-                    i += 1; 
-                }
-                
-                selectFields.push_back(std::make_pair(fieldName, fieldAlias));
-            }
-            continue;
-        }
-        
-        // Process FROM clause elements
-        if (inFromClause) {
-            if (expectingTableName) {
-                if (i > 0 && tokens[i - 1] == ")") {
-                    lastTable = "SUBQUERY"; 
-                } else {
-                    lastTable = token;
-   
-                    if (lastTable.length() >= 2 &&
-                        ((lastTable.front() == '"' && lastTable.back() == '"') ||
-                         (lastTable.front() == '`' && lastTable.back() == '`'))) {
-                        lastTable = lastTable.substr(1, lastTable.length() - 2);
-                    }
-                    
-                    size_t dotPos = lastTable.find(".");
-                    if (dotPos != std::string::npos) {
-                        lastTable = lastTable.substr(dotPos + 1);
-                    }
-                }
-                
-                current_query_table2 = lastTable;
-                query_tables_fields2[lastTable] = {};
-                std::cout << "[DEBUG] Added table: " << lastTable << std::endl;
-                
-                expectingTableName = false;
-
-                if (i + 1 < tokens.size()) {
-                    if (tokens[i + 1] == "as") {
-                        expectingAlias = true;
-                        i++; 
-                    } else if (!sqlKeywords.count(tokens[i + 1]) && 
-                              tokens[i + 1] != "," && 
-                              tokens[i + 1] != "(" && 
-                              tokens[i + 1] != ")") {
-                        std::string alias = tokens[i + 1];
-                        alias_to_table2[alias] = lastTable;
-                        std::cout << "[DEBUG] Added table alias: " << alias << " -> " << lastTable << std::endl;
-                        i++; 
-                    }
-                }
-                continue;
-            }
-            
-            if (expectingAlias) {
-                alias_to_table2[token] = lastTable;
-                std::cout << "[DEBUG] Added table alias: " << token << " -> " << lastTable << std::endl;
-                expectingAlias = false;
-                continue;
-            }
-        }
-    }
-    
-    // Process WHERE clause for additional field references
-    if (foundFrom) {
-        for (size_t i = 0; i < tokens.size(); i++) {
-            if (tokens[i] == "where" && i + 1 < tokens.size()) {
-                // Scan the WHERE clause for field references
-                for (size_t j = i + 1; j < tokens.size(); j++) {
-                    if (tokens[j] == "select") break; // Don't process into a nested query
-                    
-                    size_t dotPos = tokens[j].find(".");
-                    if (dotPos != std::string::npos) {
-                        std::string tableAlias = tokens[j].substr(0, dotPos);
-                        std::string fieldName = tokens[j].substr(dotPos + 1);
-                        
-                        if (alias_to_table2.count(tableAlias)) {
-                            std::string tableName = alias_to_table2[tableAlias];
-                            if (fieldMaskingPolicy.count(tableName) && 
-                                std::find(fieldMaskingPolicy[tableName].begin(), 
-                                        fieldMaskingPolicy[tableName].end(), 
-                                        fieldName) != fieldMaskingPolicy[tableName].end()) {
-                                
-                                if (std::find(query_tables_fields2[tableName].begin(),
-                                           query_tables_fields2[tableName].end(),
-                                           fieldName) == query_tables_fields2[tableName].end()) {
-                                    query_tables_fields2[tableName].push_back(fieldName);
-                                    std::cout << "[DEBUG] Added field from WHERE clause: " 
-                                              << tableName << "." << fieldName << std::endl;
-                                }
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-        }
-    }
-    
-    if (isStarQuery) {
-        for (const auto& [table, _] : query_tables_fields2) {
-            if (fieldMaskingPolicy.count(table)) {
-                query_tables_fields2[table] = fieldMaskingPolicy[table];
-                std::cout << "[DEBUG] Added all masking fields for table: " << table << std::endl;
-            }
-        }
-    }
-
-    for (const auto& [field, alias] : selectFields) {
-        bool fieldAssigned = false;
-
-        for (const auto& [tablealias, tableName] : alias_to_table2) {
-            if (fieldMaskingPolicy.count(tableName)) {
-                for (const auto& maskField : fieldMaskingPolicy[tableName]) {
-                    if (maskField == field) {
-                        if (std::find(query_tables_fields2[tableName].begin(),
-                                   query_tables_fields2[tableName].end(),
-                                   field) == query_tables_fields2[tableName].end()) {
-                            query_tables_fields2[tableName].push_back(field);
-                        }
-                        fieldAssigned = true;
-                        std::cout << "[DEBUG] Assigned field " << field << " to table " << tableName << std::endl;
-
-                        if (!alias.empty()) {
-                            field_alias_map2[alias] = std::make_pair(tableName, field);
-                            std::cout << "[DEBUG] Added field alias mapping: " << alias << " -> " 
-                                     << tableName << "." << field << std::endl;
-                        }
-                        break;
-                    }
-                }
-            }
-            
-            if (fieldAssigned) break;
-        }
-
-        if (!fieldAssigned) {
-            for (const auto& [tableName, maskFields] : fieldMaskingPolicy) {
-                for (const auto& maskField : maskFields) {
-                    if (maskField == field) {
-                        for (const auto& [table, _] : query_tables_fields2) {
-                            if (std::find(query_tables_fields2[table].begin(),
-                                       query_tables_fields2[table].end(),
-                                       field) == query_tables_fields2[table].end()) {
-                                query_tables_fields2[table].push_back(field);
-                                std::cout << "[DEBUG] Added sensitive field " << field << " to table " << table << std::endl;
-                            }
-                        }
-
-                        if (!alias.empty()) {
-                            field_alias_map2[alias] = std::make_pair(tableName, field);
-                            std::cout << "[DEBUG] Added sensitive field alias mapping: " << alias << " -> " 
-                                     << tableName << "." << field << std::endl;
-                        }
-                        fieldAssigned = true;
-                        break;
-                    }
-                }
-                if (fieldAssigned) break;
-            }
-        }
-        
-        if (!alias.empty() && !fieldAssigned) {
-            field_alias_map2[alias] = std::make_pair("", field);
-            std::cout << "[DEBUG] Added generic field alias mapping: " << alias << " -> " << field << std::endl;
-        }
-    }
-    
-    if (hasAggregates) {
-        const std::unordered_set<std::string> sensitiveAggregateAliases = {
-            "sum", "count", "avg", "min", "max", "abs", "upper",
-			"lower", "length", "trim", "ceil", "floor", "date",
-			"year", "month", "day", "stddev", "variance", "cast",
-			"convert"
-        };
-        
-        for (const auto& alias : sensitiveAggregateAliases) {
-            if (field_alias_map2.count(alias) == 0) {
-                field_alias_map2[alias] = std::make_pair("AGGREGATE", "balance");
-                std::cout << "[DEBUG] Added sensitive aggregate alias: " << alias << std::endl;
-            }
-        }
-    }
-	// Add special handling for specific aggregate patterns that need masking
-	if (hasAggregates) {
-		// Check for unmasked sensitive aggregates
-		for (const auto& [table, fields] : fieldMaskingPolicy) {
-			for (const auto& sensitiveField : fields) {
-				// Look for any implicit or explicit alias that references this sensitive field
-				for (const auto& [alias, tableField] : field_alias_map2) {
-					if (tableField.second == sensitiveField) {
-						std::cout << "[DEBUG] Found alias referencing sensitive field: " 
-								<< alias << " -> " << tableField.first << "." << tableField.second << std::endl;
-						
-						// Ensure the field is in the query_tables_fields2
-						if (std::find(query_tables_fields2[tableField.first].begin(),
-								query_tables_fields2[tableField.first].end(),
-								sensitiveField) == query_tables_fields2[tableField.first].end()) {
-							query_tables_fields2[tableField.first].push_back(sensitiveField);
-							std::cout << "[DEBUG] Added missing sensitive field for masking: " 
-									<< tableField.first << "." << sensitiveField << std::endl;
-						}
-					}
-				}
-				
-				// Special handling for common aggregate patterns without explicit aliases
-				for (const auto& func : aggregateFunctions) {
-					std::string implicitAlias = func + "_" + sensitiveField;
-					if (field_alias_map2.find(implicitAlias) == field_alias_map2.end()) {
-						// Check if this field might be used in an implicit aggregate
-						for (const auto& [queryTable, queryFields] : query_tables_fields2) {
-							if (std::find(queryFields.begin(), queryFields.end(), sensitiveField) != queryFields.end()) {
-								field_alias_map2[implicitAlias] = std::make_pair(queryTable, sensitiveField);
-								std::cout << "[DEBUG] Added implicit sensitive aggregate mapping: " 
-										<< implicitAlias << " -> " << queryTable << "." << sensitiveField << std::endl;
-								break;
-							}
-						}
-					}
-				}
-			}
-		}
-		
-		// Check for common sensitive aggregate aliases that might not be explicitly mapped
-		const std::unordered_set<std::string> sensitiveAggregateAliases = {
-			"sum", "count", "avg", "min", "max", "abs", "upper",
-			"lower", "length", "trim", "ceil", "floor", "date",
-			"year", "month", "day", "stddev", "variance", "cast",
-			"convert"
-		};
-		
-		for (const auto& alias : sensitiveAggregateAliases) {
-			if (field_alias_map2.count(alias) == 0) {
-				// Try to find a matching sensitive field in our masking policies
-				bool found = false;
-				for (const auto& [table, fields] : fieldMaskingPolicy) {
-					for (const auto& field : fields) {
-						if (alias.find(field) != std::string::npos) {
-							field_alias_map2[alias] = std::make_pair(table, field);
-							std::cout << "[DEBUG] Added sensitive aggregate alias by name match: " 
-									<< alias << " -> " << table << "." << field << std::endl;
-							
-							// Ensure the field is in query_tables_fields2
-							if (std::find(query_tables_fields2[table].begin(),
-									query_tables_fields2[table].end(),
-									field) == query_tables_fields2[table].end()) {
-								query_tables_fields2[table].push_back(field);
-							}
-							
-							found = true;
-							break;
-						}
-					}
-					if (found) break;
-				}
-				
-				// If no specific match, make a generic assignment for known sensitive aliases
-				if (!found) {
-					// Find a suitable table and field
-					std::string targetTable = "";
-					std::string targetField = "";
-					
-					
-					// Find a table that has this field in the masking policy
-					for (const auto& [table, fields] : fieldMaskingPolicy) {
-						if (std::find(fields.begin(), fields.end(), targetField) != fields.end()) {
-							targetTable = table;
-							break;
-						}
-					}
-					
-					// If no table found, use the first table in the query
-					if (targetTable.empty() && !query_tables_fields2.empty()) {
-						targetTable = query_tables_fields2.begin()->first;
-					}
-					
-					if (!targetTable.empty()) {
-						field_alias_map2[alias] = std::make_pair(targetTable, targetField);
-						std::cout << "[DEBUG] Added generic sensitive aggregate alias: " 
-								<< alias << " -> " << targetTable << "." << targetField << std::endl;
-						
-						// Ensure the field is in query_tables_fields2
-						if (std::find(query_tables_fields2[targetTable].begin(),
-								query_tables_fields2[targetTable].end(),
-								targetField) == query_tables_fields2[targetTable].end()) {
-							query_tables_fields2[targetTable].push_back(targetField);
-						}
-					}
-				}
-			}
-		}
-	}
-
-    std::cout << "[DEBUG] Extracted Tables:\n";
-    for (const auto& [table, fields] : query_tables_fields2) {
-        std::cout << "Table: " << table << "\n";
-        for (const auto& field : fields) {
-            std::cout << "  Field: " << field << "\n";
-        }
-    }
-    std::cout << "[DEBUG] Alias Mapping:\n";
-    for (const auto& entry : alias_to_table2) {
-        std::cout << "  Alias: " << entry.first << " → Table: " << entry.second << "\n";
-    }
-    std::cout << "[DEBUG] Field Alias Mapping:\n";
-    for (const auto& [alias, tablefield] : field_alias_map2) {
-        std::cout << "  Field Alias: " << alias << " → " 
-                  << tablefield.first << "." << tablefield.second << "\n";
-    }
-}
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1856,7 +720,21 @@ PgSQL_Session::~PgSQL_Session() {
 		l_free(authnull_mfa_pkt.size, authnull_mfa_pkt.ptr);
 		authnull_mfa_pkt.ptr = NULL;
 	}
-	// authnull_mfa_call, if still running, finishes on its own thread and frees itself.
+	// A login still waiting on its MFA push when the session ends (the client hung up, or it was
+	// killed): cancel the call, so the request to authn-service is dropped and an approval given
+	// after this is not taken for a login that went through (authnull_curl_cancel.h). The call
+	// finishes on its own thread and frees itself.
+	if (authnull_mfa_call) {
+		bool pending = !authnull_mfa_call->done();
+		authnull_mfa_call->cancel();
+		// authnull_mfa_username is "<user>,<token>": the token is a credential and is not logged.
+		std::string u = authnull_mfa_username.substr(0, authnull_mfa_username.find(','));
+		const char* d = (client_myds && client_myds->myconn) ? client_myds->myconn->conn_params.get_value(PG_DATABASE) : NULL;
+		const char* what = pending ? "client disconnected while MFA was pending; the call to authn-service is cancelled"
+			: "client disconnected before its MFA answer was read; the answer is discarded";
+		syslog(LOG_WARNING, "[authnull] %s (user '%s' db '%s', PgSQL session %u)", what, u.c_str(), d ? d : "", thread_session_id);
+		proxy_info("AuthNull: %s (user '%s' db '%s', PgSQL session %u)\n", what, u.c_str(), d ? d : "", thread_session_id);
+	}
 
 	// The session's AuthNull limits, if it had any (authnull_session_limits.h).
 	authnullSessionLimits().erase(thread_session_id);
@@ -3971,6 +2849,14 @@ __get_pkts_from_client:
 	// if client_myds == NULL , it is a mirror
 	//     process mirror only status==WAITING_CLIENT_DATA
 	for (unsigned int j = 0; j < (client_myds->PSarrayIN ? client_myds->PSarrayIN->len : 0) || (mirror == true && status == WAITING_CLIENT_DATA);) {
+		// A client that sends its next message before the answer to the last (the extended protocol
+		// lets it) waits for that answer here, rather than being disconnected: the messages stay
+		// queued until the session is back to WAITING_CLIENT_DATA.
+		if (mirror == false && status != WAITING_CLIENT_DATA && status != CONNECTING_CLIENT && status != FAST_FORWARD &&
+			status != session_status___NONE &&
+			!(status == CONNECTING_SERVER && !previous_status.empty() && previous_status.top() == FAST_FORWARD)) {
+			break;
+		}
 		if (mirror == false) {
 			client_myds->PSarrayIN->remove_index(0, &pkt);
 		}
@@ -4106,237 +2992,25 @@ __get_pkts_from_client:
 					}
 					else {
 						char command = c = *((unsigned char*)pkt.ptr + 0);
+						// An extended-protocol run ends with its query; one cut short (a lost backend) ends here.
+						if (authnull_ext.running()) {
+							authnull_ext.abandon();
+						}
 						switch (command) {
 						case 'Q':
-						{
-							__sync_add_and_fetch(&thread->status_variables.stvar[st_var_queries], 1);
-							if (session_type == PROXYSQL_SESSION_PGSQL) {
-								bool rc_break = false;
-								bool lock_hostgroup = false;
-								if (session_fast_forward == false) {
-									// Note: CurrentQuery sees the query as sent by the client.
-									// shortly after, the packets it used to contain the query will be deallocated
-									CurrentQuery.begin((unsigned char*)pkt.ptr, pkt.size, true);
-								}
-								rc_break = handler_special_queries(&pkt);
-								if (rc_break == true) {
-									if (mirror == false) {
-										// track also special queries
-										//RequestEnd(NULL);
-										// we moved this inside handler_special_queries()
-										// because a pointer was becoming invalid
-										break;
-									}
-									else {
-										handler_ret = -1;
-										return handler_ret;
-									}
-								}
-								timespec begint;
-								timespec endt;
-								if (thread->variables.stats_time_query_processor) {
-									clock_gettime(CLOCK_THREAD_CPUTIME_ID, &begint);
-								}
-								std::string query;
-								if (pkt.ptr && pkt.size > sizeof(mysql_hdr) + 1) {
-									query = std::string((char*)pkt.ptr + sizeof(mysql_hdr) + 1, pkt.size - sizeof(mysql_hdr) - 1);
-								} else {
-									query = "unknown";
-								}
-								std::string db_name = "unknown";
-								std::string user = "unknown";
-								if (client_myds) {
-									if (client_myds->myconn) {
-										if (client_myds->myconn->userinfo) {
-											db_name = client_myds->myconn->userinfo->schemaname;
-											user = client_myds->myconn->userinfo->username;
-										}
-									}
-								}
-								std::string seid = std::to_string(this->thread_session_id); 
-								// A session past the policy's maximum length runs nothing more, even between
-								// two maintenance passes (authnull_session_limits.h).
-								{
-									AuthnullSessionLimit limit;
-									if (authnullSessionLimits().get(this->thread_session_id, limit)) {
-										std::string why = authnullSessionLimitReason(limit, (long long)time(nullptr), 0);
-										if (!why.empty()) {
-											syslog(LOG_WARNING, "[authnull] ending session %u of %s on %s: %s", this->thread_session_id, user.c_str(), db_name.c_str(), why.c_str());
-											client_myds->DSS=STATE_QUERY_SENT_NET;
-											std::string msg = "Session ended: " + why;
-											authnull_refused = true;
-											authnull_query_error = msg;
-											client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"57P01", (char *)msg.c_str(), true);
-											RequestEnd(NULL);
-											l_free(pkt.size, pkt.ptr);
-											killed = true;
-											break;
-										}
-									}
-								}
-								bool result = checkPermission2(user, query, db_name,seid);
-								if (result == false){
-									syslog(LOG_INFO, "[DEBUG] Query Not OK");
-									client_myds->DSS=STATE_QUERY_SENT_NET;
-									char *err_msg = (char *)"Access denied: Query not permitted for this user";
-									authnull_refused = true;
-									authnull_query_error = err_msg;
-									client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
-									RequestEnd(NULL);
-									l_free(pkt.size, pkt.ptr);
-									break; 
-								}
-								unsigned long session_id = this->thread_session_id;
-								extractTableAndFieldsFromQuery2(query, session_id, user, db_name);
-								authnull_mask_policy = getMaskingPolicyForSession2(user, db_name, std::to_string(session_id));
-								authnull_mask_query = query;
-								syslog(LOG_DEBUG, "[DEBUG] process_query using session ID: %lu", session_id);
-								qpo = GloPgQPro->process_query(this, pkt.ptr, pkt.size, &CurrentQuery);
-								if (thread->variables.stats_time_query_processor) {
-									clock_gettime(CLOCK_THREAD_CPUTIME_ID, &endt);
-									thread->status_variables.stvar[st_var_query_processor_time] = thread->status_variables.stvar[st_var_query_processor_time] +
-										(endt.tv_sec * 1000000000 + endt.tv_nsec) -
-										(begint.tv_sec * 1000000000 + begint.tv_nsec);
-								}
-								assert(qpo);	// GloPgQPro->process_mysql_query() should always return a qpo
-								// This block was moved from 'handler_special_queries' to support
-								// handling of 'USE' statements which are preceded by a comment.
-								// For more context check issue: #3493.
-								// ===================================================
-								if (session_type != PROXYSQL_SESSION_CLICKHOUSE) {
-									const char* qd = CurrentQuery.get_digest_text();
-									bool use_db_query = false;
-
-									if (qd != NULL) {
-										if (
-											(strncasecmp((char*)"USE", qd, 3) == 0)
-											&&
-											(
-												(strncasecmp((char*)"USE ", qd, 4) == 0)
-												||
-												(strncasecmp((char*)"USE`", qd, 4) == 0)
-												)
-											) {
-											use_db_query = true;
-										}
-									}
-									else {
-										if (pkt.size > (5 + 4) && strncasecmp((char*)"USE ", (char*)pkt.ptr + 5, 4) == 0) {
-											use_db_query = true;
-										}
-									}
-
-									if (use_db_query) {
-										handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_USE_DB(&pkt);
-
-										if (mirror == false) {
-											break;
-										}
-										else {
-											handler_ret = -1;
-											return handler_ret;
-										}
-									}
-								}
-								// ===================================================
-								if (qpo->max_lag_ms >= 0) {
-									thread->status_variables.stvar[st_var_queries_with_max_lag_ms]++;
-								}
-								rc_break = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_qpo(&pkt, &lock_hostgroup);
-								if (mirror == false && rc_break == false) {
-									if (pgsql_thread___automatic_detect_sqli) {
-										if (handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_detect_SQLi()) {
-											handler_ret = -1;
-											return handler_ret;
-										}
-									}
-								}
-								if (rc_break == true) {
-									if (mirror == false) {
-										break;
-									}
-									else {
-										handler_ret = -1;
-										return handler_ret;
-									}
-								}
-								if (mirror == false) {
-									handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY___create_mirror_session();
-								}
-
-								if (autocommit_on_hostgroup >= 0) {
-								}
-								if (pgsql_thread___set_query_lock_on_hostgroup == 1) { // algorithm introduced in 2.0.6
-									if (locked_on_hostgroup < 0) {
-										if (lock_hostgroup) {
-											// we are locking on hostgroup now
-											if (qpo->destination_hostgroup >= 0) {
-												if (transaction_persistent_hostgroup == -1) {
-													current_hostgroup = qpo->destination_hostgroup;
-												}
-											}
-											locked_on_hostgroup = current_hostgroup;
-											thread->status_variables.stvar[st_var_hostgroup_locked]++;
-											thread->status_variables.stvar[st_var_hostgroup_locked_set_cmds]++;
-										}
-									}
-									if (locked_on_hostgroup >= 0) {
-										if (current_hostgroup != locked_on_hostgroup) {
-											client_myds->DSS = STATE_QUERY_SENT_NET;
-											int l = CurrentQuery.QueryLength;
-											char* end = (char*)"";
-											if (l > 256) {
-												l = 253;
-												end = (char*)"...";
-											}
-											string nqn = string((char*)CurrentQuery.QueryPointer, l);
-											char* err_msg = (char*)"Session trying to reach HG %d while locked on HG %d . Rejecting query: %s";
-											char* buf = (char*)malloc(strlen(err_msg) + strlen(nqn.c_str()) + strlen(end) + 64);
-											sprintf(buf, err_msg, current_hostgroup, locked_on_hostgroup, nqn.c_str(), end);
-											client_myds->myprot.generate_error_packet(true, true, buf, PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION,
-												false, true);
-											thread->status_variables.stvar[st_var_hostgroup_locked_queries]++;
-											RequestEnd(NULL);
-											free(buf);
-											l_free(pkt.size, pkt.ptr);
-											break;
-										}
-									}
-								}
-								mybe = find_or_create_backend(current_hostgroup);
-								status = PROCESSING_QUERY;
-								// set query retries
-								mybe->server_myds->query_retries_on_failure = pgsql_thread___query_retries_on_failure;
-								// if a number of retries is set in mysql_query_rules, that takes priority
-								if (qpo) {
-									if (qpo->retries >= 0) {
-										mybe->server_myds->query_retries_on_failure = qpo->retries;
-									}
-								}
-								mybe->server_myds->connect_retries_on_failure = pgsql_thread___connect_retries_on_failure;
-								mybe->server_myds->wait_until = 0;
-								pause_until = 0;
-								if (pgsql_thread___default_query_delay) {
-									pause_until = thread->curtime + pgsql_thread___default_query_delay * 1000;
-								}
-								if (qpo) {
-									if (qpo->delay > 0) {
-										if (pause_until == 0)
-											pause_until = thread->curtime;
-										pause_until += qpo->delay * 1000;
-									}
-								}
-
-
-								proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Received query to be processed with MariaDB Client library\n");
-								mybe->server_myds->killed_at = 0;
-								mybe->server_myds->kill_type = 0;
-								mybe->server_myds->mysql_real_query.init(&pkt);
-								mybe->server_myds->statuses.questions++;
-								client_myds->setDSS_STATE_QUERY_SENT_NET();
+							// DEALLOCATE of a statement the extended protocol prepared is answered here
+							// (authnull_pg_extended.h): the server never saw it.
+							if (authnull_ext.deallocate(std::string((char*)pkt.ptr + 5, pkt.size > 5 ? pkt.size - 5 : 0))) {
+								std::string done = authnull_pgx::message('C', std::string("DEALLOCATE", 11));
+								authnull_send(done + authnull_pgx::message('Z', std::string(1, authnull_txn_state())));
+								l_free(pkt.size, pkt.ptr);
+								break;
 							}
-						}
-						break;
+							if (handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY(pkt) == -1) {
+								handler_ret = -1;
+								return handler_ret;
+							}
+							break;
 						case 'X':
 							proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Got QUIT packet\n");
 							if (GloPgSQL_Logger) { GloPgSQL_Logger->log_audit_entry(PROXYSQL_MYSQL_AUTH_QUIT, this, NULL); }
@@ -4348,10 +3022,15 @@ __get_pkts_from_client:
 						case 'B':
 						case 'D':
 						case 'E':
-							//ignore
-							l_free(pkt.size, pkt.ptr);
-							continue;
+						case 'C':
+						case 'H':
 						case 'S':
+							// The extended query protocol (authnull_pg_extended.h).
+							if (authnull_extended_message(pkt) == -1) {
+								handler_ret = -1;
+								return handler_ret;
+							}
+							break;
 						default:
 							proxy_error("Not implemented yet. Message type:'%c'\n", c);
 							client_myds->setDSS_STATE_QUERY_SENT_NET();
@@ -4626,6 +3305,296 @@ __get_pkts_from_client:
 	return handler_ret;
 }
 // end of PgSQL_Session::get_pkts_from_client()
+
+// handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY runs a query ('Q', or the SQL an
+// extended-protocol Sync runs, authnull_pg_extended.h): the AuthNull checks, then the backend.
+// Returns -1 to close the session.
+int PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY(PtrSize_t& pkt) {
+	int handler_ret = 0;
+	__sync_add_and_fetch(&thread->status_variables.stvar[st_var_queries], 1);
+	if (session_type == PROXYSQL_SESSION_PGSQL) {
+		bool rc_break = false;
+		bool lock_hostgroup = false;
+		if (session_fast_forward == false) {
+			// Note: CurrentQuery sees the query as sent by the client.
+			// shortly after, the packets it used to contain the query will be deallocated
+			CurrentQuery.begin((unsigned char*)pkt.ptr, pkt.size, true);
+		}
+		rc_break = handler_special_queries(&pkt);
+		if (rc_break == true) {
+			if (mirror == false) {
+				// track also special queries
+				//RequestEnd(NULL);
+				// we moved this inside handler_special_queries()
+				// because a pointer was becoming invalid
+				return 0;
+			}
+			else {
+				handler_ret = -1;
+				return handler_ret;
+			}
+		}
+		timespec begint;
+		timespec endt;
+		if (thread->variables.stats_time_query_processor) {
+			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &begint);
+		}
+		std::string query;
+		if (pkt.ptr && pkt.size > sizeof(mysql_hdr) + 1) {
+			query = std::string((char*)pkt.ptr + sizeof(mysql_hdr) + 1, pkt.size - sizeof(mysql_hdr) - 1);
+		} else {
+			query = "unknown";
+		}
+		std::string db_name = "unknown";
+		std::string user = "unknown";
+		if (client_myds) {
+			if (client_myds->myconn) {
+				if (client_myds->myconn->userinfo) {
+					db_name = client_myds->myconn->userinfo->schemaname;
+					user = client_myds->myconn->userinfo->username;
+				}
+			}
+		}
+		std::string seid = std::to_string(this->thread_session_id); 
+		// A session past the policy's maximum length runs nothing more, even between
+		// two maintenance passes (authnull_session_limits.h).
+		{
+			AuthnullSessionLimit limit;
+			if (authnullSessionLimits().get(this->thread_session_id, limit)) {
+				std::string why = authnullSessionLimitReason(limit, (long long)time(nullptr), 0);
+				if (!why.empty()) {
+					syslog(LOG_WARNING, "[authnull] ending session %u of %s on %s: %s", this->thread_session_id, user.c_str(), db_name.c_str(), why.c_str());
+					client_myds->DSS=STATE_QUERY_SENT_NET;
+					std::string msg = "Session ended: " + why;
+					authnull_refused = true;
+					authnull_query_error = msg;
+					client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"57P01", (char *)msg.c_str(), true);
+					RequestEnd(NULL);
+					l_free(pkt.size, pkt.ptr);
+					killed = true;
+					return 0;
+				}
+			}
+		}
+		// Field masking: the result set decides the masked columns from these, and a query
+		// that would test a masked value without returning it is refused like one the
+		// policy does not permit (authnull_masking.h).
+		authnull_mask_policy = getMaskingPolicyForSession2(user, db_name, seid);
+		authnull_mask_query = query;
+		bool result = checkPermission2(user, query, db_name,seid) &&
+			!authnullMaskRefused(authnull_mask_policy, query, AuthnullDialect::Postgres);
+		if (result == false){
+			syslog(LOG_INFO, "[DEBUG] Query Not OK");
+			client_myds->DSS=STATE_QUERY_SENT_NET;
+			char *err_msg = (char *)"Access denied: Query not permitted for this user";
+			authnull_refused = true;
+			authnull_query_error = err_msg;
+			client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
+			RequestEnd(NULL);
+			l_free(pkt.size, pkt.ptr);
+			return 0; 
+		}
+		unsigned long session_id = this->thread_session_id;
+		syslog(LOG_DEBUG, "[DEBUG] process_query using session ID: %lu", session_id);
+		qpo = GloPgQPro->process_query(this, pkt.ptr, pkt.size, &CurrentQuery);
+		if (thread->variables.stats_time_query_processor) {
+			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &endt);
+			thread->status_variables.stvar[st_var_query_processor_time] = thread->status_variables.stvar[st_var_query_processor_time] +
+				(endt.tv_sec * 1000000000 + endt.tv_nsec) -
+				(begint.tv_sec * 1000000000 + begint.tv_nsec);
+		}
+		assert(qpo);	// GloPgQPro->process_mysql_query() should always return a qpo
+		// This block was moved from 'handler_special_queries' to support
+		// handling of 'USE' statements which are preceded by a comment.
+		// For more context check issue: #3493.
+		// ===================================================
+		if (session_type != PROXYSQL_SESSION_CLICKHOUSE) {
+			const char* qd = CurrentQuery.get_digest_text();
+			bool use_db_query = false;
+
+			if (qd != NULL) {
+				if (
+					(strncasecmp((char*)"USE", qd, 3) == 0)
+					&&
+					(
+						(strncasecmp((char*)"USE ", qd, 4) == 0)
+						||
+						(strncasecmp((char*)"USE`", qd, 4) == 0)
+						)
+					) {
+					use_db_query = true;
+				}
+			}
+			else {
+				if (pkt.size > (5 + 4) && strncasecmp((char*)"USE ", (char*)pkt.ptr + 5, 4) == 0) {
+					use_db_query = true;
+				}
+			}
+
+			if (use_db_query) {
+				handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_USE_DB(&pkt);
+
+				if (mirror == false) {
+					return 0;
+				}
+				else {
+					handler_ret = -1;
+					return handler_ret;
+				}
+			}
+		}
+		// ===================================================
+		if (qpo->max_lag_ms >= 0) {
+			thread->status_variables.stvar[st_var_queries_with_max_lag_ms]++;
+		}
+		rc_break = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_qpo(&pkt, &lock_hostgroup);
+		if (mirror == false && rc_break == false) {
+			if (pgsql_thread___automatic_detect_sqli) {
+				if (handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_detect_SQLi()) {
+					handler_ret = -1;
+					return handler_ret;
+				}
+			}
+		}
+		if (rc_break == true) {
+			if (mirror == false) {
+				return 0;
+			}
+			else {
+				handler_ret = -1;
+				return handler_ret;
+			}
+		}
+		if (mirror == false) {
+			handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY___create_mirror_session();
+		}
+
+		if (autocommit_on_hostgroup >= 0) {
+		}
+		if (pgsql_thread___set_query_lock_on_hostgroup == 1) { // algorithm introduced in 2.0.6
+			if (locked_on_hostgroup < 0) {
+				if (lock_hostgroup) {
+					// we are locking on hostgroup now
+					if (qpo->destination_hostgroup >= 0) {
+						if (transaction_persistent_hostgroup == -1) {
+							current_hostgroup = qpo->destination_hostgroup;
+						}
+					}
+					locked_on_hostgroup = current_hostgroup;
+					thread->status_variables.stvar[st_var_hostgroup_locked]++;
+					thread->status_variables.stvar[st_var_hostgroup_locked_set_cmds]++;
+				}
+			}
+			if (locked_on_hostgroup >= 0) {
+				if (current_hostgroup != locked_on_hostgroup) {
+					client_myds->DSS = STATE_QUERY_SENT_NET;
+					int l = CurrentQuery.QueryLength;
+					char* end = (char*)"";
+					if (l > 256) {
+						l = 253;
+						end = (char*)"...";
+					}
+					string nqn = string((char*)CurrentQuery.QueryPointer, l);
+					char* err_msg = (char*)"Session trying to reach HG %d while locked on HG %d . Rejecting query: %s";
+					char* buf = (char*)malloc(strlen(err_msg) + strlen(nqn.c_str()) + strlen(end) + 64);
+					sprintf(buf, err_msg, current_hostgroup, locked_on_hostgroup, nqn.c_str(), end);
+					client_myds->myprot.generate_error_packet(true, true, buf, PGSQL_ERROR_CODES::ERRCODE_RAISE_EXCEPTION,
+						false, true);
+					thread->status_variables.stvar[st_var_hostgroup_locked_queries]++;
+					RequestEnd(NULL);
+					free(buf);
+					l_free(pkt.size, pkt.ptr);
+					return 0;
+				}
+			}
+		}
+		mybe = find_or_create_backend(current_hostgroup);
+		status = PROCESSING_QUERY;
+		// set query retries
+		mybe->server_myds->query_retries_on_failure = pgsql_thread___query_retries_on_failure;
+		// if a number of retries is set in mysql_query_rules, that takes priority
+		if (qpo) {
+			if (qpo->retries >= 0) {
+				mybe->server_myds->query_retries_on_failure = qpo->retries;
+			}
+		}
+		mybe->server_myds->connect_retries_on_failure = pgsql_thread___connect_retries_on_failure;
+		mybe->server_myds->wait_until = 0;
+		pause_until = 0;
+		if (pgsql_thread___default_query_delay) {
+			pause_until = thread->curtime + pgsql_thread___default_query_delay * 1000;
+		}
+		if (qpo) {
+			if (qpo->delay > 0) {
+				if (pause_until == 0)
+					pause_until = thread->curtime;
+				pause_until += qpo->delay * 1000;
+			}
+		}
+
+
+		proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Received query to be processed with MariaDB Client library\n");
+		mybe->server_myds->killed_at = 0;
+		mybe->server_myds->kill_type = 0;
+		mybe->server_myds->mysql_real_query.init(&pkt);
+		mybe->server_myds->statuses.questions++;
+		client_myds->setDSS_STATE_QUERY_SENT_NET();
+	}
+	return 0;
+}
+
+// authnull_extended_message answers one message of the extended query protocol, and at Sync runs
+// the Executes as a simple query (authnull_pg_extended.h). Returns -1 to close the session.
+int PgSQL_Session::authnull_extended_message(PtrSize_t& pkt) {
+	const unsigned char* p = (const unsigned char*)pkt.ptr;
+	const bool queued = client_myds->PSarrayIN && client_myds->PSarrayIN->len > 0;
+	const AuthnullPgExtended::Action a = authnull_ext.on((char)p[0], p + 5, pkt.size > 5 ? pkt.size - 5 : 0, queued);
+	l_free(pkt.size, pkt.ptr);
+	// Like the server, nothing goes out before a Flush or Sync: a pipelining client (libpq's
+	// pipeline mode) reads the answers of a batch together.
+	if (a == AuthnullPgExtended::Wait) return 0;
+	std::string out = authnull_ext.takeAnswer();
+	if (a == AuthnullPgExtended::Answer && authnull_ext.wantsReady()) {
+		out += authnull_pgx::message('Z', std::string(1, authnull_txn_state()));
+	}
+	authnull_send(out);
+	if (a != AuthnullPgExtended::Run) return 0;
+	const std::string sql = authnull_ext.sql();
+	PtrSize_t q;
+	q.size = 5 + sql.size() + 1;
+	q.ptr = l_alloc(q.size);
+	unsigned char* b = (unsigned char*)q.ptr;
+	const uint32_t len = htonl(q.size - 1);
+	b[0] = 'Q';
+	memcpy(b + 1, &len, 4);
+	memcpy(b + 5, sql.data(), sql.size());
+	b[q.size - 1] = '\0';
+	const int rc = handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QUERY(q);
+	if (status != PROCESSING_QUERY) {
+		authnull_ext.abandon(); // answered without the backend: refused, or by the proxy
+	}
+	return rc;
+}
+
+// authnull_txn_state: the transaction status a ReadyForQuery the proxy writes itself reports.
+char PgSQL_Session::authnull_txn_state() {
+	for (unsigned int i = 0; mybes && i < mybes->len; i++) {
+		PgSQL_Backend* be = (PgSQL_Backend*)mybes->index(i);
+		if (be->server_myds && be->server_myds->myconn && be->server_myds->myconn->pgsql_conn) {
+			const PGTransactionStatusType s = be->server_myds->myconn->get_pg_transaction_status();
+			if (s == PQTRANS_INERROR) return 'E';
+			if (s == PQTRANS_INTRANS) return 'T';
+		}
+	}
+	return 'I';
+}
+
+void PgSQL_Session::authnull_send(const std::string& bytes) {
+	if (bytes.empty()) return;
+	void* p = l_alloc(bytes.size());
+	memcpy(p, bytes.data(), bytes.size());
+	client_myds->PSarrayOUT->add(p, bytes.size());
+}
 
 
 // this function returns:

@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -136,11 +137,11 @@ inline std::string authnullMaskSecrets(const std::string& sql) {
 	return out;
 }
 
-// authnullMaskErrorValues hides the values a MySQL error message quotes ("Duplicate entry
-// 'jane@acme.com' for key ..."): every quoted run becomes '***'. PostgreSQL keeps such values in
-// DETAIL, which is never recorded; MySQL has only the one message. A quote right after a letter or
-// digit is an apostrophe ("doesn't"), not a value.
-inline std::string authnullMaskErrorValues(const std::string& msg) {
+namespace authnull_recording_detail {
+
+// maskQuoted: every quoted run becomes '***'. A quote right after a letter or digit is an
+// apostrophe ("doesn't"), not a value.
+inline std::string maskQuoted(const std::string& msg) {
 	std::string out;
 	out.reserve(msg.size());
 	size_t i = 0;
@@ -164,6 +165,41 @@ inline std::string authnullMaskErrorValues(const std::string& msg) {
 		i = (j < msg.size()) ? j + 1 : msg.size();
 	}
 	return out;
+}
+
+} // namespace authnull_recording_detail
+
+// authnullMaskErrorValues hides the values a MySQL error message (code, message) quotes and keeps
+// the names, which say what went wrong. PostgreSQL keeps such values in DETAIL, which is never
+// recorded; MySQL has only the one message.
+//   - Names only, kept as they are: 1044, 1045 access denied for user (to database); 1048 column
+//     cannot be null; 1049 unknown database; 1050, 1051 table exists / unknown; 1054 unknown column;
+//     1060, 1061 duplicate column / key name; 1091 can't drop; 1109 unknown table; 1142 command
+//     denied; 1146 table doesn't exist; 1305 does not exist; 1356 view invalid; 1364 no default;
+//     1406 data too long for column.
+//   - A value, masked, and names, kept: 1062 "Duplicate entry '<value>' for key 'k'"; 1292, 1366
+//     "Incorrect <type> value: '<value>' for column 'c' at row n" (1292 also "Truncated incorrect
+//     <type> value: '<value>'"); 1064 "... near '<SQL>' at line n". The value runs from the
+//     lead-in to the last tail, so a quote inside it ("O'Brien") does not end it.
+//   - Any other code, or one of these in a shape not recognised: every quoted run is masked.
+inline std::string authnullMaskErrorValues(int code, const std::string& msg) {
+	static const std::set<int> namesOnly = {
+		1044, 1045, 1048, 1049, 1050, 1051, 1054, 1060, 1061, 1091, 1109, 1142, 1146, 1305, 1356, 1364, 1406,
+	};
+	if (namesOnly.count(code)) return msg;
+	std::string lead, tail;
+	if (code == 1062) { lead = "Duplicate entry '"; tail = "' for key '"; }
+	else if (code == 1064) { lead = "near '"; tail = "' at line "; }
+	else if (code == 1292 || code == 1366) {
+		lead = "value: '";
+		tail = msg.find("' for column '") != std::string::npos ? "' for column '" : "'";
+	}
+	if (!lead.empty()) {
+		size_t a = msg.find(lead);
+		size_t b = a == std::string::npos ? std::string::npos : msg.rfind(tail);
+		if (b != std::string::npos && b >= a + lead.size()) return msg.substr(0, a + lead.size()) + "***" + msg.substr(b);
+	}
+	return authnull_recording_detail::maskQuoted(msg);
 }
 
 // authnullRecordFromJSON: whether the policy asks for the session to be recorded

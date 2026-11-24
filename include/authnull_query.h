@@ -32,8 +32,9 @@
 //   EXPLAIN ANALYZE <stmt> runs <stmt>; plain EXPLAIN is SELECT
 //   INSERT (with ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: + UPDATE), UPDATE, DELETE
 //   MERGE: the actions it names; REPLACE: INSERT, DELETE; UPSERT: INSERT, UPDATE
-//   LOAD, COPY ... FROM                                                              INSERT
-//   COPY ... TO STDOUT is an export, SELECT; any other COPY                          EXECUTE
+//   LOAD, COPY ... FROM a server file                                                INSERT
+//   COPY ... TO STDOUT / FROM STDIN (streams through the proxy, which cannot relay it) COPY_STREAM
+//   any other COPY                                                                   EXECUTE
 //   TRUNCATE                                                                         TRUNCATE
 //   client housekeeping (below)                                                      nothing
 //   anything else (DDL, GRANT, DO, CALL, SET ROLE, ...)                              EXECUTE
@@ -44,7 +45,8 @@
 // to set up a connection. Transactions (BEGIN / START TRANSACTION, COMMIT, END, ROLLBACK, ABORT,
 // SAVEPOINT, RELEASE -- not their PREPARED forms); on Postgres, SET / RESET of the settings clients
 // use (clientSettings: DateStyle, TimeZone, search_path, ...) and set_config of one written out,
-// SET TRANSACTION, SET SESSION CHARACTERISTICS, SET CONSTRAINTS, DISCARD; on MySQL, SET of session
+// SET TRANSACTION, SET SESSION CHARACTERISTICS, SET CONSTRAINTS, DISCARD, DEALLOCATE [PREPARE] ALL
+// (not DEALLOCATE <name>); on MySQL, SET of session
 // and user variables, SET NAMES, SET TRANSACTION, USE. Still EXECUTE: what changes who the session
 // is or reaches past it -- SET ROLE, SESSION AUTHORIZATION, any other Postgres setting (e.g.
 // default_transaction_read_only), MySQL SET GLOBAL / PERSIST / PASSWORD / ROLE / DEFAULT ROLE /
@@ -68,11 +70,12 @@ enum class AuthnullDialect { Postgres, MySQL };
 
 namespace authnull_query_detail {
 
-enum class TokKind { Word, QuotedIdent, LParen, RParen, Str };
+enum class TokKind { Word, QuotedIdent, LParen, RParen, Str, Punct };
 
 struct Tok {
 	TokKind kind;
 	std::string text; // Word: upper case; QuotedIdent and Str: lower case
+	bool dquoted = false; // a MySQL Str written "..." (a column name under ANSI_QUOTES)
 };
 
 inline bool isWordChar(char c) {
@@ -90,8 +93,9 @@ inline std::string lower(std::string s) {
 }
 
 // lex splits sql into statements of tokens. Returns false when a string, identifier or comment is
-// not terminated -- the caller refuses such a query.
-inline bool lex(const std::string& sql, AuthnullDialect d, std::vector<std::vector<Tok>>& out) {
+// not terminated -- the caller refuses such a query. Other punctuation (, . = * ...) is dropped,
+// or kept as Punct tokens when punct is set (field masking: "amount, status" is not an alias).
+inline bool lex(const std::string& sql, AuthnullDialect d, std::vector<std::vector<Tok>>& out, bool punct = false) {
 	const bool pg = d == AuthnullDialect::Postgres;
 	const size_t n = sql.size();
 	std::vector<Tok> cur;
@@ -187,7 +191,7 @@ inline bool lex(const std::string& sql, AuthnullDialect d, std::vector<std::vect
 				text += sql[i++];
 			}
 			if (!closed) return false;
-			cur.push_back({TokKind::Str, lower(text)});
+			cur.push_back({TokKind::Str, lower(text), q == '"'});
 			continue;
 		}
 
@@ -223,6 +227,7 @@ inline bool lex(const std::string& sql, AuthnullDialect d, std::vector<std::vect
 			continue;
 		}
 
+		if (punct) cur.push_back({TokKind::Punct, std::string(1, c)});
 		i++; // operators and other punctuation
 	}
 	if (inExecComment) return false;
@@ -378,15 +383,17 @@ inline void classify(const std::vector<Tok>& t, AuthnullDialect d, std::set<std:
 		return;
 	}
 	if (k == "COPY") {
-		bool from = false, to = false, stdout_ = false;
+		bool from = false, stream = false;
 		for (const auto& x : t) {
 			if (x.kind != TokKind::Word) continue;
 			if (x.text == "FROM") from = true;
-			if (x.text == "TO") to = true;
-			if (x.text == "STDOUT") stdout_ = true;
+			if (x.text == "STDOUT" || x.text == "STDIN") stream = true;
 		}
-		if (from) need.insert("INSERT");
-		else if (to && stdout_) need.insert("SELECT");
+		// The proxy cannot relay the COPY sub-protocol: the backend connection asserts on it
+		// (PgSQL_Connection.cpp, PGRES_COPY_*), which took the whole proxy down for any user allowed
+		// to SELECT. A COPY through the connection needs a privilege no policy grants.
+		if (stream) need.insert("COPY_STREAM");
+		else if (from) need.insert("INSERT");
 		else need.insert("EXECUTE");
 		return;
 	}
@@ -430,6 +437,12 @@ inline bool classifyHousekeeping(const std::vector<Tok>& t, size_t first, Authnu
 	if (k == "SAVEPOINT" || k == "RELEASE") return true;
 	if (!pg && k == "USE") return true;
 	if (pg && k == "DISCARD") return true;
+	// DEALLOCATE ALL drops only what DISCARD ALL drops too, and psycopg 3 (pgAdmin 4) sends it on its
+	// own after ROLLBACK, DISCARD ALL, DROP or ALTER once it holds a prepared statement.
+	if (pg && k == "DEALLOCATE") {
+		const size_t i = isWord(t, rest, "PREPARE") ? rest + 1 : rest;
+		return isWord(t, i, "ALL") && i + 1 == t.size();
+	}
 	if (pg && k == "RESET") {
 		if (isWord(t, rest, "ALL")) return true;
 		if (rest < t.size() && t[rest].kind == TokKind::Word && clientSettings().count(lower(t[rest].text))) return true;

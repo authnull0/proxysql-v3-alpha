@@ -15,6 +15,7 @@
 #include "PgSQL_Protocol.h"
 #include <syslog.h>
 #include "authnull_caller_token_curl.h"
+#include "authnull_curl_cancel.h"
 extern "C" {
 #include "usual/time.h"
 }
@@ -648,7 +649,11 @@ void PgSQL_Protocol::load_conn_parameters(pgsql_hdr* pkt, bool startup)
 		read_pos += pos;
 
 		//slog_debug(server, "S: param: %s = %s", key, val);
-		(*myds)->myconn->conn_params.set_value(key, val);
+		if (!(*myds)->myconn->conn_params.set_value(key, val)) {
+			// Not kept: ProxySQL does not forward startup settings to the backend (its connections
+			// are opened from its own conninfo), so an unknown one is dropped. The value is not logged.
+			proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session=%p , DS=%p. startup parameter '%s' ignored\n", (*myds)->sess, (*myds), key);
+		}
 	}
 }
 
@@ -1186,9 +1191,12 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 						
 						CURL* h = curl;
 						struct curl_slist* hl = headers;
-						mfa_call = AuthnullMfaCall::start([h, hl, body, caller_token]() {
+						// The call gives up once the session cancels it: the client went away, so
+						// nobody will read the answer (authnull_curl_cancel.h).
+						mfa_call = AuthnullMfaCall::start_cancellable([h, hl, body, caller_token](const std::atomic<bool>& cancelled) {
 							AuthnullMfaAnswer a;
 							a.caller_token = caller_token;
+							authnullCurlCancelOn(h, &cancelled);
 							a.curl_code = (int)curl_easy_perform(h);
 							curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &a.http_code);
 							a.body = std::move(*body);
@@ -2501,7 +2509,43 @@ unsigned int PgSQL_Query_Result::add_row_description(const PGresult* result) {
 		}
 		authnull_mask = authnullMaskColumns(sess->authnull_mask_policy, cols, sess->authnull_mask_query);
 	}
+	if (authnull_pgx::Extended* ext = authnull_ext()) {
+		authnull_put(ext->onRowDescription(authnull_take_last(res)));
+	}
 	return res;
+}
+
+authnull_pgx::Extended* PgSQL_Query_Result::authnull_ext() {
+	PgSQL_Session* sess = (proto && myds) ? myds->sess : NULL;
+	return (sess && sess->authnull_ext.running()) ? &sess->authnull_ext : NULL;
+}
+
+// authnull_take_last takes back the message of size bytes just written: the end of the buffer, or,
+// when it did not fit there, the last packet.
+std::string PgSQL_Query_Result::authnull_take_last(unsigned int size) {
+	std::string m;
+	if (buffer_used >= size) {
+		m.assign((const char*)buffer + buffer_used - size, size);
+		buffer_used -= size;
+	} else if (PSarrayOUT.len) {
+		PtrSize_t pkt;
+		PSarrayOUT.remove_index(PSarrayOUT.len - 1, &pkt);
+		m.assign((const char*)pkt.ptr, pkt.size);
+		l_free(pkt.size, pkt.ptr);
+	}
+	resultset_size -= (m.size() <= resultset_size ? m.size() : resultset_size);
+	return m;
+}
+
+void PgSQL_Query_Result::authnull_put(const std::string& bytes) {
+	if (bytes.empty()) return;
+	unsigned char* p = buffer_reserve_space(bytes.size());
+	if (p == NULL) {
+		p = (unsigned char*)l_alloc(bytes.size());
+		PSarrayOUT.add(p, bytes.size());
+	}
+	memcpy(p, bytes.data(), bytes.size());
+	resultset_size += bytes.size();
 }
 
 unsigned int PgSQL_Query_Result::add_row(const PGresult* result) {
@@ -2521,8 +2565,12 @@ unsigned int PgSQL_Query_Result::add_row(const PSresult* result) {
 unsigned int PgSQL_Query_Result::add_error(const PGresult* result) {
 	unsigned int size = 0;
 
+	authnull_pgx::Extended* ext = authnull_ext();
 	if (result) {
 		size = proto->copy_error_to_PgSQL_Query_Result(false, this, result);
+		if (ext) {
+			authnull_put(ext->onError(authnull_take_last(size)));
+		}
 		PgHGM->p_update_pgsql_error_counter(p_pgsql_error_type::proxysql, conn->parent->myhgc->hid, conn->parent->address, conn->parent->port, 1907);
 	}
 	else {
@@ -2544,8 +2592,13 @@ unsigned int PgSQL_Query_Result::add_error(const PGresult* result) {
 			assert(0); // should never reach here
 		}
 
-		PSarrayOUT.add(pkt.ptr, pkt.size);
-		resultset_size += pkt.size;
+		if (ext) {
+			authnull_put(ext->onError(std::string((const char*)pkt.ptr, pkt.size)));
+			l_free(pkt.size, pkt.ptr);
+		} else {
+			PSarrayOUT.add(pkt.ptr, pkt.size);
+			resultset_size += pkt.size;
+		}
 		size = pkt.size;
 	}
 
@@ -2556,19 +2609,23 @@ unsigned int PgSQL_Query_Result::add_error(const PGresult* result) {
 unsigned int PgSQL_Query_Result::add_empty_query_response(const PGresult* result) {
 	const unsigned int bytes = proto->copy_empty_query_response_to_PgSQL_Query_Result(false, this, result);
 	result_packet_type |= PGSQL_QUERY_RESULT_EMPTY;
+	if (authnull_pgx::Extended* ext = authnull_ext()) {
+		authnull_put(ext->onComplete(authnull_take_last(bytes)));
+	}
 	return bytes;
 }
 
 unsigned int PgSQL_Query_Result::add_ready_status(PGTransactionStatusType txn_status) {
 	const unsigned int bytes = proto->copy_ready_status_to_PgSQL_Query_Result(false, this, txn_status);
+	if (authnull_pgx::Extended* ext = authnull_ext()) {
+		authnull_put(ext->onReady(authnull_take_last(bytes)));
+	}
 	buffer_to_PSarrayOut();
 	result_packet_type |= PGSQL_QUERY_RESULT_READY;
 	return bytes;
 }
 
 bool PgSQL_Query_Result::get_resultset(PtrSizeArray* PSarrayFinal) {
-    syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Starting get_resultset");
-
     transfer_started = true;
 
     // Ready packet confirms that the result is complete
@@ -2581,49 +2638,7 @@ bool PgSQL_Query_Result::get_resultset(PtrSizeArray* PSarrayFinal) {
     }
 
     if (proto) {
-        syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Dumping PSarrayOUT Contents Before Copying to PSarrayFinal (PSarrayOUT.len = %u)", PSarrayOUT.len);
-        for (unsigned int i = 0; i < PSarrayOUT.len; ++i) {
-            PtrSize_t* pkt = PSarrayOUT.index(i);
-            if (pkt && pkt->ptr && pkt->size > 0) {
-                std::string data_str;
-                // Try to interpret the packet as a data row ('D')
-                if (((char*)pkt->ptr)[0] == 'D' && pkt->size > 6) {
-                    unsigned short num_fields = ntohs(*(unsigned short*)((char*)pkt->ptr + 5));
-                    unsigned char* data_ptr = (unsigned char*)pkt->ptr + 7;
-                    data_str += "Data Row: ";
-                    for (int f = 0; f < num_fields; ++f) {
-                        int len = ntohl(*(int*)data_ptr);
-                        data_ptr += 4;
-                        if (len > 0) {
-                            data_str += std::string((char*)data_ptr, len) + "\t";
-                            data_ptr += len;
-                        } else if (len == -1) {
-                            data_str += "NULL\t";
-                        }
-                    }
-                    syslog(LOG_INFO, "%s (Size: %u)", data_str.c_str(), pkt->size);
-                } else if (((char*)pkt->ptr)[0] == 'T') {
-                    syslog(LOG_INFO, "Row Description Packet (Size: %u)", pkt->size);
-                } else if (((char*)pkt->ptr)[0] == 'C') {
-                    syslog(LOG_INFO, "Command Completion Packet (Size: %u)", pkt->size);
-                } else if (((char*)pkt->ptr)[0] == 'E') {
-                    syslog(LOG_INFO, "Error Packet (Size: %u)", pkt->size);
-                } else if (((char*)pkt->ptr)[0] == 'Z') {
-                    syslog(LOG_INFO, "Ready Status Packet (Size: %u)", pkt->size);
-                } else {
-                    syslog(LOG_INFO, "Unknown Packet Type (First Char: %c, Size: %u)", ((char*)pkt->ptr)[0], pkt->size);
-                    // You might want to dump the raw bytes if it's not a known type
-                    // for (unsigned int k = 0; k < pkt->size; ++k) {
-                    //     syslog(LOG_INFO, "Byte [%u]: %02X", k, ((unsigned char*)pkt->ptr)[k]);
-                    // }
-                }
-            } else {
-                syslog(LOG_INFO, "Empty or invalid packet in PSarrayOUT at index %u", i);
-            }
-        }
-
         PSarrayFinal->copy_add(&PSarrayOUT, 0, PSarrayOUT.len);
-        syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Copied to PSarrayFinal (PSarrayFinal->len = %u)", PSarrayFinal->len); // CRITICAL LOG
         while (PSarrayOUT.len)
             PSarrayOUT.remove_index(PSarrayOUT.len - 1, NULL);
     }
@@ -2631,7 +2646,6 @@ bool PgSQL_Query_Result::get_resultset(PtrSizeArray* PSarrayFinal) {
     if (result_complete)
         reset(); // reset only if result is complete
 
-    syslog(LOG_INFO, "PgSQL_Query_Result::get_resultset: Returning, PSarrayFinal->len = %u", PSarrayFinal->len);
     return result_complete;
 }
 
@@ -2684,6 +2698,9 @@ unsigned long long PgSQL_Query_Result::current_size() {
 unsigned int PgSQL_Query_Result::add_command_completion(const PGresult* result, bool extract_affected_rows) {
 	const unsigned int bytes = proto->copy_command_completion_to_PgSQL_Query_Result(false, this, result, extract_affected_rows);
 	result_packet_type |= PGSQL_QUERY_RESULT_COMMAND;
+	if (authnull_pgx::Extended* ext = authnull_ext()) {
+		authnull_put(ext->onComplete(authnull_take_last(bytes)));
+	}
 	/*if (affected_rows) {
 		myds->sess->CurrentQuery.have_affected_rows = true; // if affected rows is set, last_insert_id is set too
 		myds->sess->CurrentQuery.affected_rows = affected_rows;
