@@ -99,7 +99,11 @@ int main() {
 	permits(PG, SEL_INS, "update t set a = 1", false, "verbs: update not granted");
 	permits(PG, SEL_INS, "delete from t", false, "verbs: delete not granted");
 	permits(PG, SEL_INS, "truncate t", false, "verbs: truncate not granted");
-	permits(PG, SEL_INS, "copy t from stdin", true, "verbs: copy from is an insert");
+	permits(PG, SEL_INS, "copy t from '/srv/in.csv'", true, "verbs: copy from a server file is an insert");
+	permits(PG, SEL_INS, "copy t from stdin", false, "copy from stdin streams through the proxy: refused");
+	permits(PG, READ_ONLY, "copy t to stdout", false, "copy to stdout streams through the proxy: refused");
+	permits(PG, READ_ONLY, "COPY (select * from t) TO STDOUT WITH CSV", false, "copy (query) to stdout: refused");
+	permits(PG, READ_ONLY, "select 1; copy t to stdout", false, "copy hidden after another statement: refused");
 	permits(PG, SEL_INS, "insert into t values (1) on conflict (id) do update set a = 2", false, "verbs: upsert also updates");
 	permits(PG, SEL_INS, "merge into t using s on t.id = s.id when matched then update set a = 1", false, "verbs: merge");
 	permits(PG, SEL_INS, "select * from t for update", false, "verbs: row lock needs update");

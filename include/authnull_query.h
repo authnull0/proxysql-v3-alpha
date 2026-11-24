@@ -32,8 +32,9 @@
 //   EXPLAIN ANALYZE <stmt> runs <stmt>; plain EXPLAIN is SELECT
 //   INSERT (with ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE: + UPDATE), UPDATE, DELETE
 //   MERGE: the actions it names; REPLACE: INSERT, DELETE; UPSERT: INSERT, UPDATE
-//   LOAD, COPY ... FROM                                                              INSERT
-//   COPY ... TO STDOUT is an export, SELECT; any other COPY                          EXECUTE
+//   LOAD, COPY ... FROM a server file                                                INSERT
+//   COPY ... TO STDOUT / FROM STDIN (streams through the proxy, which cannot relay it) COPY_STREAM
+//   any other COPY                                                                   EXECUTE
 //   TRUNCATE                                                                         TRUNCATE
 //   client housekeeping (below)                                                      nothing
 //   anything else (DDL, GRANT, DO, CALL, SET ROLE, ...)                              EXECUTE
@@ -381,15 +382,17 @@ inline void classify(const std::vector<Tok>& t, AuthnullDialect d, std::set<std:
 		return;
 	}
 	if (k == "COPY") {
-		bool from = false, to = false, stdout_ = false;
+		bool from = false, stream = false;
 		for (const auto& x : t) {
 			if (x.kind != TokKind::Word) continue;
 			if (x.text == "FROM") from = true;
-			if (x.text == "TO") to = true;
-			if (x.text == "STDOUT") stdout_ = true;
+			if (x.text == "STDOUT" || x.text == "STDIN") stream = true;
 		}
-		if (from) need.insert("INSERT");
-		else if (to && stdout_) need.insert("SELECT");
+		// The proxy cannot relay the COPY sub-protocol: the backend connection asserts on it
+		// (PgSQL_Connection.cpp, PGRES_COPY_*), which took the whole proxy down for any user allowed
+		// to SELECT. A COPY through the connection needs a privilege no policy grants.
+		if (stream) need.insert("COPY_STREAM");
+		else if (from) need.insert("INSERT");
 		else need.insert("EXECUTE");
 		return;
 	}
