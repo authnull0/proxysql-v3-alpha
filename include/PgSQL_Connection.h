@@ -189,10 +189,11 @@ private:
 
 		if (validation != nullptr && validation->accepted_values) {
 			const char** accepted_value = validation->accepted_values;
-			while (accepted_value != nullptr) {
+			while (*accepted_value != nullptr) {
 				if (strcmp(val, *accepted_value) == 0) {
 					return true;
 				}
+				accepted_value++;
 			}
 		} else {
 			return true;
