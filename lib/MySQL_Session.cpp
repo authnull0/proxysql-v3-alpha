@@ -4859,8 +4859,8 @@ bool MySQL_Session::handler_minus1_ClientLibraryError(MySQL_Data_Stream *myds, i
 
 // this function was inline
 void MySQL_Session::handler_minus1_LogErrorDuringQuery(MySQL_Connection *myconn, int myerr, char *errmsg) {
-	// For the session's recording: the error, with the values MySQL quotes in it hidden (authnull_recording.h).
-	authnull_query_error = authnullMaskErrorValues("[" + std::to_string(myerr) + "] " + std::string(errmsg ? errmsg : mysql_error(myconn->mysql)));
+	// For the session's recording: the error, with the values MySQL quotes in it hidden by error code (authnull_recording.h).
+	authnull_query_error = "[" + std::to_string(myerr) + "] " + authnullMaskErrorValues(myerr, std::string(errmsg ? errmsg : mysql_error(myconn->mysql)));
 	if (mysql_thread___verbose_query_error) {
 		proxy_warning("Error during query on (%d,%s,%d,%lu) , user \"%s@%s\" , schema \"%s\" , %d, %s . digest_text = \"%s\"\n", myconn->parent->myhgc->hid, myconn->parent->address, myconn->parent->port, myconn->get_mysql_thread_id(), client_myds->myconn->userinfo->username, (client_myds->addr.addr ? client_myds->addr.addr : (char *)"unknown" ), client_myds->myconn->userinfo->schemaname, myerr, ( errmsg ? errmsg : mysql_error(myconn->mysql)), CurrentQuery.QueryParserArgs.digest_text );
 	} else {
