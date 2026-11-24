@@ -1777,21 +1777,6 @@ handler_again:
 
 		if (result_type == 1) {
 			std::unique_ptr<PGresult, decltype(&PQclear)> result(get_result(), PQclear);
-			if (result) {
-				int rows = PQntuples(result.get());
-				int cols = PQnfields(result.get());
-
-				std::cout << "Rows: " << rows << ", Columns: " << cols << std::endl;
-
-				for (int i = 0; i < rows; ++i) {
-					for (int j = 0; j < cols; ++j) {
-						std::cout << PQgetvalue(result.get(), i, j) << "\t";
-					}
-					std::cout << std::endl;
-				}
-			} else {
-				std::cout << "No result or query failed." << std::endl;
-			}
 
 			if (result) {
 
