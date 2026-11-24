@@ -1,5 +1,6 @@
 #include "../deps/json/json.hpp"
 #include "authnull_query.h"
+#include "authnull_tables.h"
 #include "authnull_log.h"
 #include "authnull_tls.h"
 #include "authnull_login_answer.h"
@@ -642,7 +643,9 @@ std::unordered_map<std::string, std::vector<std::string>> user_database_access;
 std::unordered_map<std::string, std::string> session_to_usertype;
 std::unordered_map<std::string, std::map<std::string, std::vector<std::string>>> usertype_masking_policies;
 std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> user_database_privileges;
-// Guards the four maps above: every worker thread writes them (a login publishes, a session's end
+// The policy's table list, by the same key as user_database_access; empty: every table.
+static std::unordered_map<std::string, std::vector<std::string>> user_database_tables;
+// Guards the maps above: every worker thread writes them (a login publishes, a session's end
 // erases) and reads them (each query's privilege check, masking).
 std::mutex authnull_mysql_maps_mu;
 
@@ -831,6 +834,12 @@ bool checkPermission(const std::string& username, const std::string& query, cons
             // See authnull_query.h: the query is read the way MySQL reads it and split into
             // statements, so "select 1; insert ..." and a data-modifying WITH are not READ.
             if (authnullQueryPermitted(user_privs, query, AuthnullDialect::MySQL)) {
+                // ... and every table it names is on the policy's table list (authnull_tables.h).
+                auto tablesIt = user_database_tables.find(key);
+                if (tablesIt != user_database_tables.end() && !authnullTablesPermitted(tablesIt->second, databaseName, query)) {
+                    syslog(LOG_INFO, "Permission denied for %s on %s: query names a table the policy does not list", username.c_str(), databaseName.c_str());
+                    return false;
+                }
                 syslog(LOG_DEBUG, "Permission granted for %s on %s", username.c_str(), databaseName.c_str());
                 return true;
             } else {
@@ -1041,6 +1050,7 @@ MySQL_Session::~MySQL_Session() {
 		std::string key = authnull_map_user + "+" + authnull_map_db + "+" + sid;
 		std::lock_guard<std::mutex> maps_lock(authnull_mysql_maps_mu);
 		user_database_access.erase(key);
+		user_database_tables.erase(key);
 		usertype_masking_policies.erase(key);
 		auto st = session_to_usertype.find(sid);
 		if (st != session_to_usertype.end() && st->second == key) session_to_usertype.erase(st);
@@ -5934,6 +5944,7 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 								{
 									std::lock_guard<std::mutex> maps_lock(authnull_mysql_maps_mu);
 									user_database_access[key] = {answer.database};
+									user_database_tables[key] = answer.tables;
 									user_database_privileges[user][answer.database + "+" + sid] = answer.privileges;
 									usertype_masking_policies[key] = answer.masking;
 									session_to_usertype[sid] = key;
