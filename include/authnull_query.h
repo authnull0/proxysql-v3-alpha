@@ -45,7 +45,8 @@
 // to set up a connection. Transactions (BEGIN / START TRANSACTION, COMMIT, END, ROLLBACK, ABORT,
 // SAVEPOINT, RELEASE -- not their PREPARED forms); on Postgres, SET / RESET of the settings clients
 // use (clientSettings: DateStyle, TimeZone, search_path, ...) and set_config of one written out,
-// SET TRANSACTION, SET SESSION CHARACTERISTICS, SET CONSTRAINTS, DISCARD; on MySQL, SET of session
+// SET TRANSACTION, SET SESSION CHARACTERISTICS, SET CONSTRAINTS, DISCARD, DEALLOCATE [PREPARE] ALL
+// (not DEALLOCATE <name>); on MySQL, SET of session
 // and user variables, SET NAMES, SET TRANSACTION, USE. Still EXECUTE: what changes who the session
 // is or reaches past it -- SET ROLE, SESSION AUTHORIZATION, any other Postgres setting (e.g.
 // default_transaction_read_only), MySQL SET GLOBAL / PERSIST / PASSWORD / ROLE / DEFAULT ROLE /
@@ -436,6 +437,12 @@ inline bool classifyHousekeeping(const std::vector<Tok>& t, size_t first, Authnu
 	if (k == "SAVEPOINT" || k == "RELEASE") return true;
 	if (!pg && k == "USE") return true;
 	if (pg && k == "DISCARD") return true;
+	// DEALLOCATE ALL drops only what DISCARD ALL drops too, and psycopg 3 (pgAdmin 4) sends it on its
+	// own after ROLLBACK, DISCARD ALL, DROP or ALTER once it holds a prepared statement.
+	if (pg && k == "DEALLOCATE") {
+		const size_t i = isWord(t, rest, "PREPARE") ? rest + 1 : rest;
+		return isWord(t, i, "ALL") && i + 1 == t.size();
+	}
 	if (pg && k == "RESET") {
 		if (isWord(t, rest, "ALL")) return true;
 		if (rest < t.size() && t[rest].kind == TokKind::Word && clientSettings().count(lower(t[rest].text))) return true;

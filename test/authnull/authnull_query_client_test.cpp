@@ -52,6 +52,11 @@ int main() {
 	permits(PG, SELECT_ONLY, "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY", true, "SESSION CHARACTERISTICS");
 	permits(PG, SELECT_ONLY, "RESET search_path", true, "RESET a setting");
 	permits(PG, SELECT_ONLY, "DISCARD ALL", true, "DISCARD ALL");
+	permits(PG, SELECT_ONLY, "DEALLOCATE ALL", true, "DEALLOCATE ALL (psycopg 3 after ROLLBACK)");
+	permits(PG, SELECT_ONLY, "deallocate prepare all;", true, "DEALLOCATE PREPARE ALL");
+	permits(PG, SELECT_ONLY, "DEALLOCATE s1", false, "DEALLOCATE <name> stays EXECUTE");
+	permits(PG, SELECT_ONLY, "DEALLOCATE prepare", false, "a statement named prepare");
+	permits(PG, SELECT_ONLY, "DEALLOCATE ALL; DELETE FROM t", false, "a second statement still counts");
 	permits(PG, SELECT_ONLY, "SHOW search_path", true, "SHOW stays SELECT");
 	permits(PG, SELECT_ONLY, "SET TIME ZONE 'UTC'", true, "SET TIME ZONE");
 	permits(PG, SELECT_ONLY, "SET NAMES 'UTF8'", true, "SET NAMES");
