@@ -22,6 +22,7 @@ bool performMFA(std::string user_ip, std::string user_device_ip, std::string use
 #include "MySQL_Variables.h"
 #include "Base_Session.h"
 #include "authnull_mfa_call.h"
+#include "authnull_blocklist.h"
 
 #ifndef PROXYJSON
 #define PROXYJSON
@@ -300,6 +301,10 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	// for MySQL_ResultSet to decide which result columns to mask.
 	std::map<std::string, std::vector<std::string>> authnull_mask_policy;
 	std::string authnull_mask_query;
+	// The policy's statement blocklist and row cap (authnull_blocklist.h), set on every login; and
+	// whether the cap cut a result set of the statement now ending (recorded).
+	AuthnullStatementPolicy authnull_policy;
+	bool authnull_capped = false;
 	void authnullRecordQuery();
 	bool handler_again___status_SETTING_GENERIC_VARIABLE(int *_rc, const char *var_name, const char *var_value, bool no_quote=false, bool set_transaction=false);
 	bool handler_again___status_SETTING_SQL_LOG_BIN(int *);

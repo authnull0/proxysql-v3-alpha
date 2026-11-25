@@ -12,6 +12,7 @@
 #include "PgSQL_Variables.h"
 #include "authnull_mfa_call.h"
 #include "authnull_pg_extended.h"
+#include "authnull_blocklist.h"
 #include "Base_Session.h"
 
 
@@ -311,6 +312,10 @@ public:
 	// for PgSQL_Query_Result to decide which result columns to mask.
 	std::map<std::string, std::vector<std::string>> authnull_mask_policy;
 	std::string authnull_mask_query;
+	// The policy's statement blocklist and row cap (authnull_blocklist.h), set on every login; and
+	// whether the cap cut a result set of the statement now ending (recorded).
+	AuthnullStatementPolicy authnull_policy;
+	bool authnull_capped = false;
 #if 0
 	/*
 	 * @brief Store the hostgroups that hold connections that have been flagged as 'expired' by the

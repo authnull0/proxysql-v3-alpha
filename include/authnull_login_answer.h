@@ -9,7 +9,8 @@
 // error, an unreadable body, isValid that is not boolean true, or an approval missing the database,
 // the privileges or the field-masking map. A refusal's message is kept for the client
 // (authnull_refusal.h). An approval brings the policy's session controls (authnull_session_limits.h)
-// and whether to record the session (authnull_recording.h).
+// and whether to record the session (authnull_recording.h), and its statement blocklist and row cap
+// (authnull_blocklist.h).
 // test/authnull/authnull_login_answer_test.cpp.
 
 #include <map>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "../deps/json/json.hpp"
+#include "authnull_blocklist.h"
 
 // authnullLoginRequest is the request body. token is the connection token the client sent
 // ("user,token"); it is a bearer credential and is never logged.
@@ -56,7 +58,33 @@ struct AuthnullLoginAnswer {
 	int max_minutes = 0, idle_minutes = 0;
 	long long ends_s = 0;
 	bool record = false;
+	AuthnullStatementPolicy policy; // blockedCommands, blockedPatterns, maxRows (authnull_blocklist.h)
 };
+
+// authnullStatementPolicyFromJSON reads blockedCommands, blockedPatterns and maxRows from a
+// credentialSubject (authnull_blocklist.h). Missing, empty or not of their type: none, no cap; an
+// entry that is not a string is skipped.
+inline AuthnullStatementPolicy authnullStatementPolicyFromJSON(const nlohmann::json& c) {
+	AuthnullStatementPolicy p;
+	if (!c.is_object()) return p;
+	auto list = [&c](const char* k, std::string (*keep)(const std::string&)) {
+		std::vector<std::string> out;
+		if (!c.contains(k) || !c[k].is_array()) return out;
+		for (const auto& v : c[k]) {
+			if (!v.is_string()) continue;
+			std::string s = keep(v.get<std::string>());
+			if (!s.empty()) out.push_back(s);
+		}
+		return out;
+	};
+	p.blocked_commands = list("blockedCommands", authnullPolicyCommand);
+	p.blocked_patterns = list("blockedPatterns", authnullPolicyPattern);
+	if (c.contains("maxRows") && c["maxRows"].is_number()) {
+		const double v = c["maxRows"].get<double>();
+		if (v >= 1) p.max_rows = v >= 1e15 ? 1000000000000000ULL : static_cast<unsigned long long>(v);
+	}
+	return p;
+}
 
 // authnullJudgeLoginAnswer reads the call's outcome: curl_code (CURLcode; -1 when it never ran),
 // the HTTP status and the body.
@@ -149,6 +177,7 @@ inline AuthnullLoginAnswer authnullJudgeLoginAnswer(int curl_code, long http_cod
 		a.has_limits = a.max_minutes > 0 || a.idle_minutes > 0 || a.ends_s > 0;
 		a.record = s.contains("record") && s["record"].is_boolean() && s["record"].get<bool>();
 	}
+	a.policy = authnullStatementPolicyFromJSON(c);
 	a.approved = true;
 	return a;
 }

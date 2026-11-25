@@ -8,6 +8,7 @@
 #include "authnull_tls.h"
 #include "authnull_session_limits.h"
 #include "authnull_recording.h"
+#include "authnull_login_answer.h"
 #include "authnull_mfa_call.h"
 #include "authnull_admin_error.h"
 #include "PgSQL_Authentication.h"
@@ -1445,6 +1446,11 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							// Whether the policy asks for the session's statements to be recorded
 							// (authnull_recording.h). Set on every login.
 							(*myds)->sess->authnull_record = authnullRecordFromJSON(credential);
+							// The policy's statement blocklist and row cap (authnull_blocklist.h). Set on every login.
+							(*myds)->sess->authnull_policy = authnullStatementPolicyFromJSON(credential);
+							syslog(LOG_INFO, "[authnull] session %u for %s on %s: %zu blocked commands, %zu blocked patterns, max rows %llu (0 = no cap)",
+								thread_session_i, username.c_str(), mfa_db.c_str(), (*myds)->sess->authnull_policy.blocked_commands.size(),
+								(*myds)->sess->authnull_policy.blocked_patterns.size(), (*myds)->sess->authnull_policy.max_rows);
 							if ((*myds)->sess->authnull_record) {
 								syslog(LOG_INFO, "[authnull] session %u for %s on %s is recorded", thread_session_i, username.c_str(), mfa_db.c_str());
 							}
