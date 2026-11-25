@@ -8018,6 +8018,7 @@ void MySQL_Session::authnullRecordQuery() {
 	st.rows = CurrentQuery.rows_sent;
 	if (CurrentQuery.have_affected_rows) st.affected = CurrentQuery.affected_rows;
 	st.error = authnull_query_error;
+	st.capped = authnull_capped;
 	if (!authnullRecorder().append(authnullRecordLine(st))) {
 		proxy_warning("[authnull] could not write the recording of MySQL session %u\n", thread_session_id);
 	}
@@ -8031,6 +8032,7 @@ void MySQL_Session::LogQuery(MySQL_Data_Stream *myds) {
 		authnullRecordQuery();
 	}
 	authnull_refused = false;
+	authnull_capped = false;
 	authnull_query_error.clear();
 
 	if (qpo) {

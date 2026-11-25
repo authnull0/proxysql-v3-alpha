@@ -2499,6 +2499,8 @@ unsigned int PgSQL_Query_Result::add_row_description(const PGresult* result) {
 	syslog(LOG_INFO, "EPFFFFFFFFFFF : 3");
 	const unsigned int res = proto->copy_row_description_to_PgSQL_Query_Result(false, this, result);
 	result_packet_type |= PGSQL_QUERY_RESULT_TUPLE;
+	authnull_rows = 0; // a new result set: the row cap counts afresh
+	authnull_capped_at = 0;
 
 	// Which columns of this result set the session's field masking covers (authnull_masking.h).
 	authnull_mask.clear();
@@ -2554,14 +2556,32 @@ void PgSQL_Query_Result::authnull_put(const std::string& bytes) {
 	resultset_size += bytes.size();
 }
 
+// authnull_cap_reached: whether the current result set already holds the session policy's maxRows
+// rows; the row about to be added is then dropped (authnull_blocklist.h). The connection still
+// reads every row from the backend, so it stays in step; CommandComplete then says what was sent.
+bool PgSQL_Query_Result::authnull_cap_reached() {
+	PgSQL_Session* sess = (proto && myds) ? myds->sess : NULL;
+	const unsigned long long cap = sess ? sess->authnull_policy.max_rows : 0;
+	if (cap == 0 || authnull_rows < cap) return false;
+	authnull_capped_at = cap;
+	sess->authnull_capped = true;
+	return true;
+}
+
 unsigned int PgSQL_Query_Result::add_row(const PGresult* result) {
 	syslog(LOG_INFO, "EPFFFFFFFFFFF : 1");
-
+	// Single-row mode (PgSQL_Connection::set_single_row_mode): one row per call.
+	if (authnull_cap_reached()) return 0;
+	authnull_rows += PQntuples(result);
 	return proto->copy_row_to_PgSQL_Query_Result(false,this, result);
 }
 
 unsigned int PgSQL_Query_Result::add_row(const PSresult* result) {
 	syslog(LOG_INFO, "EPFFFFFFFFFFF : 2");
+	if (result->id == 'D') {
+		if (authnull_cap_reached()) return 0;
+		authnull_rows++;
+	}
 
 	const unsigned int res = proto->copy_buffer_to_PgSQL_Query_Result(false, this, result);
 	result_packet_type |= PGSQL_QUERY_RESULT_TUPLE; // temporary
@@ -2702,6 +2722,26 @@ unsigned long long PgSQL_Query_Result::current_size() {
 }
 
 unsigned int PgSQL_Query_Result::add_command_completion(const PGresult* result, bool extract_affected_rows) {
+	if (authnull_capped_at) {
+		// The row cap cut this result set (authnull_blocklist.h): a notice saying so, then the
+		// CommandComplete with the rows sent ("SELECT 3", not the server's "SELECT 10").
+		std::string notice;
+		notice += 'S'; notice += "NOTICE"; notice += '\0';
+		notice += 'V'; notice += "NOTICE"; notice += '\0';
+		notice += 'C'; notice += "01000"; notice += '\0';
+		notice += 'M'; notice += authnullCappedNotice(authnull_capped_at); notice += '\0';
+		notice += '\0';
+		const char* tag = PQcmdStatus((PGresult*)result);
+		std::string out = authnull_pgx::message('N', notice);
+		const std::string complete = authnull_pgx::message('C', authnullCappedTag(tag ? tag : "", authnull_rows) + '\0');
+		authnull_pgx::Extended* ext = authnull_ext();
+		out += ext ? ext->onComplete(complete) : complete;
+		authnull_put(out);
+		pkt_count += 2;
+		authnull_capped_at = 0;
+		result_packet_type |= PGSQL_QUERY_RESULT_COMMAND;
+		return (unsigned int)out.size();
+	}
 	const unsigned int bytes = proto->copy_command_completion_to_PgSQL_Query_Result(false, this, result, extract_affected_rows);
 	result_packet_type |= PGSQL_QUERY_RESULT_COMMAND;
 	if (authnull_pgx::Extended* ext = authnull_ext()) {
@@ -2738,6 +2778,8 @@ unsigned char* PgSQL_Query_Result::buffer_reserve_space(unsigned int size) {
 void PgSQL_Query_Result::reset() {
 	authnull_mask.clear();
 	authnull_mask_binary.clear();
+	authnull_rows = 0;
+	authnull_capped_at = 0;
 	resultset_size = 0;
 	num_fields = 0;
 	num_rows = 0;
