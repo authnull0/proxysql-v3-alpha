@@ -3490,14 +3490,21 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 			std::string user = client_myds->myconn->userinfo->username;
 			std::string db_name = client_myds->myconn->userinfo->schemaname ? client_myds->myconn->userinfo->schemaname : "";
 			// Nor may it test a masked value without returning it (WHERE item = ?): authnull_masking.h.
-			if (!checkPermission(user, query, db_name, std::to_string(thread_session_id)) ||
+			// Nor run what the policy blocks (authnull_blocklist.h).
+			const std::string blocked = authnullBlockedRule(authnull_policy, query, AuthnullDialect::MySQL);
+			if (!blocked.empty() || !checkPermission(user, query, db_name, std::to_string(thread_session_id)) ||
 				authnullMaskRefused(getMaskingPolicyForSession(user, db_name, std::to_string(thread_session_id)), query, AuthnullDialect::MySQL)) {
-				syslog(LOG_INFO, "[authnull] prepared statement refused for %s on %s", user.c_str(), db_name.c_str());
-				l_free(pkt.size,pkt.ptr);
+				syslog(LOG_INFO, "[authnull] prepared statement refused for %s on %s%s%s", user.c_str(), db_name.c_str(),
+					blocked.empty() ? "" : ": blocked by policy, ", blocked.c_str());
+				const std::string err = blocked.empty() ? std::string("Access denied: Query not permitted for this user") : authnullBlockedMessage(blocked);
+				// Recorded like a refused query: the statement, refused, and why (authnull_recording.h).
+				CurrentQuery.begin((unsigned char *)pkt.ptr,pkt.size,true);
+				authnull_refused = true;
+				authnull_query_error = err;
 				client_myds->setDSS_STATE_QUERY_SENT_NET();
-				client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"28000",(char *)"Access denied: Query not permitted for this user");
-				client_myds->DSS=STATE_SLEEP;
-				status=WAITING_CLIENT_DATA;
+				client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"28000",(char *)err.c_str());
+				RequestEnd(NULL);
+				l_free(pkt.size,pkt.ptr);
 				return;
 			}
 		}
@@ -4469,14 +4476,17 @@ __get_pkts_from_client:
 									// policy does not permit (authnull_masking.h).
 									authnull_mask_policy = getMaskingPolicyForSession(user, db_name, seid);
 									authnull_mask_query = query;
-									bool result = checkPermission(user, query, db_name,seid) &&
+									// The policy's blocked commands and patterns first (authnull_blocklist.h).
+									const std::string blocked = authnullBlockedRule(authnull_policy, query, AuthnullDialect::MySQL);
+									bool result = blocked.empty() && checkPermission(user, query, db_name,seid) &&
 										!authnullMaskRefused(authnull_mask_policy, query, AuthnullDialect::MySQL);
 									if (result == false){
-										syslog(LOG_INFO, "[DEBUG] Query Not OK");
+										syslog(LOG_INFO, "[DEBUG] Query Not OK%s%s", blocked.empty() ? "" : ": blocked by policy, ", blocked.c_str());
 										client_myds->DSS=STATE_QUERY_SENT_NET;
-										char *err_msg = (char *)"Access denied: Query not permitted for this user";
+										const std::string err = blocked.empty() ? std::string("Access denied: Query not permitted for this user") : authnullBlockedMessage(blocked);
+										char *err_msg = (char *)err.c_str();
 										authnull_refused = true;
-										authnull_query_error = err_msg;
+										authnull_query_error = err;
 										client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
 										RequestEnd(NULL);
 										l_free(pkt.size, pkt.ptr);
@@ -6003,8 +6013,10 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 									authnullMySQLSessionLimits().erase(thread_session_id);
 								}
 								authnull_record = answer.record;
-								syslog(LOG_INFO, "MFA approved for user '%s' db '%s' (MySQL session %u; privileges %s%s)", user.c_str(), db_name.c_str(),
-									thread_session_id, json(answer.privileges).dump().c_str(), answer.record ? "; recorded" : "");
+								authnull_policy = answer.policy; // blocklist and row cap (authnull_blocklist.h)
+								syslog(LOG_INFO, "MFA approved for user '%s' db '%s' (MySQL session %u; privileges %s%s; %zu blocked commands, %zu blocked patterns, max rows %llu)", user.c_str(), db_name.c_str(),
+									thread_session_id, json(answer.privileges).dump().c_str(), answer.record ? "; recorded" : "",
+									answer.policy.blocked_commands.size(), answer.policy.blocked_patterns.size(), answer.policy.max_rows);
 							}
 							free_users = GloMyAuth->increase_frontend_user_connections(
 								client_myds->myconn->userinfo->username,
@@ -8006,6 +8018,7 @@ void MySQL_Session::authnullRecordQuery() {
 	st.rows = CurrentQuery.rows_sent;
 	if (CurrentQuery.have_affected_rows) st.affected = CurrentQuery.affected_rows;
 	st.error = authnull_query_error;
+	st.capped = authnull_capped;
 	if (!authnullRecorder().append(authnullRecordLine(st))) {
 		proxy_warning("[authnull] could not write the recording of MySQL session %u\n", thread_session_id);
 	}
@@ -8019,6 +8032,7 @@ void MySQL_Session::LogQuery(MySQL_Data_Stream *myds) {
 		authnullRecordQuery();
 	}
 	authnull_refused = false;
+	authnull_capped = false;
 	authnull_query_error.clear();
 
 	if (qpo) {

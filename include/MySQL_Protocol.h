@@ -44,6 +44,10 @@ class MySQL_ResultSet {
 	std::vector<bool> authnull_mask;
 	std::vector<int> authnull_mask_types; // the columns' MYSQL_FIELD.type, for binary-protocol rows
 	void authnull_mask_binary_row(MYSQL_ROWS *r);
+	// Row cap (authnull_blocklist.h): the session policy's maxRows, 0 for none, taken in init();
+	// authnull_cap_reached() says whether the next row is past it, and marks the statement capped.
+	unsigned long long authnull_max_rows = 0;
+	bool authnull_cap_reached();
 	bool transfer_started;
 	bool resultset_completed;
 	//bool reset_pid;

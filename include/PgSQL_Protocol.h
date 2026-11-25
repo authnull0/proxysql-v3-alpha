@@ -558,6 +558,12 @@ private:
 	// and whether it is in binary format. Decided in add_row_description.
 	std::vector<bool> authnull_mask;
 	std::vector<bool> authnull_mask_binary;
+	// Row cap (authnull_blocklist.h): the rows of the current result set sent so far, and whether
+	// the session policy's maxRows cut it; reset in add_row_description. authnull_cap_reached()
+	// says whether the next row is past the cap.
+	unsigned long long authnull_rows = 0;
+	unsigned long long authnull_capped_at = 0; // the cap that cut it, 0 while not cut
+	bool authnull_cap_reached();
 	unsigned int buffer_used;
 	unsigned char* buffer;
 	PgSQL_Protocol* proto;

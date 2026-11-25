@@ -85,6 +85,7 @@ void MySQL_ResultSet::init(MySQL_Protocol *_myprot, MYSQL_RES *_res, MYSQL *_my,
 	resultset_size=0;
 	num_rows=0;
 	num_fields=mysql_field_count(mysql);
+	authnull_max_rows = (myds && myds->sess) ? myds->sess->authnull_policy.max_rows : 0;
 	// Field masking: which columns of this result set the session's policy covers, decided once from
 	// the column metadata and the query text (authnull_masking.h); add_row() applies it.
 	authnull_mask.clear();
@@ -189,6 +190,18 @@ void MySQL_ResultSet::init_with_stmt(MySQL_Connection *myconn) {
 		// Field masking first: a masked row can shrink, and the sizes below are taken from the rows.
 		for (MYSQL_ROWS *m = _stmt->result.data; m; m = m->next) {
 			authnull_mask_binary_row(m);
+		}
+		// Row cap: the rows past maxRows are dropped here; the backend has sent them all already.
+		if (authnull_max_rows) {
+			unsigned long long keep = num_rows < authnull_max_rows ? authnull_max_rows - num_rows : 0;
+			unsigned long long kept = 0;
+			MYSQL_ROWS **link = &_stmt->result.data;
+			while (*link && kept < keep) { link = &(*link)->next; kept++; }
+			if (*link) { // the rest stay in the statement's memory root, freed with it
+				*link = NULL;
+				_stmt->result.rows = kept;
+				if (myds && myds->sess) myds->sess->authnull_capped = true;
+			}
 		}
 		MYSQL_ROWS *r=_stmt->result.data;
 		if (r) {
@@ -349,7 +362,17 @@ void MySQL_ResultSet::authnull_mask_binary_row(MYSQL_ROWS *r) {
 
 // this function is used for binary protocol
 // maybe later on can be adapted for text protocol too
+// authnull_cap_reached: whether the result set already holds the policy's maxRows rows; the row
+// about to be added is then dropped (authnull_blocklist.h), and the statement is marked capped.
+// The caller still reads the dropped rows from the backend, which keeps the connection in step.
+bool MySQL_ResultSet::authnull_cap_reached() {
+	if (authnull_max_rows == 0 || num_rows < authnull_max_rows) return false;
+	if (myds && myds->sess) myds->sess->authnull_capped = true;
+	return true;
+}
+
 unsigned int MySQL_ResultSet::add_row(MYSQL_ROWS *rows) {
+	if (authnull_cap_reached()) return 0;
 	authnull_mask_binary_row(rows);
 	unsigned int pkt_length=0;
 	MYSQL_ROW row = rows->data;
@@ -364,6 +387,7 @@ unsigned int MySQL_ResultSet::add_row(MYSQL_ROWS *rows) {
 
 
 unsigned int MySQL_ResultSet::add_row(MYSQL_ROW row) {
+	if (authnull_cap_reached()) return 0;
 	unsigned long *lengths=mysql_fetch_lengths(result);
 	unsigned int pkt_length=0;
 	if (myprot) {

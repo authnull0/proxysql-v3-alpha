@@ -225,6 +225,7 @@ struct AuthnullRecordedStatement {
 	unsigned long long rows = 0;
 	unsigned long long affected = 0;
 	std::string error;
+	bool capped = false;         // the policy's row cap cut a result set short (authnull_blocklist.h)
 };
 
 // authnullRecordLine is the statement as one JSON line (no newline).
@@ -235,6 +236,7 @@ inline std::string authnullRecordLine(const AuthnullRecordedStatement& s) {
 		{"rows", s.rows}, {"affected", s.affected}, {"hg", s.hostgroup}, {"engine", s.engine},
 	};
 	if (!s.error.empty()) j["error"] = s.error.size() > 500 ? s.error.substr(0, 500) : s.error;
+	if (s.capped) j["capped"] = true;
 	return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 

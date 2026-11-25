@@ -3381,14 +3381,17 @@ int PgSQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___PGSQL_QU
 		// policy does not permit (authnull_masking.h).
 		authnull_mask_policy = getMaskingPolicyForSession2(user, db_name, seid);
 		authnull_mask_query = query;
-		bool result = checkPermission2(user, query, db_name,seid) &&
+		// The policy's blocked commands and patterns first (authnull_blocklist.h).
+		const std::string blocked = authnullBlockedRule(authnull_policy, query, AuthnullDialect::Postgres);
+		bool result = blocked.empty() && checkPermission2(user, query, db_name,seid) &&
 			!authnullMaskRefused(authnull_mask_policy, query, AuthnullDialect::Postgres);
 		if (result == false){
-			syslog(LOG_INFO, "[DEBUG] Query Not OK");
+			syslog(LOG_INFO, "[DEBUG] Query Not OK%s%s", blocked.empty() ? "" : ": blocked by policy, ", blocked.c_str());
 			client_myds->DSS=STATE_QUERY_SENT_NET;
-			char *err_msg = (char *)"Access denied: Query not permitted for this user";
+			const std::string err = blocked.empty() ? std::string("Access denied: Query not permitted for this user") : authnullBlockedMessage(blocked);
+			char *err_msg = (char *)err.c_str();
 			authnull_refused = true;
-			authnull_query_error = err_msg;
+			authnull_query_error = err;
 			client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, client_myds->pkt_sid+1, 1045, (char *)"28000", err_msg, true);
 			RequestEnd(NULL);
 			l_free(pkt.size, pkt.ptr);
@@ -6777,6 +6780,7 @@ void PgSQL_Session::LogQuery(PgSQL_Data_Stream* myds) {
 		authnullRecordQuery();
 	}
 	authnull_refused = false;
+	authnull_capped = false;
 	authnull_query_error.clear();
 
 	if (qpo) {
@@ -6832,6 +6836,7 @@ void PgSQL_Session::authnullRecordQuery() {
 	st.rows = CurrentQuery.rows_sent;
 	if (CurrentQuery.have_affected_rows) st.affected = CurrentQuery.affected_rows;
 	st.error = authnull_query_error;
+	st.capped = authnull_capped;
 	if (!authnullRecorder().append(authnullRecordLine(st))) {
 		proxy_warning("[authnull] could not write the recording of session %u\n", thread_session_id);
 	}
