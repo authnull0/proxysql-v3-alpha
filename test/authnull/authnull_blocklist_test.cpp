@@ -159,6 +159,19 @@ int main() {
 	a = authnullJudgeLoginAnswer(0, 200, base + R"(,"maxRows":"3"}})");
 	expect(a.policy.max_rows == 0, "maxRows as a string: no cap");
 
+	// --- a service account's login carries its secret; nobody else's does ---
+	{
+		nlohmann::json req = {{"token", "svc:etl"}};
+		authnullAddServiceSecret(req, "svc:etl", "s3cret");
+		expect(req.value("serviceSecret", "") == "s3cret", "svc: token adds serviceSecret");
+		nlohmann::json plain = {{"token", "abc"}};
+		authnullAddServiceSecret(plain, "abc", "pw");
+		authnullAddServiceSecret(plain, "svc:etl", "");
+		authnullAddServiceSecret(plain, "svc:etl", nullptr);
+		authnullAddServiceSecret(plain, "SVC:etl", "pw");
+		expect(!plain.contains("serviceSecret"), "no serviceSecret for a plain token or an empty password");
+	}
+
 	// --- the recording marks a capped statement ---
 	AuthnullRecordedStatement st;
 	st.statement = "select * from t";

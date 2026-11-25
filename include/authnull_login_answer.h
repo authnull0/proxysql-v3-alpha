@@ -46,6 +46,13 @@ inline std::string authnullLoginRequest(const std::string& engine, int org_id, i
 	return req.dump();
 }
 
+// authnullAddServiceSecret: a service-account login ("<db role>,svc:<account>") proves itself with
+// the account's secret, which the client sends as its cleartext password; it goes to authn-service
+// as serviceSecret. Like the token, it is a credential: the request body is never logged.
+inline void authnullAddServiceSecret(nlohmann::json& req, const std::string& token, const char* password) {
+	if (token.compare(0, 4, "svc:") == 0 && password != nullptr && *password != '\0') req["serviceSecret"] = password;
+}
+
 struct AuthnullLoginAnswer {
 	bool approved = false;
 	std::string why;     // for the log, when not approved

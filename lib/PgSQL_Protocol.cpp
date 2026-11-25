@@ -1138,6 +1138,8 @@ EXECUTION_STATE PgSQL_Protocol::process_handshake_response_packet(unsigned char*
 							{"proxySessionId", thread_session_i},
 							{"timestamp", epoch_time}
 						};
+						// A service account's secret is the client's cleartext password (authnull_login_answer.h).
+						authnullAddServiceSecret(requestData, extra_data, pass);
 
 						std::string json_payload = requestData.dump();
 						if (!mfa_answered) {
